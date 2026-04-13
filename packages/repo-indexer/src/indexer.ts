@@ -93,10 +93,13 @@ export class RepoIndexer {
 
     try {
       const entries = await fs.readdir(areaPath, { withFileTypes: true });
-      const modules: Array<WorkspaceModuleInfo | null> = await Promise.all(
-        entries
-          .filter((entry) => entry.isDirectory() && !IGNORED_DIR_NAMES.has(entry.name))
-          .map(async (entry) => {
+      const validEntries = entries.filter((entry) => entry.isDirectory() && !IGNORED_DIR_NAMES.has(entry.name));
+      const modules: Array<WorkspaceModuleInfo | null> = [];
+      const batchSize = 10;
+      for (let i = 0; i < validEntries.length; i += batchSize) {
+        const batch = validEntries.slice(i, i + batchSize);
+        const results = await Promise.all(
+          batch.map(async (entry) => {
             const manifestPath = path.join(areaPath, entry.name, 'package.json');
             const manifest = await this.readJsonFile<{ name?: unknown; description?: unknown }>(manifestPath);
             if (!manifest || typeof manifest.name !== 'string' || !manifest.name.trim()) {
@@ -112,7 +115,9 @@ export class RepoIndexer {
             };
             return moduleInfo;
           }),
-      );
+        );
+        modules.push(...results);
+      }
 
       return modules
         .filter((entry): entry is WorkspaceModuleInfo => entry !== null)

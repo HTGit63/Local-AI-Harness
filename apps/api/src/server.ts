@@ -1,7 +1,8 @@
 import * as http from 'http';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { CoreEngine } from '@local-harness/core';
+import { CoreEngine, PromptAnalyzer } from '@local-harness/core';
+import { ModelAdapter } from '@local-harness/model-adapter';
 
 const PORT = parseInt(process.env.API_PORT || '3001', 10);
 const HOST = process.env.API_HOST || '127.0.0.1';
@@ -463,7 +464,41 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const body = await readBody(req);
-        const messages = Array.isArray(body.messages) ? body.messages : [];
+        let messages = Array.isArray(body.messages) ? body.messages : [];
+        const isAgentic = body.agentic !== false;
+        
+        if (!isAgentic) {
+          const adapter = new ModelAdapter(engine.getPublicConfig() as any);
+          const response = await adapter.createChatCompletion({
+            messages: messages as any,
+            stream: false,
+            signal: abortController.signal,
+          }) as any;
+          
+          let content = response?.choices?.[0]?.message?.content || '';
+          const thinking = response?.choices?.[0]?.message?.thinking;
+          if (thinking) content = `<think>${thinking}</think>${content}`;
+          sendJson(req, res, 200, { response: content });
+          return;
+        }
+
+        // --- Prompt Analyzer Hook ---
+        const analyzerAdapter = new ModelAdapter(engine.getPublicConfig() as any);
+        const analyzer = new PromptAnalyzer(analyzerAdapter);
+        const analysis = await analyzer.analyzeAndRefine(messages as any, abortController.signal);
+        
+        if (analysis.needsClarification && analysis.clarifyingQuestions && analysis.clarifyingQuestions.length > 0) {
+          const questionsContent = "I noticed this is a very broad request. To proceed effectively, I need a bit more detail. Could you clarify the following before I get to work?\n\n- " + analysis.clarifyingQuestions.join('\n- ');
+          sendJson(req, res, 200, { response: questionsContent });
+          return;
+        } else if (analysis.refinedPrompt && messages.length > 0) {
+          const lastIndex = messages.map(m => (m as any).role).lastIndexOf('user');
+          if (lastIndex >= 0) {
+            messages[lastIndex] = { ...messages[lastIndex], content: analysis.refinedPrompt };
+          }
+        }
+        // --- End Prompt Analyzer Hook ---
+
         const response = await engine.chat(messages as { role: 'system' | 'user' | 'assistant' | 'tool'; content: string }[], { signal: abortController.signal });
         sendJson(req, res, 200, { response });
       } catch (error: any) {
@@ -485,8 +520,114 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const body = await readBody(req);
-        const messages = Array.isArray(body.messages) ? body.messages : [];
+        let messages = Array.isArray(body.messages) ? body.messages : [];
+        const isAgentic = body.agentic !== false;
+        
         startNdjson(req, res);
+
+        if (!isAgentic) {
+          writeNdjson(res, { type: 'status', phase: 'Generating', action: 'Normal Chat Mode', loop: 0 });
+          
+          const adapter = new ModelAdapter(engine.getPublicConfig() as any);
+          const stream = await adapter.createChatCompletion({
+            messages: messages as any,
+            stream: true,
+            signal: abortController.signal,
+          }) as ReadableStream<Uint8Array> | null;
+
+          if (!stream || typeof stream.getReader !== 'function') {
+            const result = await adapter.createChatCompletion({
+              messages: messages as any,
+              stream: false,
+              signal: abortController.signal,
+            }) as any;
+            
+            let content = result?.choices?.[0]?.message?.content || '';
+            const thinking = result?.choices?.[0]?.message?.thinking;
+            if (thinking) content = `<think>${thinking}</think>${content}`;
+            
+            writeNdjson(res, { type: 'done', response: content });
+            res.end();
+            return;
+          }
+
+          const reader = stream.getReader();
+          const decoder = new TextDecoder();
+          let fullContent = '';
+          
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            const chunk = decoder.decode(value, { stream: true });
+            const lines = chunk.split(/\r?\n/);
+            
+            for (const line of lines) {
+               if (line.startsWith('data: ')) {
+                 if (line === 'data: [DONE]') continue;
+                 try {
+                   const data = JSON.parse(line.slice(6));
+                   const deltaObj = data.choices?.[0]?.delta || {};
+                   let deltaStr = '';
+                   if (deltaObj.thinking) deltaStr += `<think>${deltaObj.thinking}</think>`;
+                   if (deltaObj.content) deltaStr += deltaObj.content;
+                   
+                   if (deltaStr) {
+                     fullContent += deltaStr;
+                     writeNdjson(res, { type: 'delta', delta: deltaStr });
+                   }
+                 } catch (e) { /* ignore parse error */ }
+               }
+            }
+          }
+          
+          const finalChunk = decoder.decode();
+          const finalLines = finalChunk.split(/\r?\n/);
+          for (const line of finalLines) {
+             if (line.startsWith('data: ')) {
+               if (line === 'data: [DONE]') continue;
+               try {
+                 const data = JSON.parse(line.slice(6));
+                 const deltaObj = data.choices?.[0]?.delta || {};
+                 let deltaStr = '';
+                 if (deltaObj.thinking) deltaStr += `<think>${deltaObj.thinking}</think>`;
+                 if (deltaObj.content) deltaStr += deltaObj.content;
+                 
+                 if (deltaStr) {
+                   fullContent += deltaStr;
+                   writeNdjson(res, { type: 'delta', delta: deltaStr });
+                 }
+               } catch (e) { /* ignore parse error */ }
+             }
+          }
+
+          writeNdjson(res, { type: 'done', response: fullContent });
+          res.end();
+          return;
+        }
+        
+        // --- Prompt Analyzer Hook ---
+        const analyzerAdapter = new ModelAdapter(engine.getPublicConfig() as any);
+        const analyzer = new PromptAnalyzer(analyzerAdapter);
+        
+        writeNdjson(res, { type: 'status', phase: 'Analyzing Prompt', action: 'Evaluating clarity', loop: 0 });
+        const analysis = await analyzer.analyzeAndRefine(messages as any, abortController.signal);
+        
+        if (analysis.needsClarification && analysis.clarifyingQuestions && analysis.clarifyingQuestions.length > 0) {
+          const questionsContent = "I noticed this is a very broad request. To proceed effectively, I need a bit more detail. Could you clarify the following before I get to work?\n\n- " + analysis.clarifyingQuestions.join('\n- ');
+          writeNdjson(res, { type: 'status', phase: 'Awaiting Clarification', action: 'Yielded to user', loop: 0 });
+          writeNdjson(res, { type: 'delta', delta: questionsContent });
+          writeNdjson(res, { type: 'done', response: questionsContent });
+          res.end();
+          return;
+        } else if (analysis.refinedPrompt && messages.length > 0) {
+          const lastIndex = messages.map(m => (m as any).role).lastIndexOf('user');
+          if (lastIndex >= 0) {
+            messages[lastIndex] = { ...messages[lastIndex], content: analysis.refinedPrompt };
+          }
+        }
+        // --- End Prompt Analyzer Hook ---
+
         const response = await engine.chatStream(
           messages as { role: 'system' | 'user' | 'assistant' | 'tool'; content: string }[],
           {
@@ -496,7 +637,6 @@ const server = http.createServer(async (req, res) => {
           { signal: abortController.signal },
         );
         writeNdjson(res, { type: 'done', response });
-        res.end();
       } catch (error: any) {
         if (error?.name === 'AbortError') {
           return;

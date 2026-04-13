@@ -1,11 +1,11 @@
 export const RECIPES = {
   zeroShot: (task: string, constraints: string) => `Objective: ${task}\nLimit: ${constraints}`,
   fewShotPatch: (instruction: string, existing: string) => `User: ${instruction}\nExisting: ${existing}\nEdit: `,
-  toolReAct: (tools: string[], goal: string) => `Tools: ${tools.join(', ')}\nTask: ${goal}\nPolicy: Prefer one relevant native tool call before making claims about files, folders, or repo state.\nNever simulate tool calls or tool outputs in plain text.\nCall: `,
+  toolReAct: (tools: string[], goal: string) => `Tools: ${tools.join(', ')}\nTask: ${goal}\nPolicy: Always think what the user wants first, and then make sure to double down on it while being efficient. Prefer one relevant native tool call before making claims about files, folders, or repo state.\nNever simulate JSON tool blocks in plain text. Always use the provided tool call API natively.\nCall: `,
   evaluation: (output: string) => `Check for syntax errors. Output: ${output}\nReturn OK, or REJECT(reason).`,
   fileSummary: (content: string) => `Summarize this file in 2 sentences max. File:\n${content}\nSummary:`,
   codeReview: (diff: string) => `Review this diff. Focus ONLY on logic flaws/bugs. Under 3 lines.\nDiff:\n${diff}\nReview:`,
-  baselineInstruction: () => `You are a local coding assistant. Use native tools when needed. Never invent file changes or tool outputs. Be concise.`,
+  baselineInstruction: () => `You are a local coding assistant. Always think what the user wants first, and then make sure to double down on it while being efficient. Use native tools when needed. Never invent file changes, JSON tool outputs, or pretend to run commands in standard text. Be concise.`,
   factualityGuard: (text: string) => `Check if this output contains hallucinations or unfounded claims. Text:\n${text}\nVerdict (OK/WARN + reason):`,
   selfCheck: (output: string) => `Does this output follow all constraints and solve the task? Output:\n${output}\nAnswer (YES/NO + improvement):`,
   fileSynthesis: (files: string[]) => `Synthesize a plan to coordinate changes across: ${files.join(', ')}. Outcome:`,
@@ -13,7 +13,7 @@ export const RECIPES = {
   targetedEdit: (task: string) => `Inspect the target files before editing. Use tools for file or shell actions.\nUser request: ${task}`,
   docGeneration: (task: string) => `Inspect manifests, README files, or entry points before writing docs. Use tools for any file changes.\nUser request: ${task}`,
   codeReviewWorkflow: (task: string) => `Inspect the diff or files before reviewing. Prioritize concrete bugs, regressions, and missing tests.\nUser request: ${task}`,
-  toolCorrection: () => `Your previous reply simulated a tool call or tool output in plain text. Do not do that. Use the native tool interface only. Never output <|tool_calls_begin|>, Python scripts, or fabricated tool results. If no tool is needed, answer plainly and do not claim files changed.`,
+  toolCorrection: () => `Your previous reply simulated a tool call or tool output in plain text. Do not do that. Use the native tool interface (e.g. strict JSON block or specialized native tool tag) only. Never output <|tool_calls_begin|>, Python scripts, or fabricated nested JSON tool results in your response body. If no tool is needed, answer plainly and do not claim files changed.`,
   manualToolProtocol: (examples: string[]) => `Use this lightweight JSON tool protocol. When you need a tool, reply with EXACTLY one JSON object and nothing else.\nAllowed JSON shapes:\n${examples.join('\n')}\n{"final":"short answer"}\nRules: choose one action at a time, wait for the next message after each tool result, and never invent tool outputs.`,
   manualToolCorrection: () => `Reply with exactly one valid JSON object and nothing else. Use {"action":"toolName","args":{...}} for a tool step or {"final":"..."} for the final answer. Do not wrap it in markdown.`,
 };

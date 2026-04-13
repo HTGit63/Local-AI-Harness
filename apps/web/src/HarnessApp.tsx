@@ -620,6 +620,7 @@ function HarnessApp() {
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [chatMode, setChatMode] = useState<ConversationMode>('general');
+  const [isAgentic, setIsAgentic] = useState(true);
   const [streamStatus, setStreamStatus] = useState('');
 
   // Browser file state
@@ -839,7 +840,7 @@ function HarnessApp() {
       await streamNdjson(`${API}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: requestMessages }),
+        body: JSON.stringify({ messages: requestMessages, agentic: isAgentic }),
       }, (event) => {
         if (event.type === 'status') {
           const nextStep = event.action || event.phase;
@@ -1144,16 +1145,38 @@ function HarnessApp() {
                         <span className="chat-msg-time">{formatTime(msg.createdAt)}</span>
                       </div>
                       {msg.role === 'assistant' && msg.activity.length > 0 && (
-                        <div className="chat-activity">
-                          {msg.activity.map((step, index) => (
-                            <div
-                              key={`${msg.id}-step-${index}`}
-                              className={`chat-activity-step ${index === msg.activity.length - 1 && msg.status !== 'sent' ? 'chat-activity-step-active' : ''}`}
-                            >
-                              <span className="chat-activity-index">{index + 1}</span>
-                              <span>{step}</span>
-                            </div>
-                          ))}
+                        <div className="tool-execution-tracker">
+                          <div className="tool-tracker-header">
+                            <span>🔄 Tool Activity</span>
+                          </div>
+                          <div className="tool-tracker-steps">
+                            {msg.activity.map((step, index) => {
+                              let badgeClass = 'tool-badge-system';
+                              let badgeText = 'SYS';
+                              const lowerStep = step.toLowerCase();
+                              if (lowerStep.includes('read') || lowerStep.includes('search') || lowerStep.includes('glob') || lowerStep.includes('list')) {
+                                badgeClass = 'tool-badge-read';
+                                badgeText = 'READ';
+                              } else if (lowerStep.includes('write') || lowerStep.includes('patch') || lowerStep.includes('make')) {
+                                badgeClass = 'tool-badge-write';
+                                badgeText = 'WRITE';
+                              } else if (lowerStep.includes('delete') || lowerStep.includes('run') || lowerStep.includes('git')) {
+                                badgeClass = 'tool-badge-danger';
+                                badgeText = 'EXEC';
+                              }
+                              const isActive = index === msg.activity.length - 1 && msg.status !== 'sent';
+                              const isDone = msg.status === 'sent' || index < msg.activity.length - 1;
+                              return (
+                                <div
+                                  key={`${msg.id}-step-${index}`}
+                                  className={`tool-tracker-step ${isActive ? 'active' : ''} ${isDone ? 'done' : ''}`}
+                                >
+                                  <span className={`tool-badge ${badgeClass}`}>{badgeText}</span>
+                                  <span>{step}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
                         </div>
                       )}
                       <div className="chat-msg-body">
@@ -1170,8 +1193,11 @@ function HarnessApp() {
                               }
                               return (
                                 <details key={i} className="ai-thought-block" open>
-                                  <summary>Thinking</summary>
-                                  <div className="ai-thought">{inner}</div>
+                                  <summary className="ai-thought-header">
+                                    <span className="ai-thought-icon">🧠</span>
+                                    <span>Reasoning Process</span>
+                                  </summary>
+                                  <div className="ai-thought-content">{inner}</div>
                                 </details>
                               );
                             }
@@ -1201,9 +1227,13 @@ function HarnessApp() {
               />
               <div className="composer-bar">
                 <div className="composer-bar-left">
-                  <select className="mode-select" value={chatMode} onChange={e => setChatMode(e.target.value as ConversationMode)}>
+                  <select className="mode-select" value={chatMode} onChange={e => setChatMode(e.target.value as ConversationMode)} disabled={!isAgentic}>
                     {CHAT_MODES.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
                   </select>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={isAgentic} onChange={e => setIsAgentic(e.target.checked)} />
+                    Agentic
+                  </label>
                   <select
                     className="model-select"
                     value={modelDraft}

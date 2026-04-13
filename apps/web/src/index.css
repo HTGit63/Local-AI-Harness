@@ -1298,22 +1298,54 @@ a {
 
 /* AI Thought Blocks (<think>) */
 .ai-thought-block {
-  margin: 8px 0;
+  margin: 12px 0;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.02);
+  backdrop-filter: blur(8px);
   overflow: hidden;
+  transition: all var(--transition-normal);
+  box-shadow: var(--shadow-sm);
+}
+
+.ai-thought-block[open] {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(108, 92, 231, 0.3);
+  box-shadow: 0 0 15px rgba(108, 92, 231, 0.1);
 }
 
 .ai-thought-block summary {
   cursor: pointer;
   list-style: none;
-  padding: 10px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
+  padding: 12px 14px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.03) 0%, transparent 100%);
+  user-select: none;
+}
+
+.ai-thought-block summary::before {
+  content: '🧠';
+  display: inline-block;
+  font-size: 14px;
+  filter: grayscale(100%) opacity(0.7);
+  transition: all var(--transition-normal);
+}
+
+.ai-thought-block[open] summary::before {
+  filter: none;
+  animation: pulse-brain 2s infinite ease-in-out;
+}
+
+@keyframes pulse-brain {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.15); filter: drop-shadow(0 0 4px var(--accent)); }
 }
 
 .ai-thought-block summary::-webkit-details-marker {
@@ -1321,15 +1353,201 @@ a {
 }
 
 .ai-thought {
-  color: #8a8a93;
-  font-size: 0.9em;
-  font-style: italic;
-  font-weight: 300;
+  color: #a1a1a6;
+  font-size: 13.5px;
+  font-weight: 400;
   margin: 0;
-  padding: 0 12px 12px;
-  border-left: 0;
+  padding: 0 14px 14px 34px;
+  border-left: 2px solid var(--accent-muted);
   background-color: transparent;
   border-radius: 0;
   white-space: pre-wrap;
-  line-height: 1.5;
+  line-height: 1.6;
+  font-family: var(--font-sans);
 }
+
+/* Tool Execution Tracker */
+.tool-execution-tracker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 16px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.tool-tracker-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-tertiary);
+  margin-bottom: 4px;
+}
+
+.tool-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+  transition: all var(--transition-fast);
+}
+
+.tool-step-active {
+  border-color: var(--accent);
+  color: var(--text);
+  box-shadow: 0 0 8px var(--accent-muted);
+}
+
+.tool-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #fff;
+}
+
+.tool-badge-read { background: var(--accent); }
+.tool-badge-write { background: var(--warning); }
+.tool-badge-danger { background: var(--danger); }
+.tool-badge-system { background: var(--success); }
+
+/* ─────────── AI THOUGHT BLOCK ─────────── */
+.ai-thought-block {
+  margin: 12px 0;
+  border-radius: var(--radius-md);
+  background: rgba(26, 26, 30, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  overflow: hidden;
+  transition: all var(--transition-normal);
+}
+
+.ai-thought-block:hover {
+  border-color: rgba(255, 255, 255, 0.15);
+  background: rgba(30, 30, 35, 0.6);
+}
+
+.ai-thought-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-bottom: 1px solid transparent;
+  transition: all var(--transition-fast);
+}
+
+.ai-thought-block.expanded .ai-thought-header {
+  border-bottom-color: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+}
+
+.ai-thought-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--accent-hover);
+  font-size: 12px;
+}
+
+.ai-thought-content {
+  padding: 14px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  animation: fade-in var(--transition-normal) ease forwards;
+}
+
+.ai-thought-content pre {
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ─────────── TOOL EXECUTION TRACKER ─────────── */
+.tool-execution-tracker {
+  margin: 12px 0;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.tool-tracker-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tool-tracker-steps {
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+  gap: 4px;
+}
+
+.tool-tracker-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.tool-tracker-step.active {
+  background: rgba(108, 92, 231, 0.1);
+  color: var(--text);
+  border-left: 2px solid var(--accent);
+}
+
+.tool-tracker-step.done {
+  color: var(--text-tertiary);
+}
+
+.tool-tracker-result {
+  max-height: 120px;
+  overflow-y: auto;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.15);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border);
+}
+

@@ -315,13 +315,30 @@ export class ModelAdapter {
 
   private buildOllamaChatBody(request: ChatCompletionRequest, profile: { temperature: number; max_tokens: number }) {
     const think = this.mapReasoningEffortToOllamaThink(request.reasoning_effort);
+    const targetModel = request.model ?? this.model;
+    const lowerModel = targetModel.toLowerCase();
+    
+    let optTemperature = request.temperature ?? profile.temperature;
+    let optMaxTokens = request.max_tokens ?? profile.max_tokens;
+
+    // Architectural parameter tuning based on AI model name
+    if (lowerModel.includes('gemma')) {
+      optMaxTokens = Math.min(optMaxTokens, 8192); // Gemma specific token limit optimization
+      // Gemma often misinterprets deep structured JSON tools, so we lower temperature to constraint its creativity
+      optTemperature = Math.max(0.01, optTemperature * 0.8);
+    } else if (lowerModel.includes('deepseek')) {
+      optMaxTokens = Math.max(optMaxTokens, 16384); // Ensure reasoning ceiling is accommodated
+    } else if (lowerModel.includes('qwen')) {
+      optTemperature = Math.min(1.0, optTemperature * 1.1); // Make it slightly more creative safely
+    }
+
     const body: Record<string, unknown> = {
-      model: request.model ?? this.model,
+      model: targetModel,
       messages: mapMessagesToOllama(request.messages),
       stream: request.stream ?? false,
       options: {
-        temperature: request.temperature ?? profile.temperature,
-        num_predict: request.max_tokens ?? profile.max_tokens,
+        temperature: optTemperature,
+        num_predict: optMaxTokens,
       },
     };
 
@@ -338,8 +355,18 @@ export class ModelAdapter {
 
   private normalizeOllamaChatResponse(payload: any) {
     const ollamaMessage = payload?.message ?? {};
-    const thinking = extractText(ollamaMessage.thinking);
-    const content = extractText(ollamaMessage.content);
+    
+    // Explicitly handle alternate reasoning tags architectures (DeepSeek reasoning_content/think mappings)
+    let thinking = extractText(ollamaMessage.thinking);
+    let content = extractText(ollamaMessage.content);
+    
+    // Qwen tool translation intercept
+    if (content.includes('<|im_start|>tool') || content.includes('<tool_call>')) {
+      // Stub implementation: a real implementation would parse the xml into ollamaMessage.tool_calls securely
+      // This protects Qwen from spilling raw tool execution XML to UI
+      content = content.replace(/<\|im_start\|>tool[\s\S]*?(<\|im_end\|>|$)/g, '').replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
+    }
+
     const toolCalls = mapToolCallsToOpenAi(ollamaMessage.tool_calls);
 
     return {
@@ -387,7 +414,13 @@ export class ModelAdapter {
           const payload = JSON.parse(trimmed);
           const message = payload?.message ?? {};
           const thinking = extractText(message.thinking);
-          const content = extractText(message.content);
+          let content = extractText(message.content);
+          
+          // Qwen tool translation intercept for streaming chunks
+          if (content.includes('<|im_start|>tool') || content.includes('<tool_call>')) {
+            content = content.replace(/<\|im_start\|>tool[\s\S]*?(<\|im_end\|>|$)/g, '').replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
+          }
+          
           const toolCalls = mapToolCallsToOpenAi(message.tool_calls);
           const delta: Record<string, unknown> = {};
 
@@ -752,11 +785,26 @@ export class ModelAdapter {
 
     const profile = PROFILES[this.profileName] || PROFILES['balanced'];
     
+    const targetModel = request.model ?? this.model;
+    const lowerModel = targetModel.toLowerCase();
+    
+    let optTemperature = request.temperature ?? profile.temperature;
+    let optMaxTokens = request.max_tokens ?? profile.max_tokens;
+
+    if (lowerModel.includes('gemma')) {
+      optMaxTokens = Math.min(optMaxTokens, 8192);
+      optTemperature = Math.max(0.01, optTemperature * 0.8);
+    } else if (lowerModel.includes('deepseek')) {
+      optMaxTokens = Math.max(optMaxTokens, 16384);
+    } else if (lowerModel.includes('qwen')) {
+      optTemperature = Math.min(1.0, optTemperature * 1.1);
+    }
+    
     const payload = {
-      model: request.model ?? this.model,
+      model: targetModel,
       messages: request.messages,
-      temperature: request.temperature ?? profile.temperature,
-      max_tokens: request.max_tokens ?? profile.max_tokens,
+      temperature: optTemperature,
+      max_tokens: optMaxTokens,
       reasoning_effort: request.reasoning_effort,
       stream: request.stream ?? false,
       tools: request.tools

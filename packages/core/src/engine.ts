@@ -9,6 +9,7 @@ import { FileSessionStore, SessionMetadata } from '@local-harness/session-store'
 import { ToolRegistry } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
+import { PromptAnalyzer } from './prompt-analyzer';
 
 const SUPPORTED_TOOLS = [
   'glob',
@@ -1512,6 +1513,29 @@ export class CoreEngine extends EventEmitter {
 
     const latestUserMessage = this.getLatestUserMessage(messages);
     const browserFolderContextActive = this.hasBrowserFolderContext(messages);
+
+    // Initialize and run Prompt Analyzer
+    const analyzer = new PromptAnalyzer(this.modelAdapter);
+    if (streamHandlers?.onStatus) {
+      streamHandlers.onStatus({ phase: 'Prompt Evaluation', action: 'Analyzing task complexity', loop: 0 });
+    }
+    const analysis = await analyzer.analyzeAndRefine(messages, options?.signal);
+    
+    if (analysis.needsClarification && analysis.clarifyingQuestions?.length) {
+      const qns = analysis.clarifyingQuestions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+      const response = `<think>The user task is highly complex and lacks specific instruction. I need to ask for clarification before proceeding to avoid mistakes and ensure I accomplish what they want properly.</think>\nThis sounds like a great task! However, to make sure I deliver exactly what you're looking for, please clarify the following points:\n\n${qns}`;
+      this.completeImmediateResponse(streamHandlers, { content: response, action: 'Requested clarification', source: 'analyzer' });
+      await this.persistCurrentSession();
+      return response;
+    }
+
+    if (analysis.refinedPrompt && analysis.refinedPrompt !== analysis.originalPrompt) {
+      // Safely mutate the last message to use the refined prompt from the analyzer
+      const lastMsg = messages[messages.length - 1];
+      if (lastMsg && lastMsg.role === 'user') {
+        lastMsg.content = analysis.refinedPrompt;
+      }
+    }
 
     if (!browserFolderContextActive && this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
       const localAnswer = await this.tryAnswerFromLocalState(latestUserMessage);
