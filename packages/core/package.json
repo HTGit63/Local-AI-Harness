@@ -1,0 +1,24 @@
+{
+  "name": "@local-harness/core",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@local-harness/model-adapter": "file:../model-adapter",
+    "@local-harness/workspace-policy": "file:../workspace-policy",
+    "@local-harness/session-store": "file:../session-store",
+    "@local-harness/trace-bus": "file:../trace-bus",
+    "@local-harness/tool-runtime": "file:../tool-runtime",
+    "@local-harness/planner": "file:../planner",
+    "@local-harness/approval-workflow": "file:../approval-workflow",
+    "@local-harness/prompt-recipes": "file:../prompt-recipes",
+    "@local-harness/repo-indexer": "file:../repo-indexer"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^18.0.0"
+  }
+}

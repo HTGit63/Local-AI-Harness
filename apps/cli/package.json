@@ -1,0 +1,20 @@
+{
+  "name": "@local-harness/cli",
+  "version": "0.1.0",
+  "bin": {
+    "harness": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node ./dist/cli.js"
+  },
+  "dependencies": {
+    "@local-harness/core": "file:../../packages/core",
+    "@local-harness/doctor": "file:../../packages/doctor",
+    "@local-harness/skills": "file:../../packages/skills"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^5.0.0"
+  }
+}

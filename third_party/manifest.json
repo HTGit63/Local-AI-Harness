@@ -1,0 +1,37 @@
+{
+  "sync_date": "2026-04-10",
+  "repositories": [
+    {
+      "name": "openclaw",
+      "upstream": "https://github.com/openclaw/openclaw.git",
+      "default_branch": "main",
+      "pinned_sha": "9fd08f9d0f54bc1f811d6dfbcc619cb7e565fca9",
+      "local_path": "third_party/openclaw",
+      "purpose": "Gateway/control-plane concepts, web/chat surfaces, workspace semantics"
+    },
+    {
+      "name": "claw-code",
+      "upstream": "https://github.com/ultraworkers/claw-code.git",
+      "default_branch": "main",
+      "pinned_sha": "8aa1fa2cc931007f537854b1b0f0b61fdc986a50",
+      "local_path": "third_party/claw-code",
+      "purpose": "CLI harness behavior, session model, permission modes, OpenAI-compatible local provider route"
+    },
+    {
+      "name": "agency-agents",
+      "upstream": "https://github.com/msitarzewski/agency-agents.git",
+      "default_branch": "main",
+      "pinned_sha": "4feb0cd736dd0e2e9830cd54dfc99770621bed90",
+      "local_path": "third_party/agency-agents",
+      "purpose": "Primary source of reusable specialist skills and personas"
+    },
+    {
+      "name": "Prompt-Engineering-Guide",
+      "upstream": "https://github.com/dair-ai/Prompt-Engineering-Guide.git",
+      "default_branch": "main",
+      "pinned_sha": "57673726396dd94acb23bdb1e67f27c78ee85a8e",
+      "local_path": "third_party/Prompt-Engineering-Guide",
+      "purpose": "Prompt recipes, eval prompts, and toolkit patterns"
+    }
+  ]
+}

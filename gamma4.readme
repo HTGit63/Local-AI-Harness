@@ -1,0 +1,49 @@
+# Gamma 4 Harness
+
+This repository contains the Offline Local Coding Harness built specifically for local inference (running Gemma 4 E4B models via Ollama on constrained hardware). It allows for powerful offline agentic coding with a clear trace stream and built-in file writing approvals.
+
+## High-Level Architecture
+The project is built as a TypeScript monorepo containing front-end applications, a backend API, CLI interfaces, and several isolated Node.js packages representing the core engine logic. 
+
+## Directory and File Breakdown
+
+### Root Configuration and Documentation
+- `AGENTS.md` and `AGENTS_local_harness.md`: These files define the build contract, objectives, and parameters for creating this specific agent harness. It functions as a source of truth for the repository structure and operational limits.
+- `README.md`: The general repository README containing quick-start instructions.
+- `gamma4.readme`: This file, explaining the internal file structure of the workspace in details.
+- `docker-compose.yml`, `Dockerfile.api`, `Dockerfile.web`: Container definitions that allow deploying the web interface and API service reliably across systems.
+- `nginx.conf`: Proxies requests locally for Docker setups to ensure Web and API servers can communicate seamlessly.
+- `package.json` and `package-lock.json`: The monorepo NPM workspace configuration handling all dependencies and builds across `apps/` and `packages/` workspaces.
+- `.dockerignore`, `.gamma-harness`, `.playwright-cli`: Internal caching, docker exclusions, and hidden directories for keeping tool/session state cleanly separated.
+
+### Applications (`apps/`)
+This folder contains the primary runnable entry points of the system.
+- `apps/cli/`: 
+  The interactive Node.js terminal app. This powers the `gamma> ` prompt, allowing slash commands (`/model`, `/skills`, `/status`, `/bye`, `/clear`, `/quit`, etc.) and interactive session handling directly from the shell without the browser.
+- `apps/api/`:
+  The backend API service that interacts with the Web application, resolving frontend requests over HTTP to the `core` engine.
+- `apps/web/`:
+  The Localhost Web UI which provides a Graphical User Interface to track trace events, view active tools, approve file modifications, and switch skills seamlessly.
+
+### Core Engine and Libraries (`packages/`)
+This isolates specific functional responsibilities into testable TypeScript modules.
+- `@local-harness/approval-workflow`: Intercepts filesystem-modifying tools, prompting the user (via CLI or UI queue) before making potentially dangerous writes.
+- `@local-harness/core`: The main brain. Binds all packages together, tracking session flows and dispatching tool/agent actions.
+- `@local-harness/doctor`: System diagnostics checker ensuring Ollama health and proper system dependencies (`harness doctor`).
+- `@local-harness/exporters`: Adapters for exporting skill artifacts.
+- `@local-harness/model-adapter`: Safely manages communication sequences with Ollama and OpenAI-flavored /v1 endpoints, handling streaming generation logs.
+- `@local-harness/planner`: Orchestrates the action-plan chain, keeping the model anchored to the main objective without rambling.
+- `@local-harness/prompt-recipes`: Pre-built system contexts and tool templates extracted from advanced references.
+- `@local-harness/repo-indexer`: A retrieval-augmented generation (RAG) feature that allows the model to search through the current project workspace.
+- `@local-harness/session-store`: Saves logs of past agent runs so conversations can be `resumed` or analyzed over time.
+- `@local-harness/skills`: Manages specialized persona abilities (like code reviews, product management context, database specialization).
+- `@local-harness/tool-runtime`: Sandboxed execution engine for safe file reads, path manipulations, shell commands and parsing.
+- `@local-harness/trace-bus`: Eventing stream that broadcasts active model states and reasoning traces live to Web/CLI loops (the "Thinking..." visual stream).
+- `@local-harness/workspace-policy`: Evaluator that rigorously enforces directory boundaries depending on permission modes (read-only vs workspace-write modes).
+
+### Shared Upstream Depots and Tooling
+- `base_repos/` and `third_party/`:
+  These directories act as preserved "vendor" clones of reference repositories: `claw-code` (reference for CLI features & slash commands), `agency-agents` (library of specialized prompts), `openclaw`, and `Prompt-Engineering-Guide`.
+- `scripts/`: Assorted bash & Node.js CI/local tasks utilized for cross-checking builds, copying vendor configurations, or benchmarking agent responses.
+- `tests/`: End-to-End browser checks, CLI binary expectations, Integration workflows, and localized Unit testing paths testing `packages`.
+- `docs/`: Technical documents retaining design decisions (Decision Records), architecture diagrams, local UX plans, and capability parity charts.

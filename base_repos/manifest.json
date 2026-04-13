@@ -1,0 +1,29 @@
+{
+  "repositories": [
+    {
+      "name": "openclaw",
+      "upstream": "https://github.com/openclaw/openclaw.git",
+      "local_path": "openclaw",
+      "purpose": "Gateway/control-plane concepts, web/chat surfaces, workspace semantics"
+    },
+    {
+      "name": "claw-code",
+      "upstream": "https://github.com/ultraworkers/claw-code.git",
+      "local_path": "claw-code",
+      "purpose": "CLI harness behavior, session model, permission modes, OpenAI-compatible local provider route"
+    },
+    {
+      "name": "agency-agents",
+      "upstream": "https://github.com/msitarzewski/agency-agents.git",
+      "local_path": "agency-agents",
+      "purpose": "Primary source of reusable specialist skills and personas"
+    },
+    {
+      "name": "Prompt-Engineering-Guide",
+      "upstream": "https://github.com/dair-ai/Prompt-Engineering-Guide.git",
+      "local_path": "Prompt-Engineering-Guide",
+      "purpose": "Prompt recipes, eval prompts, and toolkit patterns"
+    }
+  ],
+  "sync_date": "2026-04-10"
+}

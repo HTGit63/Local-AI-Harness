@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "strict": true,
+    "types": ["node"],
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@local-harness/*": ["../packages/*/src"]
+    }
+  },
+  "include": ["unit/**/*", "integration/**/*", "e2e/**/*", "mocks/**/*"]
+}

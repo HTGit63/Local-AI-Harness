@@ -1,0 +1,16 @@
+{
+  "name": "@local-harness/api",
+  "version": "0.1.0",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "@local-harness/core": "file:../../packages/core"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^18.0.0"
+  }
+}

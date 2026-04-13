@@ -1,0 +1,34 @@
+import { AdapterOptions, ChatCompletionRequest, ModelRuntimeState, ModelSwitchResult } from './types';
+export declare class ModelAdapter {
+    private baseUrl;
+    private apiKey;
+    private model;
+    private timeoutMs;
+    private retries;
+    private profileName;
+    private lastSwitchResult;
+    private readonly capabilityCache;
+    private nativeChatSupported;
+    constructor(options?: Partial<AdapterOptions>);
+    updateConfig(options?: Partial<AdapterOptions>): void;
+    private get headers();
+    private get nativeBaseUrl();
+    private fetchJson;
+    private supportsOllamaNativeChat;
+    private mapReasoningEffortToOllamaThink;
+    private buildOllamaChatBody;
+    private normalizeOllamaChatResponse;
+    private wrapOllamaStreamAsOpenAi;
+    private createOllamaChatCompletion;
+    private tryListRunningModels;
+    private listInstalledModels;
+    private unloadModel;
+    private preloadModel;
+    isHealthy(): Promise<boolean>;
+    listModels(): Promise<any[]>;
+    getRuntimeState(): Promise<ModelRuntimeState>;
+    getModelCapabilities(modelName?: string): Promise<string[] | null>;
+    activateModel(requestedModel: string, previousModel?: string | null): Promise<ModelSwitchResult>;
+    private fetchWithRetry;
+    createChatCompletion(request: ChatCompletionRequest): Promise<any>;
+}
