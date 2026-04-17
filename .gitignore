@@ -50,5 +50,5 @@ Thumbs.db
 
 # Gamma harness specific
 .gamma-harness/
+.playwright-cli/
 scratch/
-

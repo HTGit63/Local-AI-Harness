@@ -14,12 +14,12 @@ The project is built as a TypeScript monorepo containing front-end applications,
 - `docker-compose.yml`, `Dockerfile.api`, `Dockerfile.web`: Container definitions that allow deploying the web interface and API service reliably across systems.
 - `nginx.conf`: Proxies requests locally for Docker setups to ensure Web and API servers can communicate seamlessly.
 - `package.json` and `package-lock.json`: The monorepo NPM workspace configuration handling all dependencies and builds across `apps/` and `packages/` workspaces.
-- `.dockerignore`, `.gamma-harness`, `.playwright-cli`: Internal caching, docker exclusions, and hidden directories for keeping tool/session state cleanly separated.
+- `.dockerignore`, `.gamma-harness`: Docker exclusions and local harness state kept outside normal project source.
 
 ### Applications (`apps/`)
 This folder contains the primary runnable entry points of the system.
 - `apps/cli/`: 
-  The interactive Node.js terminal app. This powers the `gamma> ` prompt, allowing slash commands (`/model`, `/skills`, `/status`, `/bye`, `/clear`, `/quit`, etc.) and interactive session handling directly from the shell without the browser.
+  The terminal interface. It supports command-style usage (`doctor`, `benchmark`, `prompt`, `session`, `workspace`, `skills`, `model`, `config`) and also offers interactive REPL chat with slash commands.
 - `apps/api/`:
   The backend API service that interacts with the Web application, resolving frontend requests over HTTP to the `core` engine.
 - `apps/web/`:
@@ -30,7 +30,6 @@ This isolates specific functional responsibilities into testable TypeScript modu
 - `@local-harness/approval-workflow`: Intercepts filesystem-modifying tools, prompting the user (via CLI or UI queue) before making potentially dangerous writes.
 - `@local-harness/core`: The main brain. Binds all packages together, tracking session flows and dispatching tool/agent actions.
 - `@local-harness/doctor`: System diagnostics checker ensuring Ollama health and proper system dependencies (`harness doctor`).
-- `@local-harness/exporters`: Adapters for exporting skill artifacts.
 - `@local-harness/model-adapter`: Safely manages communication sequences with Ollama and OpenAI-flavored /v1 endpoints, handling streaming generation logs.
 - `@local-harness/planner`: Orchestrates the action-plan chain, keeping the model anchored to the main objective without rambling.
 - `@local-harness/prompt-recipes`: Pre-built system contexts and tool templates extracted from advanced references.

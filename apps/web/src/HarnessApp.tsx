@@ -13,6 +13,9 @@ const API = getApiBase();
 const MAX_PREVIEW_CHARS = 120_000;
 const MAX_BROWSER_CONTEXT_CHARS = 48_000;
 const MAX_BROWSER_TREE_LINES = 220;
+const MAX_IMAGE_ATTACHMENTS = 2;
+const MAX_IMAGE_BYTES = 1024 * 1024;
+const AGENTIC_STORAGE_KEY = 'gamma-harness.agentic-mode';
 
 /* ─────────── Types ─────────── */
 type ChatRole = 'user' | 'assistant';
@@ -28,6 +31,17 @@ interface ChatMessage {
   createdAt: number;
   activity: string[];
   status?: 'sending' | 'streaming' | 'sent' | 'error';
+  attachments?: MessageImageAttachment[];
+}
+
+interface MessageImageAttachment {
+  id: string;
+  name: string;
+  dataUrl: string;
+}
+
+interface ComposerImageAttachment extends MessageImageAttachment {
+  base64: string;
 }
 
 interface ConfigState {
@@ -48,6 +62,14 @@ interface SessionState {
   cwd: string;
   skillsActive: string[];
   toolsAllowlist: string[];
+  turnHistory?: Array<{
+    timestamp: number;
+    executionMode: 'direct' | 'agentic';
+    promptMode?: string;
+    messageCount: number;
+    thinkingEnabled?: boolean;
+    imageCount?: number;
+  }>;
 }
 
 interface TraceEntry {
@@ -225,6 +247,15 @@ function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
       throw new Error(text || `Request failed: ${res.status}`);
     }
     return res.json() as Promise<T>;
+  });
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('Failed to read file.'));
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.readAsDataURL(file);
   });
 }
 
@@ -548,8 +579,9 @@ function buildSystemPrompt(mode: ConversationMode, opts: {
     opts.selectedFile && `Selected file: ${opts.selectedFile}.`,
     opts.repoSummary && `Repo summary: ${opts.repoSummary}`,
   ].filter(Boolean).join(' ');
+  const skillsList = opts.selectedSkills.join(', ');
   const skills = opts.selectedSkills.length > 0
-    ? `Active skills: ${opts.selectedSkills.join(', ')}.`
+    ? `Active skills: ${skillsList}. ${opts.selectedSkills.includes('caveman') ? 'Guardrail: Never compress structured JSON, code blocks, shell commands, safety warnings, or approval prompts.' : ''}`
     : '';
   return [
     'You are a local-first agentic coding assistant.',
@@ -608,7 +640,7 @@ function HarnessApp() {
   const [session, setSession] = useState<SessionState | null>(null);
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [skills, setSkills] = useState<SkillMetadata[]>([]);
-  const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
+  const [selectedSkills, setSelectedSkills] = useState<string[]>(['caveman']);
   const [traces, setTraces] = useState<TraceEntry[]>([]);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [plan, setPlan] = useState<PlanState | null>(null);
@@ -620,7 +652,18 @@ function HarnessApp() {
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [chatMode, setChatMode] = useState<ConversationMode>('general');
-  const [isAgentic, setIsAgentic] = useState(true);
+  const [isAgentic, setIsAgentic] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    const stored = window.localStorage.getItem(AGENTIC_STORAGE_KEY);
+    return stored === null ? true : stored === 'true';
+  });
+  const [thinkingEnabled, setThinkingEnabled] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    const stored = window.localStorage.getItem('gamma-harness.thinking-mode');
+    return stored === null ? false : stored === 'true';
+  });
+  const [attachedImages, setAttachedImages] = useState<ComposerImageAttachment[]>([]);
+  const [attachmentNotice, setAttachmentNotice] = useState('');
   const [streamStatus, setStreamStatus] = useState('');
 
   // Browser file state
@@ -641,8 +684,10 @@ function HarnessApp() {
 
   // Refs
   const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const lastConfigSigRef = useRef('');
+  const lastTraceTimestampRef = useRef(0);
 
   // Derived
   const modelOptions = useMemo(() => {
@@ -650,6 +695,10 @@ function HarnessApp() {
     if (modelDraft.trim()) opts.add(modelDraft.trim());
     return Array.from(opts);
   }, [modelDraft, modelRuntime]);
+  const thinkingSupported = useMemo(() => modelRuntime?.configuredModelCapabilities?.includes('thinking') ?? false, [modelRuntime]);
+  const thinkingWarning = thinkingEnabled && modelRuntime && !thinkingSupported
+    ? 'Thinking unavailable on current model; toggle may be ignored.'
+    : '';
 
   const workspaceSelection = useMemo(() => buildWorkspaceSelection(config?.workspaceRoot, repoContext?.files), [config?.workspaceRoot, repoContext?.files]);
   const sidebarSelection = workspaceSelection || browserSelection;
@@ -662,15 +711,83 @@ function HarnessApp() {
   const activeModelLabel = modelRuntime?.activeModel || config?.model || 'No model';
 
   /* ─── Refresh dashboard data ─── */
-  const refreshDashboard = useCallback(async () => {
+  const refreshDashboard = useCallback(async (mode: 'full' | 'live' = 'full') => {
     const safe = async <T,>(url: string, fallback: T): Promise<T> => {
       try { return await fetchJson<T>(url); } catch { return fallback; }
     };
     try {
+      const traceUrl = mode === 'full' || lastTraceTimestampRef.current === 0
+        ? `${API}/trace?limit=240`
+        : `${API}/trace?since=${lastTraceTimestampRef.current}`;
+
+      const applyCoreState = (
+        health: { status: BackendStatus },
+        cfg: ConfigState | null,
+        traceEntries: TraceEntry[],
+        approvalItems: ApprovalItem[],
+        planState: PlanState | null,
+        runtimeState: ModelRuntimeState | null,
+        sessionState: SessionState | null,
+      ) => {
+        setBackendStatus(health.status);
+        setConfig(cfg);
+        setApprovals(approvalItems);
+        setPlan(planState);
+        setModelRuntime(runtimeState);
+        setSession(sessionState);
+        setTraces((current) => {
+          if (traceEntries.length > 0) {
+            lastTraceTimestampRef.current = traceEntries[traceEntries.length - 1].timestamp;
+          }
+
+          return mode === 'full'
+            ? traceEntries.slice(-240)
+            : [...current, ...traceEntries].slice(-240);
+        });
+
+        if (sessionState?.skillsActive?.length) {
+          setSelectedSkills((cur) => cur.length > 0 ? cur : sessionState.skillsActive);
+        }
+
+        if (cfg) {
+          const sig = JSON.stringify({
+            workspaceRoot: cfg.workspaceRoot,
+            baseUrl: cfg.baseUrl,
+            model: cfg.model,
+            profile: cfg.profile,
+            mode: cfg.mode,
+          });
+
+          if (sig !== lastConfigSigRef.current) {
+            lastConfigSigRef.current = sig;
+            setWorkspaceRootDraft(cfg.workspaceRoot);
+            setBaseUrlDraft(cfg.baseUrl);
+            setModelDraft(cfg.model);
+            setProfileDraft(cfg.profile);
+            setModeDraft(cfg.mode);
+          }
+        }
+      };
+
+      if (mode === 'live') {
+        const [health, cfg, tr, ap, pl, mrt, sess] = await Promise.all([
+          safe<{ status: BackendStatus }>(`${API}/health`, { status: 'offline' }),
+          safe<ConfigState | null>(`${API}/config`, null),
+          safe<TraceEntry[]>(traceUrl, []),
+          safe<ApprovalItem[]>(`${API}/approvals`, []),
+          safe<PlanState | null>(`${API}/plan`, null),
+          safe<ModelRuntimeState | null>(`${API}/model/runtime`, null),
+          safe<SessionState | null>(`${API}/session`, null),
+        ]);
+
+        applyCoreState(health, cfg, tr, ap, pl, mrt, sess);
+        return;
+      }
+
       const [health, cfg, tr, ap, pl, mrt, sess, sessList, sk, repo, diff] = await Promise.all([
         safe<{ status: BackendStatus }>(`${API}/health`, { status: 'offline' }),
         safe<ConfigState | null>(`${API}/config`, null),
-        safe<TraceEntry[]>(`${API}/trace`, []),
+        safe<TraceEntry[]>(traceUrl, []),
         safe<ApprovalItem[]>(`${API}/approvals`, []),
         safe<PlanState | null>(`${API}/plan`, null),
         safe<ModelRuntimeState | null>(`${API}/model/runtime`, null),
@@ -680,36 +797,23 @@ function HarnessApp() {
         safe<RepoContext | null>(`${API}/workspace/index`, null),
         safe<{ output: string }>(`${API}/workspace/git/diff`, { output: '' }),
       ]);
-      setBackendStatus(health.status);
-      setConfig(cfg);
-      setTraces(tr);
-      setApprovals(ap);
-      setPlan(pl);
-      setModelRuntime(mrt);
-      setSession(sess);
+
+      applyCoreState(health, cfg, tr, ap, pl, mrt, sess);
       setSessions(sessList);
       setSkills(sk);
       setRepoContext(repo);
       setGitDiff(diff.output);
-      if (sess?.skillsActive?.length) setSelectedSkills(cur => cur.length > 0 ? cur : sess.skillsActive);
-      if (cfg) {
-        const sig = JSON.stringify({ workspaceRoot: cfg.workspaceRoot, baseUrl: cfg.baseUrl, model: cfg.model, profile: cfg.profile, mode: cfg.mode });
-        if (sig !== lastConfigSigRef.current) {
-          lastConfigSigRef.current = sig;
-          setWorkspaceRootDraft(cfg.workspaceRoot);
-          setBaseUrlDraft(cfg.baseUrl);
-          setModelDraft(cfg.model);
-          setProfileDraft(cfg.profile);
-          setModeDraft(cfg.mode);
-        }
-      }
     } catch { setBackendStatus('offline'); }
   }, []);
 
   useEffect(() => {
-    void refreshDashboard();
-    const id = setInterval(() => void refreshDashboard(), 3000);
-    return () => clearInterval(id);
+    void refreshDashboard('full');
+    const liveId = setInterval(() => void refreshDashboard('live'), 3000);
+    const fullId = setInterval(() => void refreshDashboard('full'), 15000);
+    return () => {
+      clearInterval(liveId);
+      clearInterval(fullId);
+    };
   }, [refreshDashboard]);
 
   useEffect(() => {
@@ -728,6 +832,22 @@ function HarnessApp() {
     setExpandedPaths(new Set(['.']));
     setWorkspacePreview(null);
   }, [workspaceSelection?.label]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(AGENTIC_STORAGE_KEY, String(isAgentic));
+    } catch {
+      // ignore storage errors
+    }
+  }, [isAgentic]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('gamma-harness.thinking-mode', String(thinkingEnabled));
+    } catch {
+      // ignore storage errors
+    }
+  }, [thinkingEnabled]);
 
   /* ─── Session management ─── */
   async function ensureSession(): Promise<SessionState> {
@@ -806,21 +926,33 @@ function HarnessApp() {
   /* ─── Chat ─── */
   async function sendChat() {
     const content = draft.trim();
-    if (!content || isSending) return;
+    if (isSending) return;
+    if (!content && attachedImages.length === 0) return;
     setIsSending(true);
     setStreamStatus('Preparing request');
     let placeholderId = '';
     try {
       const activeSession = await ensureSession();
       const now = Date.now();
-      const userMsg: ChatMessage = { id: makeId('msg'), role: 'user', content, mode: chatMode, createdAt: now, activity: [], status: 'sent' };
+      const userAttachments = attachedImages.map(({ id, name, dataUrl }) => ({ id, name, dataUrl }));
+      const userMsg: ChatMessage = {
+        id: makeId('msg'),
+        role: 'user',
+        content,
+        mode: chatMode,
+        createdAt: now,
+        activity: [],
+        status: 'sent',
+        attachments: userAttachments,
+      };
       const placeholder: ChatMessage = { id: makeId('msg'), role: 'assistant', content: '', mode: chatMode, createdAt: now + 1, activity: [], status: 'sending' };
       placeholderId = placeholder.id;
       const browserContext = buildBrowserContextMessage(browserSelection, browserPreview);
+      const activeSkillsForPrompt = isAgentic ? selectedSkills : selectedSkills.filter(s => s !== 'caveman');
       const prompt = buildSystemPrompt(chatMode, {
         workspace: config?.workspaceRoot,
         sessionId: activeSession.id,
-        selectedSkills,
+        selectedSkills: activeSkillsForPrompt,
         folderLabel: browserSelection?.label,
         selectedFile: workspacePreview?.path || browserPreview?.path,
         repoSummary: repoContext?.summary,
@@ -840,7 +972,12 @@ function HarnessApp() {
       await streamNdjson(`${API}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: requestMessages, agentic: isAgentic }),
+        body: JSON.stringify({
+          messages: requestMessages,
+          agentic: isAgentic,
+          thinking: thinkingEnabled,
+          images: attachedImages.map(image => image.base64),
+        }),
       }, (event) => {
         if (event.type === 'status') {
           const nextStep = event.action || event.phase;
@@ -890,6 +1027,8 @@ function HarnessApp() {
     } finally {
       setIsSending(false);
       setStreamStatus('');
+      setAttachedImages([]);
+      setAttachmentNotice('');
       await refreshDashboard();
     }
   }
@@ -974,6 +1113,53 @@ function HarnessApp() {
         setBrowserLoading(false);
       }
     })();
+  }
+
+  async function handleImageInput(e: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!files.length) return;
+
+    const imageFiles = files.filter(file => file.type.startsWith('image/'));
+    const rejectedTypeCount = files.length - imageFiles.length;
+    const validSizeFiles = imageFiles.filter(file => file.size <= MAX_IMAGE_BYTES);
+    const rejectedSizeCount = imageFiles.length - validSizeFiles.length;
+    const remainingSlots = Math.max(0, MAX_IMAGE_ATTACHMENTS - attachedImages.length);
+    const acceptedFiles = validSizeFiles.slice(0, remainingSlots);
+    const rejectedCount = validSizeFiles.length - acceptedFiles.length;
+    const notices: string[] = [];
+
+    if (rejectedTypeCount > 0) {
+      notices.push('Only image files are supported; audio/video stay future work.');
+    }
+    if (rejectedSizeCount > 0) {
+      notices.push(`Images must be ${formatBytes(MAX_IMAGE_BYTES)} or smaller.`);
+    }
+    if (rejectedCount > 0) {
+      notices.push(`Only ${MAX_IMAGE_ATTACHMENTS} image${MAX_IMAGE_ATTACHMENTS > 1 ? 's' : ''} can be attached per turn.`);
+    }
+
+    const encoded = await Promise.all(acceptedFiles.map(async (file) => {
+      try {
+        const dataUrl = await readFileAsDataUrl(file);
+        const base64 = dataUrl.split(',')[1] || '';
+        if (!base64) return null;
+        return {
+          id: makeId('img'),
+          name: file.name,
+          dataUrl,
+          base64,
+        } satisfies ComposerImageAttachment;
+      } catch {
+        return null;
+      }
+    }));
+
+    const next = encoded.filter((image): image is ComposerImageAttachment => image !== null);
+    if (next.length > 0) {
+      setAttachedImages(cur => [...cur, ...next]);
+    }
+    setAttachmentNotice(notices.join(' '));
   }
 
   async function previewFile(node: BrowserFileNode) {
@@ -1133,88 +1319,124 @@ function HarnessApp() {
                 </div>
               </div>
             ) : (
-              messages.map(msg => (
-                <div key={msg.id} className={`chat-msg ${msg.status === 'sending' ? 'chat-msg-pending' : ''} ${msg.status === 'error' ? 'chat-msg-error' : ''}`}>
-                  <div className={`chat-msg-row ${msg.role === 'user' ? 'chat-msg-row-user' : ''}`}>
-                    <div className={`chat-avatar ${msg.role === 'user' ? 'chat-avatar-user' : 'chat-avatar-assistant'}`}>
-                      {msg.role === 'user' ? 'U' : 'G4'}
-                    </div>
-                    <div className="chat-msg-content">
-                      <div className="chat-msg-header">
-                        <span className="chat-msg-name">{msg.role === 'user' ? 'You' : 'Assistant'}</span>
-                        <span className="chat-msg-time">{formatTime(msg.createdAt)}</span>
+              messages.map(msg => {
+                const hasUserImages = msg.role === 'user' && (msg.attachments?.length || 0) > 0;
+                const showMessageBody = msg.status === 'sending' || Boolean(msg.content);
+                return (
+                  <div key={msg.id} className={`chat-msg ${msg.status === 'sending' ? 'chat-msg-pending' : ''} ${msg.status === 'error' ? 'chat-msg-error' : ''}`}>
+                    <div className={`chat-msg-row ${msg.role === 'user' ? 'chat-msg-row-user' : ''}`}>
+                      <div className={`chat-avatar ${msg.role === 'user' ? 'chat-avatar-user' : 'chat-avatar-assistant'}`}>
+                        {msg.role === 'user' ? 'U' : 'G4'}
                       </div>
-                      {msg.role === 'assistant' && msg.activity.length > 0 && (
-                        <div className="tool-execution-tracker">
-                          <div className="tool-tracker-header">
-                            <span>🔄 Tool Activity</span>
-                          </div>
-                          <div className="tool-tracker-steps">
-                            {msg.activity.map((step, index) => {
-                              let badgeClass = 'tool-badge-system';
-                              let badgeText = 'SYS';
-                              const lowerStep = step.toLowerCase();
-                              if (lowerStep.includes('read') || lowerStep.includes('search') || lowerStep.includes('glob') || lowerStep.includes('list')) {
-                                badgeClass = 'tool-badge-read';
-                                badgeText = 'READ';
-                              } else if (lowerStep.includes('write') || lowerStep.includes('patch') || lowerStep.includes('make')) {
-                                badgeClass = 'tool-badge-write';
-                                badgeText = 'WRITE';
-                              } else if (lowerStep.includes('delete') || lowerStep.includes('run') || lowerStep.includes('git')) {
-                                badgeClass = 'tool-badge-danger';
-                                badgeText = 'EXEC';
-                              }
-                              const isActive = index === msg.activity.length - 1 && msg.status !== 'sent';
-                              const isDone = msg.status === 'sent' || index < msg.activity.length - 1;
-                              return (
-                                <div
-                                  key={`${msg.id}-step-${index}`}
-                                  className={`tool-tracker-step ${isActive ? 'active' : ''} ${isDone ? 'done' : ''}`}
-                                >
-                                  <span className={`tool-badge ${badgeClass}`}>{badgeText}</span>
-                                  <span>{step}</span>
-                                </div>
-                              );
-                            })}
-                          </div>
+                      <div className="chat-msg-content">
+                        <div className="chat-msg-header">
+                          <span className="chat-msg-name">{msg.role === 'user' ? 'You' : 'Assistant'}</span>
+                          <span className="chat-msg-time">{formatTime(msg.createdAt)}</span>
                         </div>
-                      )}
-                      <div className="chat-msg-body">
-                        {msg.status === 'sending' && !msg.content ? (
-                          <div className="chat-typing">
-                            <span /><span /><span />
+                        {msg.role === 'assistant' && msg.activity.length > 0 && (
+                          <div className="tool-execution-tracker">
+                            <div className="tool-tracker-header">
+                              <span>🔄 Tool Activity</span>
+                            </div>
+                            <div className="tool-tracker-steps">
+                              {msg.activity.map((step, index) => {
+                                let badgeClass = 'tool-badge-system';
+                                let badgeText = 'SYS';
+                                const lowerStep = step.toLowerCase();
+                                if (lowerStep.includes('read') || lowerStep.includes('search') || lowerStep.includes('glob') || lowerStep.includes('list')) {
+                                  badgeClass = 'tool-badge-read';
+                                  badgeText = 'READ';
+                                } else if (lowerStep.includes('write') || lowerStep.includes('patch') || lowerStep.includes('make')) {
+                                  badgeClass = 'tool-badge-write';
+                                  badgeText = 'WRITE';
+                                } else if (lowerStep.includes('delete') || lowerStep.includes('run') || lowerStep.includes('git')) {
+                                  badgeClass = 'tool-badge-danger';
+                                  badgeText = 'EXEC';
+                                }
+                                const isActive = index === msg.activity.length - 1 && msg.status !== 'sent';
+                                const isDone = msg.status === 'sent' || index < msg.activity.length - 1;
+                                return (
+                                  <div
+                                    key={`${msg.id}-step-${index}`}
+                                    className={`tool-tracker-step ${isActive ? 'active' : ''} ${isDone ? 'done' : ''}`}
+                                  >
+                                    <span className={`tool-badge ${badgeClass}`}>{badgeText}</span>
+                                    <span>{step}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
                           </div>
-                        ) : (
-                          msg.content.split(/(<think>[\s\S]*?(?:<\/think>|$))/gi).map((part, i) => {
-                            if (part.toLowerCase().startsWith('<think>')) {
-                              let inner = part.slice(7);
-                              if (inner.toLowerCase().endsWith('</think>')) {
-                                inner = inner.slice(0, -8);
-                              }
-                              return (
-                                <details key={i} className="ai-thought-block" open>
-                                  <summary className="ai-thought-header">
-                                    <span className="ai-thought-icon">🧠</span>
-                                    <span>Reasoning Process</span>
-                                  </summary>
-                                  <div className="ai-thought-content">{inner}</div>
-                                </details>
-                              );
-                            }
-                            return <span key={i} style={{ whiteSpace: 'pre-wrap' }}>{part}</span>;
-                          })
+                        )}
+                        {hasUserImages && (
+                          <div className="chat-msg-attachments">
+                            {msg.attachments?.map(image => (
+                              <a
+                                key={image.id}
+                                className="chat-msg-attachment"
+                                href={image.dataUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                title={image.name}
+                              >
+                                <img src={image.dataUrl} alt={image.name} loading="lazy" />
+                              </a>
+                            ))}
+                          </div>
+                        )}
+                        {showMessageBody && (
+                          <div className="chat-msg-body">
+                            {msg.status === 'sending' && !msg.content ? (
+                              <div className="chat-typing">
+                                <span /><span /><span />
+                              </div>
+                            ) : (
+                              msg.content.split(/(<think>[\s\S]*?(?:<\/think>|$))/gi).map((part, i) => {
+                                if (part.toLowerCase().startsWith('<think>')) {
+                                  let inner = part.slice(7);
+                                  if (inner.toLowerCase().endsWith('</think>')) {
+                                    inner = inner.slice(0, -8);
+                                  }
+                                  return (
+                                    <details key={i} className="ai-thought-block" open={(msg.status === 'sending') || (inner.length < 500)}>
+                                      <summary className="ai-thought-header">
+                                        <span className="ai-thought-icon">🧠</span>
+                                        <span>Reasoning Process</span>
+                                      </summary>
+                                      <div className="ai-thought-content">{inner}</div>
+                                    </details>
+                                  );
+                                }
+                                return <span key={i} style={{ whiteSpace: 'pre-wrap' }}>{part}</span>;
+                              })
+                            )}
+                          </div>
                         )}
                       </div>
                     </div>
                   </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
 
           {/* Composer */}
           <div className="composer-wrapper">
             <div className="composer">
+              <div className="composer-meta">
+                <span className="composer-meta-pill" title={config?.workspaceRoot || ''}>
+                  Workspace {config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 24) : 'none'}
+                </span>
+                <span className="composer-meta-pill" title={activeModelLabel}>
+                  Model {shortenText(activeModelLabel, 20)}
+                </span>
+                {selectedSkills.includes('caveman') && isAgentic && (
+                  <span className="composer-meta-pill composer-meta-pill-accent" title="Caveman style applied to agentic output">
+                    Caveman
+                  </span>
+                )}
+                <span className="composer-meta-status">{streamStatus || plan?.currentPhase || 'Ready'}</span>
+              </div>
               <textarea
                 className="composer-input"
                 placeholder={isSending ? 'Generating response...' : 'Ask anything... (Enter to send, Shift+Enter for new line)'}
@@ -1225,74 +1447,99 @@ function HarnessApp() {
                 }}
                 disabled={isSending}
               />
-              <div className="composer-bar">
-                <div className="composer-bar-left">
-                  <select className="mode-select" value={chatMode} onChange={e => setChatMode(e.target.value as ConversationMode)} disabled={!isAgentic}>
-                    {CHAT_MODES.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
-                  </select>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', color: 'var(--text-secondary)', cursor: 'pointer' }}>
-                    <input type="checkbox" checked={isAgentic} onChange={e => setIsAgentic(e.target.checked)} />
-                    Agentic
-                  </label>
-                  <select
-                    className="model-select"
-                    value={modelDraft}
-                    onChange={e => {
-                      setModelDraft(e.target.value);
-                      // Auto-switch model when selected from composer
-                      void (async () => {
-                        try {
-                          await fetchJson(`${API}/config`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ model: e.target.value, activateModel: true }),
-                          });
-                          await refreshDashboard();
-                        } catch { /* ignore */ }
-                      })();
-                    }}
-                  >
-                    {modelOptions.map(id => <option key={id} value={id}>{id}</option>)}
-                  </select>
-                  <select
-                    className="permission-select"
-                    value={modeDraft}
-                    onChange={e => {
-                      setModeDraft(e.target.value);
-                      // Auto-apply permission mode change
-                      void (async () => {
-                        try {
-                          await fetchJson(`${API}/config`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ mode: e.target.value }),
-                          });
-                          await refreshDashboard();
-                        } catch { /* ignore */ }
-                      })();
-                    }}
-                  >
-                    <option value="read-only">🔒 Read Only</option>
-                    <option value="workspace-write">✏️ Write</option>
-                    <option value="danger">⚠️ Danger</option>
-                  </select>
-                  {(workspacePreview || browserPreview) && (
-                    <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                      📎 {(workspacePreview || browserPreview)?.name}
-                    </span>
-                  )}
+              {attachedImages.length > 0 && (
+                <div className="composer-attachments">
+                  <div className="composer-attachments-meta">
+                    <span>{attachedImages.length} image{attachedImages.length > 1 ? 's' : ''} attached</span>
+                    <button
+                      className="composer-image-clear-all"
+                      onClick={() => {
+                        setAttachedImages([]);
+                        setAttachmentNotice('');
+                      }}
+                      type="button"
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                  <div className="composer-attachments-list">
+                    {attachedImages.map(image => (
+                      <div key={image.id} className="composer-attachment-item">
+                        <img className="composer-attachment-thumb" src={image.dataUrl} alt={image.name} />
+                        <button
+                          className="composer-attachment-remove"
+                          onClick={() => {
+                            setAttachedImages(cur => cur.filter(item => item.id !== image.id));
+                            setAttachmentNotice('');
+                          }}
+                          type="button"
+                          aria-label={`Remove ${image.name}`}
+                          title={`Remove ${image.name}`}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-                <div className="composer-bar-right">
-                  <span className="composer-workspace-label" title={config?.workspaceRoot || ''}>
-                    📁 {config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 24) : 'No workspace'}
-                  </span>
-                  <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                    {streamStatus || plan?.currentPhase || 'Ready'}
-                  </span>
-                  <button className="send-btn" disabled={isSending || !draft.trim()} onClick={() => void sendChat()} type="button">
-                    ↑
+              )}
+              <div className="composer-actions">
+                <div className="composer-actions-left">
+                  {isAgentic && (
+                    <select className="composer-select" value={chatMode} onChange={e => setChatMode(e.target.value as ConversationMode)}>
+                      {CHAT_MODES.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+                    </select>
+                  )}
+                  <button
+                    className={`composer-toggle ${isAgentic ? 'composer-toggle-active' : ''}`}
+                    onClick={() => setIsAgentic(v => !v)}
+                    title={isAgentic ? 'Agentic mode enabled' : 'Direct chat mode enabled'}
+                    aria-pressed={isAgentic}
+                    type="button"
+                  >
+                    {isAgentic ? 'Agentic' : 'Direct'}
+                  </button>
+                  <button
+                    className={`composer-toggle composer-toggle-thinking ${thinkingEnabled ? 'composer-toggle-active' : ''}`}
+                    onClick={() => setThinkingEnabled(v => !v)}
+                    title={thinkingEnabled ? 'Thinking enabled' : 'Thinking disabled'}
+                    aria-pressed={thinkingEnabled}
+                    type="button"
+                  >
+                    {thinkingEnabled ? 'Thinking on' : 'Thinking off'}
                   </button>
                 </div>
+                <div className="composer-actions-right">
+                  <button
+                    className="composer-secondary-btn composer-attach-btn"
+                    onClick={() => imageInputRef.current?.click()}
+                    type="button"
+                    title={`Attach images (max ${MAX_IMAGE_ATTACHMENTS}, ${formatBytes(MAX_IMAGE_BYTES)} each)`}
+                    aria-label="Attach images"
+                  >
+                    Attach
+                  </button>
+                  <input
+                    ref={imageInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="visually-hidden"
+                    onChange={e => { void handleImageInput(e); }}
+                  />
+                  <button className="send-btn" disabled={isSending || (!draft.trim() && attachedImages.length === 0)} onClick={() => void sendChat()} type="button">
+                    {isSending ? '…' : 'Send'}
+                  </button>
+                </div>
+              </div>
+              <div className="composer-footer">
+                {thinkingWarning ? (
+                  <span className="composer-note composer-note-warning">{thinkingWarning}</span>
+                ) : attachmentNotice ? (
+                  <span className="composer-note composer-note-warning">{attachmentNotice}</span>
+                ) : (
+                  <span className="composer-note">Enter to send. Shift+Enter for newline.</span>
+                )}
               </div>
             </div>
           </div>
@@ -1476,6 +1723,8 @@ function HarnessApp() {
                         <div className="settings-info-row"><span>ID</span><span>{shortenText(session.id, 20)}</span></div>
                         <div className="settings-info-row"><span>Model</span><span>{session.model}</span></div>
                         <div className="settings-info-row"><span>Mode</span><span>{session.mode}</span></div>
+                        <div className="settings-info-row"><span>Last Turn</span><span>{session.turnHistory && session.turnHistory.length > 0 ? session.turnHistory[session.turnHistory.length - 1].executionMode : 'None'}</span></div>
+                        <div className="settings-info-row"><span>Turns</span><span>{session.turnHistory?.length || 0}</span></div>
                         <div className="settings-info-row"><span>Skills</span><span>{session.skillsActive.length || 'None'}</span></div>
                       </div>
                     ) : (

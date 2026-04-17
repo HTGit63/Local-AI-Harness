@@ -4,6 +4,9 @@ packages/*/node_modules
 apps/*/dist
 packages/*/dist
 base_repos
+third_party/*
+!third_party/agency-agents
+!third_party/agency-agents/**
 tests
 docs
 .git

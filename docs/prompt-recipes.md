@@ -60,3 +60,10 @@ Summarize the purpose of this file in max 2 sentences. Highlight exported classe
 ```
 Review the following unified diff snippet. Focus ONLY on logic flaws and potential security bugs. Ignore stylistic nitpicks. Keep response under 3 lines.
 ```
+
+## 7. Direct Chat Instruction
+**Use**: When the user wants raw chat without agentic tools loops.
+**Format**:
+```
+Reply directly. Do not invent tools. Keep output low-latency and concise.
+```

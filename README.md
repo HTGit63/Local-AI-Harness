@@ -45,7 +45,7 @@ node apps/cli/dist/cli.js chat
 The web UI is organized around:
 - A left folder browser that opens local files directly in the browser
 - A focused main workspace with tabs for conversation, file preview, activity, history, and settings
-- A bottom composer with a `+` button for mode switching (`architecture`, `data analysis`, `code review`, `implementation`, `general`)
+- A bottom composer with direct-chat and agentic-coding toggles, a thinking toggle, image attachments, and prompt-mode presets (`architecture`, `data analysis`, `code review`, `implementation`, `general`)
 
 ## Using Models
 
@@ -82,6 +82,19 @@ Web UI:
 
 The top bar shows the selected model and the active loaded model separately, so you can tell whether the backend config and the live Ollama runtime match.
 
+## Benchmarking
+
+Run built API/CLI for real timings:
+
+```bash
+npm run build
+node apps/cli/dist/cli.js benchmark
+```
+
+The benchmark CLI targets `http://127.0.0.1:3001/api` by default. It measures direct chat, agentic chat, tool call, image turn, and think on/off turns, each with cold and warm passes plus first-token timing. Direct chat is the think-off baseline.
+
+Use built app or CLI for measurement. Vite dev noise and sandboxed port-binding results are not the baseline.
+
 ## Docker Run
 
 If you want to run the harness without leaving the IDE open, use Docker Compose from the repo root:
@@ -116,8 +129,10 @@ docker compose up --build
 ```
 ├── apps/
 │   ├── cli/              # Terminal interface
+│   ├── api/              # Local API bridge to core engine
 │   └── web/              # Localhost web UI (Vite + React)
 ├── packages/
+│   ├── core/             # Main orchestration engine
 │   ├── model-adapter/    # Ollama/OpenAI-compatible client
 │   ├── workspace-policy/ # Read-only / write / danger modes
 │   ├── session-store/    # File-based session persistence
@@ -147,6 +162,7 @@ docker compose up --build
 | [Approvals](docs/approvals.md) | Diff review and write control |
 | [Antigravity](docs/antigravity.md) | Skill export and IDE integration |
 | [Benchmarks](docs/benchmarks.md) | Performance baselines |
+| [Stage Audit](docs/stage-audit.md) | Stage 1-20 completion status and cleanup summary |
 | [Provenance](docs/provenance-map.md) | Upstream repo origins and licenses |
 
 ## License

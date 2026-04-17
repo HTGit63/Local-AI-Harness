@@ -213,7 +213,7 @@ function isMissingExecutable(error: unknown): boolean {
 
 function isNotGitRepository(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return message.includes('not a git repository');
+  return message.toLowerCase().includes('not a git repository');
 }
 
 export class ToolRegistry {
@@ -510,9 +510,15 @@ export class ToolRegistry {
           maxBuffer: MAX_BUFFER_BYTES,
         });
         return { success: true, output: stdout.trim() || 'No output' };
-      } catch (error) {
+      } catch (error: any) {
         if (isNotGitRepository(error)) {
           return { success: true, output: 'Not a git repository.' };
+        }
+        if (typeof error?.stdout === 'string' && error.stdout.trim()) {
+          return {
+            success: true,
+            output: `${truncateOutput(error.stdout)}\n\n[git diff truncated: output exceeded buffer]`,
+          };
         }
         throw error;
       }

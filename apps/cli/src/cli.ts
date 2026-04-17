@@ -9,11 +9,10 @@ import { loadCuratedSkills } from '@local-harness/skills';
 const args = process.argv.slice(2);
 const command = args[0] || 'chat';
 const isJson = args.includes('--json');
-const isCompact = args.includes('--compact');
 
 const engine = new CoreEngine({
   workspaceRoot: process.cwd(),
-  profile: isCompact ? 'fast' : 'balanced',
+  profile: 'fast',
 });
 
 function printJson(value: unknown) {
@@ -58,6 +57,10 @@ function pushStepStatus(stepHistory: string[], nextStatus: string) {
   console.log(`\n[step ${stepHistory.length}] ${step}`);
 }
 
+function supportsThinking(capabilities: string[] | undefined): boolean {
+  return Array.isArray(capabilities) && capabilities.includes('thinking');
+}
+
 async function listSkills() {
   try {
     return await loadCuratedSkills();
@@ -70,14 +73,20 @@ async function handlePrompt() {
   const promptIndex = args.indexOf('prompt');
   const promptText = args.slice(promptIndex + 1).filter((arg) => !arg.startsWith('--')).join(' ');
   if (!promptText) {
-    throw new Error('Usage: harness prompt <text>');
+    throw new Error('Usage: harness prompt [--thinking|--nothinking] <text>');
   }
+
+  const thinkingEnabled = args.includes('--nothinking') ? false : args.includes('--thinking') ? true : undefined;
+  const runtime = thinkingEnabled === true ? await engine.getModelRuntime() : null;
+  const thinkingWarning = thinkingEnabled === true && !supportsThinking(runtime?.configuredModelCapabilities)
+    ? 'Thinking unavailable on current model; toggle may be ignored.'
+    : null;
 
   if (isJson) {
     const response = await engine.chat([
       { role: 'user', content: promptText },
-    ]);
-    printOutput({ input: promptText, output: response });
+    ], thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
+    printOutput({ input: promptText, output: response, ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
     return;
   }
 
@@ -86,7 +95,7 @@ async function handlePrompt() {
     { role: 'user', content: promptText },
   ], {
     onStatus: (event) => pushStepStatus(stepHistory, event.action || event.phase),
-  });
+  }, thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
 
   renderAssistantOutput(response);
 }
@@ -95,11 +104,13 @@ async function handleSession() {
   switch (args[1]) {
     case 'list': {
       const sessions = await engine.listSessions();
-      printOutput(isJson ? { sessions } : sessions.map((session: { id: string; model: string; mode: string; skillsActive: string[]; updatedAt: number }) => ({
+      printOutput(isJson ? { sessions } : sessions.map((session: { id: string; model: string; mode: string; skillsActive: string[]; updatedAt: number; turnHistory?: Array<{ executionMode: string }> }) => ({
         id: session.id,
         model: session.model,
         mode: session.mode,
         skills: session.skillsActive,
+        turns: session.turnHistory?.length || 0,
+        lastTurnMode: session.turnHistory?.length ? session.turnHistory[session.turnHistory.length - 1].executionMode : 'none',
         updatedAt: new Date(session.updatedAt).toLocaleString(),
       })));
       return;
@@ -247,10 +258,11 @@ async function handleConfig() {
 function startRepl() {
   const history: { role: 'user' | 'assistant'; content: string }[] = [];
   const session = engine.startSession();
+  let thinkingEnabled = false;
 
   console.log('Gamma Harness CLI');
-  console.log(`Session: ${session.id}  Model: ${session.model}  Mode: ${session.mode}`);
-  console.log("Commands: /help /exit /status /plan /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>");
+  console.log(`Session: ${session.id}  Model: ${session.model}  Mode: ${session.mode}  Execution: agentic  Thinking: ${thinkingEnabled ? 'on' : 'off'}`);
+  console.log("Commands: /help /exit /status /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>");
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -286,7 +298,27 @@ function startRepl() {
       }
 
       if (input === '/help') {
-        console.log('Slash commands: /exit /quit /bye /clear /help /status /plan /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>');
+        console.log('Slash commands: /exit /quit /bye /clear /help /status /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>');
+        rl.prompt();
+        return;
+      }
+
+      if (input === '/thinking') {
+        thinkingEnabled = true;
+        {
+          const runtime = await engine.getModelRuntime();
+          if (!supportsThinking(runtime.configuredModelCapabilities)) {
+            console.log('Warning: current model does not report thinking support. Toggle may be ignored.');
+          }
+        }
+        console.log('Thinking enabled');
+        rl.prompt();
+        return;
+      }
+
+      if (input === '/nothinking') {
+        thinkingEnabled = false;
+        console.log('Thinking disabled');
         rl.prompt();
         return;
       }
@@ -295,6 +327,8 @@ function startRepl() {
         console.log(JSON.stringify({
           session: engine.getSession(),
           config: engine.getPublicConfig(),
+          executionMode: 'agentic',
+          thinkingEnabled,
         }, null, 2));
         rl.prompt();
         return;
@@ -431,6 +465,8 @@ function startRepl() {
         onStatus: (event: { action: string; phase: string }) => {
           pushStepStatus(stepHistory, event.action || event.phase);
         },
+      }, {
+        think: thinkingEnabled,
       });
       history.push({ role: 'assistant', content: response });
       renderAssistantOutput(response);

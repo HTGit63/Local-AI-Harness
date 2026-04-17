@@ -3,21 +3,25 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
+      network: host
     network_mode: host
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 3001
       HARNESS_WORKSPACE_ROOT: /workspace
+      HARNESS_WORKSPACE_SEARCH_ROOTS: /host-projects
       HARNESS_ALLOWED_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
       OPENAI_BASE_URL: ${HARNESS_MODEL_BASE_URL:-http://127.0.0.1:11434/v1}
       OPENAI_API_KEY: ${HARNESS_MODEL_API_KEY:-ollama}
     volumes:
       - ${HARNESS_WORKSPACE_SOURCE:-.}:/workspace
+      - ${HARNESS_WORKSPACE_SEARCH_SOURCE:-..}:/host-projects
 
   web:
     build:
       context: .
       dockerfile: Dockerfile.web
+      network: host
     depends_on:
       - api
     extra_hosts:

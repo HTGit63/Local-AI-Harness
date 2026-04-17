@@ -13,7 +13,7 @@ export const PROFILES: Record<string, ModelProfile> = {
   },
   deep: {
     name: 'deep',
-    max_tokens: 8192,
+    max_tokens: 2048,
     temperature: 0.6,
   }
 };
@@ -22,7 +22,7 @@ export const DEFAULT_CONFIG: Required<Omit<AdapterOptions, 'profile'>> & { profi
   baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1',
   apiKey: process.env.OPENAI_API_KEY || 'ollama',
   model: 'gemma4:e4b',
-  profile: 'balanced',
-  timeoutMs: 120000,
-  retries: 3
+  profile: 'fast',
+  timeoutMs: 60000,
+  retries: 1
 };

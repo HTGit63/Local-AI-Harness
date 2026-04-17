@@ -199,6 +199,11 @@ function mapMessagesToOllama(messages: ChatMessage[]): Array<Record<string, unkn
       mappedMessage.tool_call_id = message.tool_call_id.trim();
     }
 
+    // Multimodal: pass through base64 images for Gemma 4 vision support
+    if (Array.isArray(message.images) && message.images.length > 0) {
+      mappedMessage.images = message.images;
+    }
+
     return mappedMessage;
   });
 }
@@ -314,7 +319,10 @@ export class ModelAdapter {
   }
 
   private buildOllamaChatBody(request: ChatCompletionRequest, profile: { temperature: number; max_tokens: number }) {
-    const think = this.mapReasoningEffortToOllamaThink(request.reasoning_effort);
+    // Explicit think toggle takes priority over reasoning_effort mapping
+    const think = request.think !== undefined
+      ? request.think
+      : this.mapReasoningEffortToOllamaThink(request.reasoning_effort);
     const targetModel = request.model ?? this.model;
     const lowerModel = targetModel.toLowerCase();
     
@@ -323,13 +331,13 @@ export class ModelAdapter {
 
     // Architectural parameter tuning based on AI model name
     if (lowerModel.includes('gemma')) {
-      optMaxTokens = Math.min(optMaxTokens, 8192); // Gemma specific token limit optimization
-      // Gemma often misinterprets deep structured JSON tools, so we lower temperature to constraint its creativity
+      // Gemma 4 supports up to 128k context, raise the token ceiling
+      optMaxTokens = Math.min(optMaxTokens, 16384);
       optTemperature = Math.max(0.01, optTemperature * 0.8);
     } else if (lowerModel.includes('deepseek')) {
-      optMaxTokens = Math.max(optMaxTokens, 16384); // Ensure reasoning ceiling is accommodated
+      optMaxTokens = Math.max(optMaxTokens, 16384);
     } else if (lowerModel.includes('qwen')) {
-      optTemperature = Math.min(1.0, optTemperature * 1.1); // Make it slightly more creative safely
+      optTemperature = Math.min(1.0, optTemperature * 1.1);
     }
 
     const body: Record<string, unknown> = {
@@ -578,7 +586,7 @@ export class ModelAdapter {
           model: modelName,
           prompt: '',
           stream: false,
-          keep_alive: '10m',
+          keep_alive: '2m',
         }),
       },
       Math.max(this.timeoutMs * 4, 120_000),
@@ -779,8 +787,16 @@ export class ModelAdapter {
   }
 
   async createChatCompletion(request: ChatCompletionRequest) {
-    if ((!request.tools || request.tools.length === 0) && await this.supportsOllamaNativeChat()) {
+    // Always prefer native Ollama API when available — it properly handles
+    // Gemma 4's native function calling tokens, thinking mode, and images.
+    // The OpenAI-compat endpoint lacks support for think, images, and
+    // Gemma 4's special tool control tokens.
+    if (await this.supportsOllamaNativeChat()) {
       return this.createOllamaChatCompletion(request);
+    }
+
+    if (request.think === true) {
+      console.warn('Model Adapter: think=true but native Ollama chat unavailable. Falling back to OpenAI-compat path; thinking may be ignored.');
     }
 
     const profile = PROFILES[this.profileName] || PROFILES['balanced'];

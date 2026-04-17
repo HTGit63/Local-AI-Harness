@@ -11,6 +11,7 @@ export interface ChatMessage {
   thinking?: string;
   tool_calls?: any[];
   tool_call_id?: string;
+  images?: string[];
 }
 
 export interface ChatCompletionRequest {
@@ -19,6 +20,7 @@ export interface ChatCompletionRequest {
   temperature?: number;
   max_tokens?: number;
   reasoning_effort?: 'high' | 'medium' | 'low' | 'none';
+  think?: boolean;
   stream?: boolean;
   tools?: any[];
   signal?: AbortSignal;

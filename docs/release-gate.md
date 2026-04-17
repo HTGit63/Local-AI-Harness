@@ -13,7 +13,7 @@
 | 7 | Workspace boundary enforcement works | ✅ Outside-workspace writes denied |
 | 8 | Tool traces are visible | ✅ TraceBus + Planner events |
 | 9 | `doctor` passes | ✅ 11 diagnostic checks |
-| 10 | Basic benchmarks are recorded | ✅ 6 latency metrics |
+| 10 | Basic benchmarks are recorded | ✅ Matrix covers direct/agentic/tool/image/think with cold/warm and first-token timings |
 | 11 | Docs are present | ✅ 15 documentation files |
 | 12 | Vendored repo provenance is documented | ✅ manifest.json + provenance-map.md |
 
@@ -32,3 +32,14 @@ The project is **NOT ready** if any of the following are true:
 ## Verdict
 
 **All acceptance criteria met. The harness is ready for v1 use.**
+
+## Runtime Contract Checks
+
+These checks are already reflected in current code and docs:
+
+- No hidden PromptAnalyzer round-trip remains in the hot path.
+- Native Ollama chat is preferred first; manual tool fallback stays bounded and visible.
+- Image attachments are validated in API and forwarded through adapter and UI.
+- Direct chat and agentic coding stay separate in UI, CLI, and API.
+- Caveman overlay stays agentic-only and never overrides approval or safety copy.
+- Thinking toggle stays visible, and unsupported models warn instead of faking thinking.

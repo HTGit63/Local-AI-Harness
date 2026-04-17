@@ -1,15 +1,16 @@
 import { EventEmitter } from 'events';
+import * as fs from 'fs/promises';
 import * as path from 'path';
 import { ApprovalQueueManager, ApprovalRequestPayload } from '@local-harness/approval-workflow';
 import { ModelAdapter, ModelRuntimeState } from '@local-harness/model-adapter';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
 import { RepoIndexer, ProjectContext } from '@local-harness/repo-indexer';
-import { FileSessionStore, SessionMetadata } from '@local-harness/session-store';
+import { FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
 import { ToolRegistry } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
-import { PromptAnalyzer } from './prompt-analyzer';
+// PromptAnalyzer removed — passes messages straight through for lower latency
 
 const SUPPORTED_TOOLS = [
   'glob',
@@ -27,11 +28,13 @@ const SUPPORTED_TOOLS = [
 const AUTO_REPO_CONTEXT_ENABLED = process.env.HARNESS_AUTO_REPO_CONTEXT === '1';
 
 type SupportedTool = (typeof SUPPORTED_TOOLS)[number];
+type TurnExecutionMode = 'direct' | 'agentic';
 type ReasoningEffort = 'high' | 'medium' | 'low' | 'none';
 type ManualToolDecision =
   | { kind: 'tool'; name: SupportedTool; args: Record<string, unknown> }
   | { kind: 'final'; content: string };
 type ImmediateChatAnswer = { content: string; action: string; source: string };
+type ToolProtocolMode = 'native' | 'manual_preferred' | 'manual_fallback';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -76,7 +79,7 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1',
   apiKey: process.env.OPENAI_API_KEY || 'ollama',
   model: 'gemma4:e4b',
-  profile: 'balanced',
+  profile: 'fast',
   workspaceRoot: process.cwd(),
   mode: 'workspace-write',
   sessionDataDir: '.gamma-harness/sessions',
@@ -383,6 +386,43 @@ export class CoreEngine extends EventEmitter {
     await this.sessionStore.saveSession(this.currentSession);
   }
 
+  async recordTurnExecution(
+    executionMode: TurnExecutionMode,
+    details: {
+      promptMode?: string;
+      messageCount: number;
+      thinkingEnabled?: boolean;
+      imageCount?: number;
+    },
+  ): Promise<SessionTurnMetadata> {
+    if (!this.currentSession) {
+      this.startSession();
+    }
+
+    const record: SessionTurnMetadata = {
+      timestamp: Date.now(),
+      executionMode,
+      promptMode: details.promptMode,
+      messageCount: details.messageCount,
+      thinkingEnabled: details.thinkingEnabled,
+      imageCount: details.imageCount,
+    };
+
+    this.currentSession = {
+      ...(this.currentSession as SessionMetadata),
+      turnHistory: [...(this.currentSession?.turnHistory ?? []), record],
+    };
+
+    this.traceBus.emitEvent({
+      type: 'chat_turn_mode',
+      data: record,
+    });
+
+    // Append turn to JSONL sidecar instead of rewriting the full session
+    await this.sessionStore.appendTurn(this.currentSession!.id, record);
+    return record;
+  }
+
   private refreshWorkspaceRuntime(workspaceRoot: string) {
     this.repoIndexer.updateWorkspaceRoot(workspaceRoot);
     this.workspacePolicy.updateConfig({
@@ -402,6 +442,7 @@ export class CoreEngine extends EventEmitter {
       cwd: this.config.workspaceRoot,
       skillsActive: skills,
       toolsAllowlist: [...SUPPORTED_TOOLS],
+      turnHistory: [],
     };
 
     this.currentSession = session;
@@ -627,46 +668,41 @@ export class CoreEngine extends EventEmitter {
     );
   }
 
-  private isInspectOnlyToolset(toolNames: SupportedTool[]): boolean {
-    return toolNames.every((toolName) => ['glob', 'readFile', 'searchText', 'listDir'].includes(toolName));
-  }
-
-  private isLatencySensitiveLocalReasoningModel(modelCapabilities: string[] | null): boolean {
-    const normalizedModel = this.config.model.toLowerCase();
-    return (
-      normalizedModel.includes('gemma') ||
-      normalizedModel.includes('qwen') ||
-      (Array.isArray(modelCapabilities) && modelCapabilities.includes('thinking'))
-    );
-  }
-
-  private shouldPreferManualToolProtocol(
-    promptMode: RunMode,
+  private selectToolProtocol(
     toolNames: SupportedTool[],
     modelCapabilities: string[] | null,
-  ): boolean {
+  ): { manualToolProtocol: boolean; mode: ToolProtocolMode; reason?: string } {
     if (toolNames.length === 0) {
-      return false;
+      return { manualToolProtocol: false, mode: 'native' };
     }
 
-    if (!Array.isArray(modelCapabilities) || !modelCapabilities.includes('tools')) {
-      return true;
+    if (!Array.isArray(modelCapabilities)) {
+      return { manualToolProtocol: false, mode: 'native' };
     }
 
-    if (this.isLatencySensitiveLocalReasoningModel(modelCapabilities)) {
-      return true;
+    if (!modelCapabilities.includes('tools')) {
+      return {
+        manualToolProtocol: true,
+        mode: 'manual_fallback',
+        reason: 'Model capabilities do not include native tools.',
+      };
     }
 
-    if (promptMode !== 'quick_inspect' || !this.isInspectOnlyToolset(toolNames)) {
-      return false;
-    }
-
+    const nativeToolsForced = process.env.HARNESS_FORCE_NATIVE_TOOLS === '1';
     const normalizedModel = this.config.model.toLowerCase();
-    return (
-      modelCapabilities.includes('thinking') ||
-      normalizedModel.includes('gemma') ||
-      normalizedModel.includes('qwen')
-    );
+    if (!nativeToolsForced && normalizedModel.includes('gemma4')) {
+      return {
+        manualToolProtocol: true,
+        mode: 'manual_preferred',
+        reason: 'Gemma 4 native tool selection is much slower than manual JSON tool routing on local Ollama.',
+      };
+    }
+
+    return { manualToolProtocol: false, mode: 'native' };
+  }
+
+  private supportsThinking(modelCapabilities: string[] | null): boolean {
+    return Array.isArray(modelCapabilities) && modelCapabilities.includes('thinking');
   }
 
   private shouldIncludeRepoContext(latestUserMessage: string, promptMode: RunMode): boolean {
@@ -777,6 +813,11 @@ export class CoreEngine extends EventEmitter {
     }
 
     const normalized = latestUserMessage.toLowerCase();
+    const writeIntent = /\b(create|write|add|update|modify|change|edit|fix|implement|generate|save|insert|replace|append|remove|delete)\b/.test(normalized);
+    if (writeIntent) {
+      return null;
+    }
+
     const inventory = await this.repoIndexer.buildWorkspaceInventory();
     const appNames = inventory.apps.map((entry: { name: string }) => entry.name);
     const packageNames = inventory.packages.map((entry: { name: string }) => entry.name.replace(/^@local-harness\//, ''));
@@ -834,6 +875,90 @@ export class CoreEngine extends EventEmitter {
       action: 'Summarizing workspace inventory',
       source: 'local_inventory',
     };
+  }
+
+  private async tryAnswerFromRootManifest(latestUserMessage: string): Promise<ImmediateChatAnswer | null> {
+    const normalized = latestUserMessage.toLowerCase();
+    const writeIntent = /\b(create|write|add|update|modify|change|edit|fix|implement|generate|save|insert|replace|append|remove|delete)\b/.test(normalized);
+    const asksAboutManifest =
+      /package\.json/.test(normalized) ||
+      /\b(project|package)\s+name\b/.test(normalized) ||
+      /\broot package\b/.test(normalized) ||
+      /\b(npm|package)\s+scripts?\b/.test(normalized);
+
+    if (!asksAboutManifest || writeIntent) {
+      return null;
+    }
+
+    try {
+      const manifestPath = path.join(this.config.workspaceRoot, 'package.json');
+      const raw = await fs.readFile(manifestPath, 'utf8');
+      const manifest = JSON.parse(raw) as { name?: unknown; scripts?: unknown };
+      const name = typeof manifest.name === 'string' && manifest.name.trim()
+        ? manifest.name.trim()
+        : null;
+      const scripts = manifest.scripts && typeof manifest.scripts === 'object' && !Array.isArray(manifest.scripts)
+        ? Object.entries(manifest.scripts)
+            .filter((entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string')
+            .map(([scriptName, command]) => [scriptName.trim(), command.trim()] as [string, string])
+            .filter(([scriptName, command]) => scriptName.length > 0 && command.length > 0)
+        : [];
+
+      if (!name && scripts.length === 0) {
+        return null;
+      }
+
+      const wantsScripts =
+        /\b(npm|package)\s+scripts?\b/.test(normalized) ||
+        (/package\.json/.test(normalized) && /\bscripts?\b/.test(normalized));
+      const wantsName =
+        /\b(name field|project name|package name|root package)\b/.test(normalized) ||
+        (/package\.json/.test(normalized) && !wantsScripts);
+      const exactNameOnly = wantsName && !wantsScripts && /\b(exactly|just|only)\b/.test(normalized);
+
+      if (exactNameOnly && name) {
+        return {
+          content: name,
+          action: 'Reading root package manifest',
+          source: 'root_manifest',
+        };
+      }
+
+      if (wantsName && wantsScripts) {
+        return {
+          content: [
+            name ? `name: ${name}` : null,
+            scripts.length > 0
+              ? `scripts:\n${scripts.map(([scriptName, command]) => `- ${scriptName}: ${command}`).join('\n')}`
+              : 'scripts: none',
+          ].filter(Boolean).join('\n'),
+          action: 'Reading root package manifest',
+          source: 'root_manifest',
+        };
+      }
+
+      if (wantsScripts) {
+        return {
+          content: scripts.length > 0
+            ? scripts.map(([scriptName, command]) => `${scriptName}: ${command}`).join('\n')
+            : 'No scripts found in root package.json.',
+          action: 'Reading root package manifest',
+          source: 'root_manifest',
+        };
+      }
+
+      if (name) {
+        return {
+          content: name,
+          action: 'Reading root package manifest',
+          source: 'root_manifest',
+        };
+      }
+    } catch {
+      return null;
+    }
+
+    return null;
   }
 
   private selectToolNames(latestUserMessage: string, promptMode: RunMode): SupportedTool[] {
@@ -1004,6 +1129,52 @@ export class CoreEngine extends EventEmitter {
     return { kind: 'tool', name: actionName as SupportedTool, args };
   }
 
+  private async inferManualBootstrapTool(
+    latestUserMessage: string,
+    promptMode: RunMode,
+    toolNames: SupportedTool[],
+  ): Promise<{ kind: 'tool'; name: SupportedTool; args: Record<string, unknown> } | null> {
+    if (!toolNames.includes('readFile')) {
+      return null;
+    }
+
+    const normalized = latestUserMessage.toLowerCase();
+    const tryReadFile = async (filePath: string): Promise<{ kind: 'tool'; name: SupportedTool; args: Record<string, unknown> } | null> => {
+      try {
+        await fs.access(path.join(this.config.workspaceRoot, filePath));
+        return { kind: 'tool', name: 'readFile', args: { filePath } };
+      } catch {
+        return null;
+      }
+    };
+
+    if (
+      /\b(project|package)\s+name\b/.test(normalized) ||
+      /\b(start|main)\s+(command|file|server file)\b/.test(normalized) ||
+      /\b(npm|package)\s+scripts?\b/.test(normalized) ||
+      /\b(readme|repo|repository)\b/.test(normalized) ||
+      /package\.json/.test(normalized)
+    ) {
+      const manifestDecision = await tryReadFile('package.json');
+      if (manifestDecision) {
+        return manifestDecision;
+      }
+    }
+
+    if (/server\.js/.test(normalized) || /\bmain server file\b/.test(normalized)) {
+      const serverDecision = await tryReadFile('server.js');
+      if (serverDecision) {
+        return serverDecision;
+      }
+    }
+
+    if (promptMode === 'targeted_edit' && toolNames.includes('listDir')) {
+      return { kind: 'tool', name: 'listDir', args: { dirPath: '.' } };
+    }
+
+    return null;
+  }
+
   private choosePromptMode(messages: ChatMessage[]): RunMode {
     const latestUserMessage = this.getLatestUserMessage(messages).toLowerCase();
 
@@ -1105,43 +1276,66 @@ export class CoreEngine extends EventEmitter {
     return contextMessages;
   }
 
+  private static readonly WORKSPACE_MUTATING_TOOLS: ReadonlySet<string> = new Set([
+    'writeFile', 'patchFile', 'makeDir', 'deleteFile',
+  ]);
+
   private async executeToolCall(toolName: SupportedTool, args: Record<string, unknown>): Promise<any> {
+    let result: any;
     switch (toolName) {
       case 'readFile':
-        return this.readFile(getRequiredStringArg(args, 'filePath', toolName));
+        result = await this.readFile(getRequiredStringArg(args, 'filePath', toolName));
+        break;
       case 'listDir':
-        return this.listDir(getOptionalStringArg(args, 'dirPath') || '.');
+        result = await this.listDir(getOptionalStringArg(args, 'dirPath') || '.');
+        break;
       case 'glob':
-        return this.glob(getRequiredStringArg(args, 'pattern', toolName));
+        result = await this.glob(getRequiredStringArg(args, 'pattern', toolName));
+        break;
       case 'searchText':
-        return this.searchText(
+        result = await this.searchText(
           getRequiredStringArg(args, 'query', toolName),
           getOptionalStringArg(args, 'filePattern'),
         );
+        break;
       case 'writeFile':
-        return this.writeFile(
+        result = await this.writeFile(
           getRequiredStringArg(args, 'filePath', toolName),
           getRequiredStringArg(args, 'content', toolName),
         );
+        break;
       case 'patchFile':
-        return this.patchFile(
+        result = await this.patchFile(
           getRequiredStringArg(args, 'filePath', toolName),
           getRequiredStringArg(args, 'oldContent', toolName),
           getRequiredStringArg(args, 'newContent', toolName),
         );
+        break;
       case 'makeDir':
-        return this.makeDir(getRequiredStringArg(args, 'dirPath', toolName));
+        result = await this.makeDir(getRequiredStringArg(args, 'dirPath', toolName));
+        break;
       case 'deleteFile':
-        return this.deleteFile(getRequiredStringArg(args, 'filePath', toolName));
+        result = await this.deleteFile(getRequiredStringArg(args, 'filePath', toolName));
+        break;
       case 'gitStatus':
-        return this.gitStatus();
+        result = await this.gitStatus();
+        break;
       case 'gitDiff':
-        return this.gitDiff();
+        result = await this.gitDiff();
+        break;
       case 'runCommand':
-        return this.runCommand(getRequiredStringArg(args, 'command', toolName));
+        result = await this.runCommand(getRequiredStringArg(args, 'command', toolName));
+        break;
       default:
         throw new Error(`Tool ${toolName} is not supported.`);
     }
+
+    // Invalidate repo context cache after workspace-modifying tools so next turn gets fresh context
+    if (CoreEngine.WORKSPACE_MUTATING_TOOLS.has(toolName)) {
+      this.invalidateRepoContextCache();
+    }
+
+    return result;
   }
 
   private getToolDefinitions(toolNames: SupportedTool[] = [...SUPPORTED_TOOLS]): any[] {
@@ -1309,10 +1503,11 @@ export class CoreEngine extends EventEmitter {
   async indexWorkspace(): Promise<ProjectContext> {
     this.planner.setPhase('indexing');
     this.planner.setIntendedAction('Scanning workspace structure');
-    const context = await this.repoIndexer.buildContext();
+    const { context, cached } = await this.repoIndexer.buildContext();
     this.traceBus.emitEvent({
-      type: 'repo_index_built',
+      type: 'repo_context_loaded',
       data: {
+        cached,
         fileCount: context.files.length,
         entryPoints: context.entryPoints,
       },
@@ -1322,17 +1517,43 @@ export class CoreEngine extends EventEmitter {
     return context;
   }
 
+  /** Invalidate repo indexer cache after workspace-modifying tool actions. */
+  private invalidateRepoContextCache() {
+    this.repoIndexer.clearCaches();
+  }
+
   async getRepoContextPrompt(): Promise<string> {
     const context = await this.indexWorkspace();
     return this.repoIndexer.generatePromptInjection(context);
   }
 
-  async chat(messages: ChatMessage[], options?: { signal?: AbortSignal }): Promise<string> {
+  async chat(messages: ChatMessage[], options?: { signal?: AbortSignal; think?: boolean }): Promise<string> {
     return this.runChat(messages, undefined, options);
   }
 
-  async chatStream(messages: ChatMessage[], handlers: ChatStreamHandlers, options?: { signal?: AbortSignal }): Promise<string> {
+  async chatStream(messages: ChatMessage[], handlers: ChatStreamHandlers, options?: { signal?: AbortSignal; think?: boolean }): Promise<string> {
     return this.runChat(messages, handlers, options);
+  }
+
+  async directChatStream(messages: ChatMessage[], handlers: ChatStreamHandlers, options?: { signal?: AbortSignal; think?: boolean }): Promise<string> {
+    await this.recordTurnExecution('direct', {
+      promptMode: 'general',
+      messageCount: messages.length,
+      thinkingEnabled: options?.think === true,
+    });
+    this.emitChatStatus(handlers, 'mode', 'Direct chat mode', 0);
+    this.emitChatStatus(handlers, 'Generating', 'Normal Chat Mode', 0);
+
+    const message = await this.streamAssistantMessage(
+      messages,
+      handlers,
+      undefined, // tools
+      4096, // maxTokens
+      undefined, // reasoningEffort
+      options?.signal,
+      options?.think
+    );
+    return extractTextSegment(message?.content) || '';
   }
 
   private emitChatStatus(handlers: ChatStreamHandlers | undefined, phase: string, action: string, loop: number) {
@@ -1362,6 +1583,7 @@ export class CoreEngine extends EventEmitter {
     maxTokens: number,
     reasoningEffort: ReasoningEffort | undefined,
     signal?: AbortSignal,
+    think?: boolean,
   ): Promise<any> {
     const stream = await this.modelAdapter.createChatCompletion({
       messages: currentMessages,
@@ -1369,6 +1591,7 @@ export class CoreEngine extends EventEmitter {
       tools,
       max_tokens: maxTokens,
       reasoning_effort: reasoningEffort,
+      think,
       signal,
     }) as ReadableStream<Uint8Array> | null;
 
@@ -1379,6 +1602,7 @@ export class CoreEngine extends EventEmitter {
         tools,
         max_tokens: maxTokens,
         reasoning_effort: reasoningEffort,
+        think,
         signal,
       });
       const message = result?.choices?.[0]?.message;
@@ -1505,7 +1729,7 @@ export class CoreEngine extends EventEmitter {
   private async runChat(
     messages: ChatMessage[],
     streamHandlers?: ChatStreamHandlers,
-  options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; think?: boolean },
   ): Promise<string> {
     if (!this.currentSession) {
       this.startSession();
@@ -1513,29 +1737,14 @@ export class CoreEngine extends EventEmitter {
 
     const latestUserMessage = this.getLatestUserMessage(messages);
     const browserFolderContextActive = this.hasBrowserFolderContext(messages);
+    const promptMode = this.choosePromptMode(messages);
 
-    // Initialize and run Prompt Analyzer
-    const analyzer = new PromptAnalyzer(this.modelAdapter);
-    if (streamHandlers?.onStatus) {
-      streamHandlers.onStatus({ phase: 'Prompt Evaluation', action: 'Analyzing task complexity', loop: 0 });
-    }
-    const analysis = await analyzer.analyzeAndRefine(messages, options?.signal);
-    
-    if (analysis.needsClarification && analysis.clarifyingQuestions?.length) {
-      const qns = analysis.clarifyingQuestions.map((q, i) => `${i + 1}. ${q}`).join('\n');
-      const response = `<think>The user task is highly complex and lacks specific instruction. I need to ask for clarification before proceeding to avoid mistakes and ensure I accomplish what they want properly.</think>\nThis sounds like a great task! However, to make sure I deliver exactly what you're looking for, please clarify the following points:\n\n${qns}`;
-      this.completeImmediateResponse(streamHandlers, { content: response, action: 'Requested clarification', source: 'analyzer' });
-      await this.persistCurrentSession();
-      return response;
-    }
-
-    if (analysis.refinedPrompt && analysis.refinedPrompt !== analysis.originalPrompt) {
-      // Safely mutate the last message to use the refined prompt from the analyzer
-      const lastMsg = messages[messages.length - 1];
-      if (lastMsg && lastMsg.role === 'user') {
-        lastMsg.content = analysis.refinedPrompt;
-      }
-    }
+    await this.recordTurnExecution('agentic', {
+      promptMode,
+      messageCount: messages.length,
+      thinkingEnabled: options?.think === true,
+    });
+    this.emitChatStatus(streamHandlers, 'mode', 'Agentic coding mode', 0);
 
     if (!browserFolderContextActive && this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
       const localAnswer = await this.tryAnswerFromLocalState(latestUserMessage);
@@ -1555,11 +1764,19 @@ export class CoreEngine extends EventEmitter {
       return directWorkspaceAnswer.content;
     }
 
-    const promptMode = this.choosePromptMode(messages);
     const includeWorkspaceContext = !browserFolderContextActive && this.isWorkspaceQuestion(latestUserMessage, promptMode);
     const includeRepoContext = !browserFolderContextActive && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
     const selectedToolNames = browserFolderContextActive ? [] : this.selectToolNames(latestUserMessage, promptMode);
     const modelCapabilities = await this.modelAdapter.getModelCapabilities(this.config.model);
+    const toolProtocol = this.selectToolProtocol(selectedToolNames, modelCapabilities);
+    const rootManifestAnswer = !browserFolderContextActive
+      ? await this.tryAnswerFromRootManifest(latestUserMessage)
+      : null;
+    if (rootManifestAnswer !== null) {
+      this.completeImmediateResponse(streamHandlers, rootManifestAnswer);
+      await this.persistCurrentSession();
+      return rootManifestAnswer.content;
+    }
     const localRepoOverview = !browserFolderContextActive
       ? await this.tryAnswerFromLocalRepoOverview(latestUserMessage)
       : null;
@@ -1569,7 +1786,7 @@ export class CoreEngine extends EventEmitter {
       return localRepoOverview.content;
     }
 
-    let manualToolProtocol = this.shouldPreferManualToolProtocol(promptMode, selectedToolNames, modelCapabilities);
+    let manualToolProtocol = toolProtocol.manualToolProtocol;
     let manualProtocolPromptInjected = manualToolProtocol;
     let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol
       ? this.getToolDefinitions(selectedToolNames)
@@ -1577,17 +1794,56 @@ export class CoreEngine extends EventEmitter {
     const maxTokens = manualToolProtocol
       ? Math.min(256, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
       : this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0);
-    const reasoningEffort = manualToolProtocol && this.isLatencySensitiveLocalReasoningModel(modelCapabilities)
+    const reasoningEffort = manualToolProtocol
       ? 'none'
       : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
+
+    if (toolProtocol.mode === 'manual_fallback') {
+      this.traceBus.emitEvent({
+        type: 'manual_tool_fallback',
+        data: {
+          model: this.config.model,
+          reason: toolProtocol.reason,
+          manualToolProtocol: true,
+          selectedTools: selectedToolNames,
+        },
+      });
+      this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', 0);
+    } else if (toolProtocol.mode === 'manual_preferred') {
+      this.traceBus.emitEvent({
+        type: 'manual_tool_strategy_selected',
+        data: {
+          model: this.config.model,
+          reason: toolProtocol.reason,
+          manualToolProtocol: true,
+          selectedTools: selectedToolNames,
+        },
+      });
+      this.emitChatStatus(streamHandlers, 'mode', 'Low-latency manual tool protocol active', 0);
+    }
+
+    if (options?.think === true && !this.supportsThinking(modelCapabilities)) {
+      this.traceBus.emitEvent({
+        type: 'thinking_unsupported',
+        data: {
+          model: this.config.model,
+          reason: 'Current model does not report thinking capability.',
+          requestedThink: true,
+          modelCapabilities: modelCapabilities ?? [],
+        },
+      });
+      this.emitChatStatus(streamHandlers, 'warning', 'Thinking unavailable on current model', 0);
+    }
 
     this.traceBus.emitEvent({
       type: 'chat_execution_plan',
       data: {
+        executionMode: 'agentic',
         promptMode,
         toolNames: selectedToolNames,
         nativeTools: Boolean(nativeToolDefinitions),
         manualToolProtocol,
+        toolProtocolMode: toolProtocol.mode,
         includeRepoContext,
         browserFolderContextActive,
         maxTokens,
@@ -1596,21 +1852,83 @@ export class CoreEngine extends EventEmitter {
       },
     });
 
+    if (manualToolProtocol) {
+      this.traceBus.emitEvent({
+        type: 'prompt_recipe_selected',
+        data: {
+          mode: promptMode,
+          taskPreview: latestUserMessage.slice(0, 120),
+          manualToolProtocol: true,
+          recipe: 'manual_tool_plan',
+        },
+      });
+    }
+
+    const promptMessages = manualToolProtocol
+      ? [
+          {
+            role: 'system' as const,
+            content: [
+              `Manual tool plan (${promptMode}):`,
+              'Inspect only the minimum files needed before editing.',
+              'Use exactly one JSON tool action at a time, then wait for the next tool result.',
+              'When the task is complete, reply with {"final":"..."} and keep it brief.',
+            ].join('\n'),
+          },
+          ...messages,
+        ]
+      : this.applyPromptOptimization(
+          messages,
+          promptMode,
+          includeRepoContext || promptMode !== 'quick_inspect' || (selectedToolNames.length > 0 && !manualToolProtocol),
+        );
+
     const currentMessages: any[] = [
       ...(await this.buildContextMessages(messages, promptMode, includeWorkspaceContext, includeRepoContext)),
       ...(manualToolProtocol ? [{ role: 'system', content: this.buildManualToolProtocol(selectedToolNames) }] : []),
-      ...this.applyPromptOptimization(
-        messages,
-        promptMode,
-        includeRepoContext || promptMode !== 'quick_inspect' || (selectedToolNames.length > 0 && !manualToolProtocol),
-      ),
+      ...promptMessages,
     ];
+    let manualBootstrapTool = manualToolProtocol
+      ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, selectedToolNames)
+      : null;
     let loopCount = 0;
     const MAX_LOOPS = 10;
     let manualProtocolCorrectionCount = 0;
     let simulatedToolReplyCount = 0;
 
     while (loopCount < MAX_LOOPS) {
+      if (manualToolProtocol && manualBootstrapTool) {
+        const bootstrapDecision = manualBootstrapTool;
+        manualBootstrapTool = null;
+        loopCount += 1;
+        this.planner.setPhase('execution');
+        this.planner.setIntendedAction(`Executing ${bootstrapDecision.name}`);
+        this.emitChatStatus(streamHandlers, 'execution', `Executing ${bootstrapDecision.name}`, loopCount);
+        this.traceBus.emitEvent({
+          type: 'manual_tool_bootstrap_selected',
+          data: {
+            model: this.config.model,
+            promptMode,
+            action: bootstrapDecision.name,
+            args: bootstrapDecision.args,
+          },
+        });
+
+        try {
+          const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args);
+          currentMessages.push({
+            role: 'user',
+            content: this.formatManualToolResult(bootstrapDecision.name, toolResult.output),
+          });
+        } catch (error: any) {
+          currentMessages.push({
+            role: 'user',
+            content: this.formatManualToolResult(bootstrapDecision.name, `Error: ${error.message}`),
+          });
+        }
+        continue;
+      }
+
       this.planner.setPhase('model');
       this.planner.setIntendedAction(loopCount === 0 ? 'Generating assistant response' : 'Processing tool results');
       this.emitChatStatus(
@@ -1639,6 +1957,7 @@ export class CoreEngine extends EventEmitter {
             maxTokens,
             reasoningEffort,
             options?.signal,
+            options?.think,
           );
         } else {
           result = await this.modelAdapter.createChatCompletion({
@@ -1647,6 +1966,7 @@ export class CoreEngine extends EventEmitter {
             tools: nativeToolDefinitions,
             max_tokens: maxTokens,
             reasoning_effort: reasoningEffort,
+            think: options?.think,
             signal: options?.signal,
           });
           message = result?.choices?.[0]?.message;
@@ -1661,6 +1981,16 @@ export class CoreEngine extends EventEmitter {
             type: 'tools_unsupported',
             data: { model: this.config.model, reason: errorMessage },
           });
+          this.traceBus.emitEvent({
+            type: 'manual_tool_fallback',
+            data: {
+              model: this.config.model,
+              reason: errorMessage,
+              manualToolProtocol: manualToolProtocol,
+              selectedTools: selectedToolNames,
+            },
+          });
+          this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', loopCount);
           if (manualToolProtocol && !manualProtocolPromptInjected) {
             currentMessages.push({
               role: 'system',
@@ -1676,6 +2006,7 @@ export class CoreEngine extends EventEmitter {
               maxTokens,
               reasoningEffort,
               options?.signal,
+              options?.think,
             );
           } else {
             result = await this.modelAdapter.createChatCompletion({
@@ -1683,6 +2014,7 @@ export class CoreEngine extends EventEmitter {
               stream: false,
               max_tokens: maxTokens,
               reasoning_effort: reasoningEffort,
+              think: options?.think,
               signal: options?.signal,
             });
             message = result?.choices?.[0]?.message;
@@ -1744,6 +2076,39 @@ export class CoreEngine extends EventEmitter {
 
       const response = extractTextSegment(message.content);
       if (manualToolProtocol) {
+        if (looksLikeSimulatedToolCall(response)) {
+          simulatedToolReplyCount += 1;
+          this.traceBus.emitEvent({
+            type: 'tool_simulation_detected',
+            data: {
+              model: this.config.model,
+              attempt: simulatedToolReplyCount,
+              preview: response.slice(0, 240),
+              manualToolProtocol: true,
+            },
+          });
+
+          if (simulatedToolReplyCount < 2) {
+            currentMessages.push({
+              role: 'system',
+              content: RECIPES.manualToolCorrection(),
+            });
+            loopCount += 1;
+            continue;
+          }
+
+          const warning = 'Model attempted to simulate tool usage in plain text. No tools were executed.';
+          this.planner.setPhase('ready');
+          this.planner.setIntendedAction('Awaiting user input');
+          this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
+          this.traceBus.emitEvent({
+            type: 'chat_response',
+            data: { length: warning.length, simulatedTools: true, manualToolProtocol: true },
+          });
+          await this.persistCurrentSession();
+          return `${warning} Retry the request or switch models.`;
+        }
+
         const manualDecision = this.parseManualToolResponse(response, selectedToolNames);
         if (manualDecision?.kind === 'tool') {
           loopCount += 1;

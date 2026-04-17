@@ -1,15 +1,30 @@
-FROM node:22-alpine@sha256:4d64b49e6c891c8fc821007cb1cdc6c0db7773110ac2c34bf2e6960adef62ed3 AS build
+FROM node:22-alpine@sha256:4d64b49e6c891c8fc821007cb1cdc6c0db7773110ac2c34bf2e6960adef62ed3 AS deps
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-COPY apps ./apps
-COPY packages ./packages
-COPY scripts ./scripts
-COPY third_party ./third_party
-COPY README.md AGENTS.md AGENTS_local_harness.md ./
+COPY apps/api/package.json ./apps/api/package.json
+COPY apps/cli/package.json ./apps/cli/package.json
+COPY apps/web/package.json ./apps/web/package.json
+COPY packages/approval-workflow/package.json ./packages/approval-workflow/package.json
+COPY packages/core/package.json ./packages/core/package.json
+COPY packages/doctor/package.json ./packages/doctor/package.json
+COPY packages/model-adapter/package.json ./packages/model-adapter/package.json
+COPY packages/planner/package.json ./packages/planner/package.json
+COPY packages/prompt-recipes/package.json ./packages/prompt-recipes/package.json
+COPY packages/repo-indexer/package.json ./packages/repo-indexer/package.json
+COPY packages/session-store/package.json ./packages/session-store/package.json
+COPY packages/skills/package.json ./packages/skills/package.json
+COPY packages/tool-runtime/package.json ./packages/tool-runtime/package.json
+COPY packages/trace-bus/package.json ./packages/trace-bus/package.json
+COPY packages/workspace-policy/package.json ./packages/workspace-policy/package.json
 
-RUN npm ci
+RUN npm ci --no-audit --no-fund
+
+FROM deps AS build
+
+COPY apps/web ./apps/web
+
 RUN npm run build --workspace web
 
 FROM nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10

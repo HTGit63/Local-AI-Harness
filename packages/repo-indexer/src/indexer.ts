@@ -15,6 +15,7 @@ const IGNORED_DIR_NAMES = new Set([
 const MAX_MANIFEST_PREVIEW = 8;
 const MAX_ENTRY_POINT_PREVIEW = 8;
 const MAX_README_PREVIEW = 4;
+const DEFAULT_CACHE_TTL_MS = 30_000;
 
 export interface ProjectContext {
   cwd: string;
@@ -45,15 +46,95 @@ export interface WorkspaceInventory {
   topLevelAreas: string[];
 }
 
+interface CacheEntry<T> {
+  signature: string;
+  expiresAt: number;
+  value: T;
+}
+
+function resolveCacheTtlMs(): number {
+  const rawValue = Number(
+    process.env.HARNESS_REPO_CONTEXT_CACHE_TTL_MS ??
+    process.env.HARNESS_REPO_CONTEXT_TTL_MS ??
+    DEFAULT_CACHE_TTL_MS,
+  );
+
+  if (!Number.isFinite(rawValue)) {
+    return DEFAULT_CACHE_TTL_MS;
+  }
+
+  return Math.max(1_000, Math.floor(rawValue));
+}
+
 export class RepoIndexer {
   private cwd: string;
+  private readonly cacheTtlMs: number;
+  private contextCache: CacheEntry<ProjectContext> | null = null;
+  private inventoryCache: CacheEntry<WorkspaceInventory> | null = null;
 
   constructor(cwd: string) {
     this.cwd = path.resolve(cwd);
+    this.cacheTtlMs = resolveCacheTtlMs();
   }
 
   updateWorkspaceRoot(cwd: string) {
     this.cwd = path.resolve(cwd);
+    this.clearCaches();
+  }
+
+  clearCaches() {
+    this.contextCache = null;
+    this.inventoryCache = null;
+  }
+
+  private buildCacheEntry<T>(signature: string, value: T): CacheEntry<T> {
+    return {
+      signature,
+      value,
+      expiresAt: Date.now() + this.cacheTtlMs,
+    };
+  }
+
+  private isCacheValid<T>(cache: CacheEntry<T> | null, signature: string): cache is CacheEntry<T> {
+    return Boolean(cache && cache.signature === signature && cache.expiresAt > Date.now());
+  }
+
+  private async getPathFingerprint(relativePath: string): Promise<string> {
+    try {
+      const stat = await fs.stat(path.join(this.cwd, relativePath));
+      return `${relativePath}:${Math.trunc(stat.mtimeMs)}:${stat.size}`;
+    } catch {
+      return `${relativePath}:missing`;
+    }
+  }
+
+  private async getWorkspaceSignature(): Promise<string> {
+    const sentinelPaths = [
+      '.git/index',
+      'package.json',
+      'pnpm-workspace.yaml',
+      'package-lock.json',
+      'yarn.lock',
+      'bun.lockb',
+    ];
+
+    let topLevelEntries: string[] = [];
+    try {
+      const entries = await fs.readdir(this.cwd, { withFileTypes: true });
+      topLevelEntries = entries
+        .filter((entry) => !IGNORED_DIR_NAMES.has(entry.name))
+        .map((entry) => entry.name)
+        .sort((left, right) => left.localeCompare(right));
+    } catch {
+      topLevelEntries = [];
+    }
+
+    const fingerprintTargets = Array.from(new Set([...sentinelPaths, ...topLevelEntries]));
+    const fingerprints = await Promise.all(
+      fingerprintTargets.map((target) => this.getPathFingerprint(target)),
+    );
+
+    return fingerprints.join('|');
   }
 
   async walk(dir: string, depth = 0, maxDepth = 3): Promise<string[]> {
@@ -143,7 +224,15 @@ export class RepoIndexer {
     }
   }
 
-  async buildWorkspaceInventory(): Promise<WorkspaceInventory> {
+  async buildWorkspaceInventory(forceRefresh = false): Promise<WorkspaceInventory> {
+    if (!forceRefresh && this.inventoryCache && this.inventoryCache.expiresAt > Date.now()) {
+      return this.inventoryCache.value;
+    }
+    const signature = await this.getWorkspaceSignature();
+    if (!forceRefresh && this.isCacheValid(this.inventoryCache, signature)) {
+      return this.inventoryCache.value;
+    }
+
     const rootManifest = await this.readJsonFile<{ name?: unknown; workspaces?: unknown }>(path.join(this.cwd, 'package.json'));
     const rootPackageName = typeof rootManifest?.name === 'string' && rootManifest.name.trim()
       ? rootManifest.name.trim()
@@ -166,7 +255,7 @@ export class RepoIndexer {
       .map((entry) => entry.name)
       .sort((left, right) => left.localeCompare(right));
 
-    return {
+    const inventory = {
       rootPackageName,
       workspaceGlobs,
       apps,
@@ -174,9 +263,20 @@ export class RepoIndexer {
       references,
       topLevelAreas,
     };
+    this.inventoryCache = this.buildCacheEntry(signature, inventory);
+    return inventory;
   }
 
-  async buildContext(): Promise<ProjectContext> {
+  async buildContext(forceRefresh = false): Promise<{ context: ProjectContext; cached: boolean }> {
+    if (!forceRefresh && this.contextCache && this.contextCache.expiresAt > Date.now()) {
+      return { context: this.contextCache.value, cached: true };
+    }
+
+    const signature = await this.getWorkspaceSignature();
+    if (!forceRefresh && this.isCacheValid(this.contextCache, signature)) {
+      return { context: this.contextCache.value, cached: true };
+    }
+
     const allFiles = await this.walk(this.cwd);
 
     const manifests: Record<string, string> = {};
@@ -211,7 +311,7 @@ export class RepoIndexer {
       `Key entry points: ${entryPoints.length > 0 ? entryPoints.join(', ') : 'unknown'}.`,
     ].join(' ');
 
-    return {
+    const context = {
       cwd: this.cwd,
       files: allFiles,
       manifests,
@@ -219,6 +319,8 @@ export class RepoIndexer {
       entryPoints,
       summary
     };
+    this.contextCache = this.buildCacheEntry(signature, context);
+    return { context, cached: false };
   }
 
   generatePromptInjection(ctx: ProjectContext): string {

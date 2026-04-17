@@ -40,9 +40,10 @@ The UI Event Bus and all surfaces must build their display logic around structur
 
 ### Agentic Coding Compatibility
 - **Gemma 4 / Qwen 3.5**: Prefer native Ollama chat for non-tool turns so the harness can preserve `thinking` output and explicitly suppress or reduce thinking on simple inspect requests.
-- **Tool strategy**: Small local reasoning models should default to deterministic local shortcuts for trivial workspace questions and stepwise/manual tool protocol when native tool calling is flaky.
+- **Tool strategy**: Small local reasoning models should default to deterministic local shortcuts for trivial workspace questions, native Ollama tool calling first, and stepwise/manual tool protocol only when native tool calling is flaky or unsupported.
 - **Workspace truth**: The sidebar and CLI must reflect the same backend workspace root the tools use; browser-only folder attachments are secondary context, not the source of truth.
 - **Surface parity**: CLI and Web must share the same session phases, thinking presentation, workspace root, model runtime status, and approval workflow language so the harness feels consistent across both surfaces.
+- **Mode split**: Direct chat and agentic coding are separate runtime paths; caveman overlay stays agentic-only and must not change approval or safety copy.
 
 ### Storage
 - **Session Storage Engine**: Local file-based JSON/text formats or a local SQLite database suitable for persistent session history, configuration parameters, and metadata storage.

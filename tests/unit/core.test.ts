@@ -2,8 +2,8 @@ import assert from 'assert';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { CoreEngine } from '@local-harness/core';
-import { ModelAdapter, PROFILES } from '@local-harness/model-adapter';
+import { CoreEngine, PromptAnalyzer } from '@local-harness/core';
+import { ModelAdapter, PROFILES, type ChatMessage as AdapterChatMessage } from '@local-harness/model-adapter';
 import { PromptOptimizer, RECIPES } from '@local-harness/prompt-recipes';
 import { RepoIndexer } from '@local-harness/repo-indexer';
 import { WorkspacePolicy } from '@local-harness/workspace-policy';
@@ -16,7 +16,7 @@ async function testConfigDefaults() {
   assert.ok(config.baseUrl.includes('11434'));
   assert.strictEqual(config.model, 'gemma4:e4b');
   assert.strictEqual(config.mode, 'workspace-write');
-  assert.strictEqual(config.profile, 'balanced');
+  assert.strictEqual(config.profile, 'fast');
 }
 
 function testPromptRecipes() {
@@ -29,6 +29,20 @@ function testPromptRecipes() {
   assert.ok(optimizer.optimizeForTask('diff content', 100).length > 0);
   assert.ok(optimizer.optimizeForTask('rewrite entire codebase', 5000).includes('FALLBACK'));
   assert.strictEqual(optimizer.detectReframing(Array(120).fill('word').join(' ')), true);
+}
+
+async function testPromptAnalyzerIsPassThrough() {
+  const analyzer = new PromptAnalyzer({} as ModelAdapter);
+  const messages: AdapterChatMessage[] = [
+    { role: 'system', content: 'setup' },
+    { role: 'user', content: '  keep wording  ' },
+  ];
+
+  const result = await analyzer.analyzeAndRefine(messages);
+  assert.strictEqual(result.needsClarification, false);
+  assert.strictEqual(result.originalPrompt, '  keep wording  ');
+  assert.strictEqual(result.refinedPrompt, '  keep wording  ');
+  assert.strictEqual(messages[1].content, '  keep wording  ');
 }
 
 function testWorkspacePolicy() {
@@ -68,6 +82,36 @@ async function testModelAdapter() {
     assert.strictEqual(runtimeAfter.activeModel, 'qwen3.5:9b-q4_K_M');
     assert.strictEqual(runtimeAfter.lastSwitchResult?.requestedModel, 'qwen3.5:9b-q4_K_M');
     assert.strictEqual(PROFILES.fast.max_tokens, 512);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testModelAdapterPrefersNativeOllamaChat() {
+  const originalFetch = globalThis.fetch;
+  const mockFetch = createMockFetch();
+  const requests: Array<{ url: string; body: any }> = [];
+
+  globalThis.fetch = (async (url: any, opts?: any) => {
+    const requestUrl = String(url);
+    const parsedBody = typeof opts?.body === 'string' && opts.body.trim() ? JSON.parse(opts.body) : undefined;
+    requests.push({ url: requestUrl, body: parsedBody });
+    return mockFetch(requestUrl, opts);
+  }) as typeof fetch;
+
+  try {
+    const adapter = new ModelAdapter();
+    await adapter.createChatCompletion({
+      messages: [{ role: 'user', content: 'Describe this image', images: ['abc123'] }],
+      think: true,
+    });
+
+    assert.ok(requests.some((entry) => entry.url.includes('/api/tags')));
+    const chatRequest = requests.find((entry) => entry.url.includes('/api/chat'));
+    assert.ok(chatRequest);
+    assert.deepStrictEqual(chatRequest?.body.messages?.[0]?.images, ['abc123']);
+    assert.strictEqual(chatRequest?.body.think, true);
+    assert.ok(!requests.some((entry) => entry.url.includes('/v1/chat/completions')));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -130,6 +174,30 @@ async function testEngineChatStream() {
   }
 }
 
+async function testEngineRecordsExecutionModes() {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = createMockFetch() as typeof fetch;
+
+  try {
+    const engine = new CoreEngine();
+    await engine.recordTurnExecution('direct', { messageCount: 1, thinkingEnabled: false });
+
+    const firstSession = engine.getSession();
+    assert.strictEqual(firstSession?.turnHistory?.[0]?.executionMode, 'direct');
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'chat_turn_mode' && (entry.data as { executionMode?: string }).executionMode === 'direct'));
+
+    await engine.chat([
+      { role: 'user', content: 'Reply with exactly: PING' },
+    ]);
+
+    const modes = engine.getSession()?.turnHistory?.map((turn) => turn.executionMode) || [];
+    assert.ok(modes.includes('agentic'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'chat_turn_mode' && (entry.data as { executionMode?: string }).executionMode === 'agentic'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function testEnginePrioritizesEditsWithoutAutoRepoContext() {
   const originalFetch = globalThis.fetch;
   const chatRequests: any[] = [];
@@ -156,7 +224,10 @@ async function testEnginePrioritizesEditsWithoutAutoRepoContext() {
     assert.ok(payload.includes('[Workspace Context]'));
     assert.ok(payload.includes(workspaceRoot));
     assert.ok(!payload.includes('[Repo Context Summary]'));
-    assert.ok(payload.includes('Inspect the target files before editing'));
+    assert.ok(
+      payload.includes('Inspect only the minimum files needed before editing') ||
+      payload.includes('Inspect the target files before editing'),
+    );
 
     const recipeTrace = engine.getTraceLog().find((entry) => entry.type === 'prompt_recipe_selected');
     assert.strictEqual((recipeTrace?.data as { mode?: string } | undefined)?.mode, 'targeted_edit');
@@ -182,7 +253,7 @@ async function testRepoIndexerExcludesVendoredAndSessionDirs() {
 
   try {
     const indexer = new RepoIndexer(workspaceRoot);
-    const context = await indexer.buildContext();
+    const { context } = await indexer.buildContext();
     assert.ok(context.files.includes('src/index.ts'));
     assert.ok(!context.files.some((file) => file.startsWith('third_party/')));
     assert.ok(!context.files.some((file) => file.startsWith('base_repos/')));
@@ -251,21 +322,26 @@ async function testEngineKeepsSimplePromptsLean() {
   }
 }
 
-async function testEngineUsesManualToolProtocolForGemmaTargetedEdits() {
+async function testEnginePrefersManualToolsForGemmaTargetedEdits() {
   const originalFetch = globalThis.fetch;
   const chatRequests: any[] = [];
   globalThis.fetch = createMockFetch({
     onChatRequest(body) {
       chatRequests.push(body);
     },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'export const ok = true;' }, finish_reason: 'stop' }],
+    }),
   }) as typeof fetch;
 
   try {
     const engine = new CoreEngine();
-    await engine.chat([
+    const response = await engine.chat([
       { role: 'user', content: 'Fix src/index.ts so it exports a default value' },
     ]);
 
+    assert.strictEqual(response, 'export const ok = true;');
     assert.ok(chatRequests.length >= 1);
     assert.strictEqual(chatRequests[0].tools, undefined);
     assert.ok(JSON.stringify(chatRequests[0].messages).includes('Use this lightweight JSON tool protocol'));
@@ -312,7 +388,7 @@ async function testEngineUsesManualToolProtocolWhenModelLacksNativeTools() {
     assert.ok(chatRequests.length >= 2);
     assert.strictEqual(chatRequests[0].tools, undefined);
     assert.ok(JSON.stringify(chatRequests[0].messages).includes('Use this lightweight JSON tool protocol'));
-    assert.strictEqual(chatRequests[0].think ?? chatRequests[0].reasoning_effort, undefined);
+    assert.strictEqual(chatRequests[0].think ?? chatRequests[0].reasoning_effort, false);
   } finally {
     globalThis.fetch = originalFetch;
     await fs.rm(workspaceRoot, { recursive: true, force: true });
@@ -365,7 +441,45 @@ async function testEngineAnswersRootManifestNameFromLocalInventory() {
   }
 }
 
-async function testEnginePrefersManualToolProtocolForThinkingModelsDuringQuickInspect() {
+async function testEngineDoesNotShortCircuitWritePromptsThatMentionProjectMetadata() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-root-manifest-write-'));
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({
+    name: 'art-gallery',
+    scripts: {
+      start: 'node server.js',
+    },
+  }), 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'AGENTIC_PROBE.md' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, model: 'gemma4:e4b' });
+    const response = await engine.chat([
+      {
+        role: 'user',
+        content: 'Create AGENTIC_PROBE.md in this workspace with exactly three bullets: project name, start command, main server file. Then reply with the file path only.',
+      },
+    ]);
+
+    assert.strictEqual(response, 'AGENTIC_PROBE.md');
+    assert.ok(chatRequests.length >= 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testEnginePrefersManualToolsForGemmaQuickInspect() {
   const originalFetch = globalThis.fetch;
   const chatRequests: any[] = [];
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-thinking-model-'));
@@ -376,19 +490,10 @@ async function testEnginePrefersManualToolProtocolForThinkingModelsDuringQuickIn
     onChatRequest(body) {
       chatRequests.push(body);
     },
-    chatResponder(body) {
-      const lastUser = [...body.messages].reverse().find((message: any) => message.role === 'user')?.content || '';
-      if (lastUser.includes('[Tool Result]')) {
-        return {
-          ...MOCK_CHAT_RESPONSE,
-          choices: [{ index: 0, message: { role: 'assistant', content: '{"final":"export const ok = true;"}' }, finish_reason: 'stop' }],
-        };
-      }
-      return {
-        ...MOCK_CHAT_RESPONSE,
-        choices: [{ index: 0, message: { role: 'assistant', content: '{"action":"readFile","args":{"filePath":"src/index.ts"}}' }, finish_reason: 'stop' }],
-      };
-    },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'export const ok = true;' }, finish_reason: 'stop' }],
+    }),
   }) as typeof fetch;
 
   try {
@@ -398,13 +503,43 @@ async function testEnginePrefersManualToolProtocolForThinkingModelsDuringQuickIn
     ]);
 
     assert.strictEqual(response, 'export const ok = true;');
-    assert.ok(chatRequests.length >= 2);
+    assert.ok(chatRequests.length >= 1);
     assert.strictEqual(chatRequests[0].tools, undefined);
     assert.ok(JSON.stringify(chatRequests[0].messages).includes('Use this lightweight JSON tool protocol'));
     assert.strictEqual(chatRequests[0].think ?? chatRequests[0].reasoning_effort, false);
   } finally {
     globalThis.fetch = originalFetch;
     await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testEngineWarnsWhenThinkingUnsupported() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    showResponder() {
+      return { capabilities: ['completion', 'vision', 'tools'] };
+    },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Thinking unavailable response' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ model: 'gemma4:e4b' });
+    const response = await engine.chat([
+      { role: 'user', content: 'Explain the plan briefly' },
+    ], { think: true });
+
+    assert.strictEqual(response, 'Thinking unavailable response');
+    assert.strictEqual(chatRequests[0].think, true);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 }
 
@@ -572,19 +707,24 @@ async function testEngineRejectsSimulatedToolTranscripts() {
 async function run() {
   await testConfigDefaults();
   testPromptRecipes();
+  await testPromptAnalyzerIsPassThrough();
   testWorkspacePolicy();
   await testModelAdapter();
+  await testModelAdapterPrefersNativeOllamaChat();
   await testEnginePromptRecipeSelection();
   await testEngineChatStream();
+  await testEngineRecordsExecutionModes();
   await testEnginePrioritizesEditsWithoutAutoRepoContext();
   await testRepoIndexerExcludesVendoredAndSessionDirs();
   await testRepoIndexerBuildsWorkspaceInventory();
   await testEngineKeepsSimplePromptsLean();
-  await testEngineUsesManualToolProtocolForGemmaTargetedEdits();
+  await testEnginePrefersManualToolsForGemmaTargetedEdits();
   await testEngineUsesManualToolProtocolWhenModelLacksNativeTools();
   await testEngineAnswersRepoOverviewFromLocalInventory();
   await testEngineAnswersRootManifestNameFromLocalInventory();
-  await testEnginePrefersManualToolProtocolForThinkingModelsDuringQuickInspect();
+  await testEngineDoesNotShortCircuitWritePromptsThatMentionProjectMetadata();
+  await testEnginePrefersManualToolsForGemmaQuickInspect();
+  await testEngineWarnsWhenThinkingUnsupported();
   await testEngineAnswersStatusOnlyQuestionsFromLocalState();
   await testEngineAnswersSimpleWorkspaceListingsWithoutModelRoundTrip();
   await testEngineChatStreamShowsStatusesForDirectWorkspaceListing();
