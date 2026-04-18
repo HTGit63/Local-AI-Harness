@@ -40,6 +40,68 @@ export class Planner {
     this.emitStateChange('plan_update', { activeSkills: skills });
   }
 
+  startRun(runId: string) {
+    this.emitStateChange('plan_update', {
+      currentRunId: runId,
+      runSteps: [],
+      runSummary: undefined,
+      currentTool: undefined,
+    });
+    this.traceBus.emitEvent({
+      type: 'run_started',
+      data: { runId },
+    });
+  }
+
+  upsertRunStep(step: {
+    id: string;
+    type: string;
+    title: string;
+    status: 'running' | 'done' | 'error' | 'skipped';
+    detail?: string;
+    toolName?: string;
+  }) {
+    const currentSteps = this.state.runSteps ?? [];
+    const nextSteps = currentSteps.filter((entry) => entry.id !== step.id).concat(step);
+    this.emitStateChange('plan_update', { runSteps: nextSteps });
+    this.traceBus.emitEvent({
+      type: step.status === 'running' ? 'run_step_started' : 'run_step_finished',
+      data: {
+        runId: this.state.currentRunId,
+        step,
+      },
+    });
+  }
+
+  setCurrentTool(toolName?: string) {
+    this.emitStateChange('plan_update', { currentTool: toolName });
+  }
+
+  setRunSummary(summary: {
+    id: string;
+    summary?: string;
+    changedFiles?: number;
+    addedLines?: number;
+    removedLines?: number;
+  }) {
+    this.emitStateChange('plan_update', { runSummary: summary, currentTool: undefined });
+    this.traceBus.emitEvent({
+      type: 'run_summary_ready',
+      data: summary,
+    });
+  }
+
+  failRun(error: string) {
+    this.emitStateChange('plan_update', { currentTool: undefined });
+    this.traceBus.emitEvent({
+      type: 'run_failed',
+      data: {
+        runId: this.state.currentRunId,
+        error,
+      },
+    });
+  }
+
   setIntendedAction(action: string) {
     this.emitStateChange('action_intent', { intendedNextAction: action });
   }

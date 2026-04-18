@@ -1,5 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { HARNESS_NATIVE_SKILLS } from './harness-native';
 
 const DIVISIONS = [
   'engineering',
@@ -164,10 +165,14 @@ export async function indexSkills(options: IndexSkillsOptions = {}) {
     }
   }
 
-  const curated = skills.filter((skill) => CURATED_SLUGS.some((slug) => skill.slug.includes(slug)));
+  const curated = [
+    ...skills.filter((skill) => CURATED_SLUGS.some((slug) => skill.slug.includes(slug))),
+    ...HARNESS_NATIVE_SKILLS,
+  ];
+  const allSkills = [...skills, ...HARNESS_NATIVE_SKILLS];
 
   await fs.mkdir(outDir, { recursive: true });
-  await fs.writeFile(path.join(outDir, 'all_skills.json'), JSON.stringify(skills, null, 2));
+  await fs.writeFile(path.join(outDir, 'all_skills.json'), JSON.stringify(allSkills, null, 2));
   await fs.writeFile(path.join(outDir, 'curated_pack.json'), JSON.stringify(curated, null, 2));
 
   const antigravityDir = path.join(outDir, 'antigravity_exports');
@@ -198,7 +203,7 @@ export async function indexSkills(options: IndexSkillsOptions = {}) {
     );
   }
 
-  return { skills, curated, outDir, antigravityDir };
+  return { skills: allSkills, curated, outDir, antigravityDir };
 }
 
 export async function loadCuratedSkills(outputDir = path.resolve(path.join(__dirname, '../dist'))): Promise<SkillMetadata[]> {

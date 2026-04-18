@@ -1,4 +1,4 @@
-import { ApprovalDecision, ToolActionContext, ToolResult } from './types';
+import { ApprovalDecision, ToolActionContext, ToolDiffStats, ToolResult } from './types';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
@@ -102,13 +102,23 @@ function containsUnsupportedShellSyntax(command: string): boolean {
   return false;
 }
 
-function truncateOutput(output: string): string {
+function truncateOutputResult(output: string): { text: string; truncated: boolean } {
   const lines = output.split('\n');
   if (lines.length <= MAX_OUTPUT_LINES) {
-    return output.trim() || 'No output';
+    return {
+      text: output.trim() || 'No output',
+      truncated: false,
+    };
   }
 
-  return `${lines.slice(0, MAX_OUTPUT_LINES).join('\n')}\n... output truncated ...`;
+  return {
+    text: `${lines.slice(0, MAX_OUTPUT_LINES).join('\n')}\n... output truncated ...`,
+    truncated: true,
+  };
+}
+
+function truncateOutput(output: string): string {
+  return truncateOutputResult(output).text;
 }
 
 function createSummaryPreview(filePath: string, before: string, after: string): string {
@@ -175,9 +185,66 @@ async function walkFiles(cwd: string, currentDir = cwd): Promise<string[]> {
   return results.sort();
 }
 
-async function buildDiffPreview(filePath: string, before: string, after: string): Promise<string> {
+function countDiffStatsFromContent(before: string, after: string): ToolDiffStats {
+  const beforeLines = before ? before.split('\n') : [];
+  const afterLines = after ? after.split('\n') : [];
+  let prefix = 0;
+  let suffix = 0;
+
+  while (
+    prefix < beforeLines.length &&
+    prefix < afterLines.length &&
+    beforeLines[prefix] === afterLines[prefix]
+  ) {
+    prefix += 1;
+  }
+
+  while (
+    suffix + prefix < beforeLines.length &&
+    suffix + prefix < afterLines.length &&
+    beforeLines[beforeLines.length - 1 - suffix] === afterLines[afterLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+
+  const removedLines = Math.max(0, beforeLines.length - prefix - suffix);
+  const addedLines = Math.max(0, afterLines.length - prefix - suffix);
+  return {
+    changedFiles: before === after ? 0 : 1,
+    addedLines,
+    removedLines,
+  };
+}
+
+function parseUnifiedDiffStats(diff: string): ToolDiffStats {
+  const lines = diff.split('\n');
+  let addedLines = 0;
+  let removedLines = 0;
+
+  for (const line of lines) {
+    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) {
+      continue;
+    }
+    if (line.startsWith('+')) {
+      addedLines += 1;
+    } else if (line.startsWith('-')) {
+      removedLines += 1;
+    }
+  }
+
+  return {
+    changedFiles: addedLines > 0 || removedLines > 0 ? 1 : 0,
+    addedLines,
+    removedLines,
+  };
+}
+
+async function buildDiffPreview(filePath: string, before: string, after: string): Promise<{ preview: string; lineStats: ToolDiffStats }> {
   if (before === after) {
-    return `No content changes for ${filePath}`;
+    return {
+      preview: `No content changes for ${filePath}`,
+      lineStats: { changedFiles: 0, addedLines: 0, removedLines: 0 },
+    };
   }
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-diff-'));
@@ -194,13 +261,22 @@ async function buildDiffPreview(filePath: string, before: string, after: string)
         ['-u', '--label', `${filePath} (before)`, '--label', `${filePath} (after)`, beforePath, afterPath],
         { maxBuffer: MAX_BUFFER_BYTES },
       );
-      return truncateOutput(stdout);
+      return {
+        preview: truncateOutput(stdout),
+        lineStats: parseUnifiedDiffStats(stdout),
+      };
     } catch (error: any) {
       if (typeof error?.stdout === 'string' && error.stdout.trim()) {
-        return truncateOutput(error.stdout);
+        return {
+          preview: truncateOutput(error.stdout),
+          lineStats: parseUnifiedDiffStats(error.stdout),
+        };
       }
 
-      return createSummaryPreview(filePath, before, after);
+      return {
+        preview: createSummaryPreview(filePath, before, after),
+        lineStats: countDiffStatsFromContent(before, after),
+      };
     }
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -247,23 +323,39 @@ export class ToolRegistry {
   }
 
   private wrapExecution(name: string, inputSummary: string, executor: () => Promise<ToolResult>): Promise<ToolResult> {
+    const startedAt = Date.now();
     this.context.emitTrace('tool_call', { name, inputSummary });
     return executor()
       .then((result) => {
+        const durationMs = Date.now() - startedAt;
         this.context.emitTrace('tool_result', {
           name,
           resultSummary: result.success ? 'Success' : 'Failed',
           output: truncateOutput(result.output),
+          durationMs,
         });
-        return result;
+        return {
+          ...result,
+          metadata: {
+            ...(result.metadata ?? {}),
+            durationMs,
+          },
+        };
       })
       .catch((error: Error) => {
+        const durationMs = Date.now() - startedAt;
         this.context.emitTrace('tool_result', {
           name,
           resultSummary: 'Error',
           output: error.message,
+          durationMs,
         });
-        return { success: false, output: error.message, error: error.message };
+        return {
+          success: false,
+          output: error.message,
+          error: error.message,
+          metadata: { durationMs },
+        };
       });
   }
 
@@ -275,7 +367,13 @@ export class ToolRegistry {
       }
 
       const content = await fs.readFile(this.resolveTarget(filePath), 'utf8');
-      return { success: true, output: content };
+      return {
+        success: true,
+        output: content,
+        metadata: {
+          fileReads: [filePath],
+        },
+      };
     });
   }
 
@@ -292,7 +390,13 @@ export class ToolRegistry {
         .sort()
         .join('\n');
 
-      return { success: true, output: output || 'No entries' };
+      return {
+        success: true,
+        output: output || 'No entries',
+        metadata: {
+          directoriesRead: [dirPath],
+        },
+      };
     });
   }
 
@@ -309,7 +413,15 @@ export class ToolRegistry {
           ['--files', '--glob', pattern, '--glob', '!node_modules/**', '--glob', '!.git/**'],
           { cwd: this.context.cwd, maxBuffer: MAX_BUFFER_BYTES },
         );
-        return { success: true, output: truncateOutput(stdout) || 'No matches' };
+        const truncated = truncateOutputResult(stdout);
+        return {
+          success: true,
+          output: truncated.text || 'No matches',
+          metadata: {
+            searches: [{ query: pattern, pattern }],
+            truncated: truncated.truncated,
+          },
+        };
       } catch (error) {
         if (!isMissingExecutable(error)) {
           throw error;
@@ -318,7 +430,13 @@ export class ToolRegistry {
 
       const matcher = globToRegExp(pattern);
       const matches = (await walkFiles(this.context.cwd)).filter((file) => matcher.test(file));
-      return { success: true, output: matches.join('\n') || 'No matches' };
+      return {
+        success: true,
+        output: matches.join('\n') || 'No matches',
+        metadata: {
+          searches: [{ query: pattern, pattern }],
+        },
+      };
     });
   }
 
@@ -340,14 +458,36 @@ export class ToolRegistry {
           cwd: this.context.cwd,
           maxBuffer: MAX_BUFFER_BYTES,
         });
-        return { success: true, output: truncateOutput(stdout) || 'No matches' };
+        const truncated = truncateOutputResult(stdout);
+        return {
+          success: true,
+          output: truncated.text || 'No matches',
+          metadata: {
+            searches: [{ query, pattern: filePattern }],
+            truncated: truncated.truncated,
+          },
+        };
       } catch (error: any) {
         if (!isMissingExecutable(error)) {
           if (typeof error?.stdout === 'string' && error.stdout.trim()) {
-            return { success: true, output: truncateOutput(error.stdout) };
+            const truncated = truncateOutputResult(error.stdout);
+            return {
+              success: true,
+              output: truncated.text,
+              metadata: {
+                searches: [{ query, pattern: filePattern }],
+                truncated: truncated.truncated,
+              },
+            };
           }
           if (error?.code === 1) {
-            return { success: true, output: 'No matches' };
+            return {
+              success: true,
+              output: 'No matches',
+              metadata: {
+                searches: [{ query, pattern: filePattern }],
+              },
+            };
           }
         }
       }
@@ -363,13 +503,35 @@ export class ToolRegistry {
           cwd: this.context.cwd,
           maxBuffer: MAX_BUFFER_BYTES,
         });
-        return { success: true, output: truncateOutput(stdout) || 'No matches' };
+        const truncated = truncateOutputResult(stdout);
+        return {
+          success: true,
+          output: truncated.text || 'No matches',
+          metadata: {
+            searches: [{ query, pattern: filePattern }],
+            truncated: truncated.truncated,
+          },
+        };
       } catch (error: any) {
         if (error?.code === 1) {
-          return { success: true, output: 'No matches' };
+          return {
+            success: true,
+            output: 'No matches',
+            metadata: {
+              searches: [{ query, pattern: filePattern }],
+            },
+          };
         }
         if (typeof error?.stdout === 'string' && error.stdout.trim()) {
-          return { success: true, output: truncateOutput(error.stdout) };
+          const truncated = truncateOutputResult(error.stdout);
+          return {
+            success: true,
+            output: truncated.text,
+            metadata: {
+              searches: [{ query, pattern: filePattern }],
+              truncated: truncated.truncated,
+            },
+          };
         }
         throw error;
       }
@@ -390,17 +552,33 @@ export class ToolRegistry {
       }
 
       const patched = fileContent.replace(oldContent, newContent);
-      const preview = await buildDiffPreview(filePath, fileContent, patched);
+      const diff = await buildDiffPreview(filePath, fileContent, patched);
 
       if (policy.requiresApproval) {
-        const approved = await this.withApproval('patch_file', filePath, preview);
+        const approved = await this.withApproval('patch_file', filePath, diff.preview);
         if (!approved) {
-          return { success: false, output: 'Rejected by user.', preview };
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: {
+              fileWrites: [filePath],
+              lineStats: diff.lineStats,
+            },
+          };
         }
       }
 
       await fs.writeFile(absolutePath, patched, 'utf8');
-      return { success: true, output: `Patched ${filePath}`, preview };
+      return {
+        success: true,
+        output: `Patched ${filePath}`,
+        preview: diff.preview,
+        metadata: {
+          fileWrites: [filePath],
+          lineStats: diff.lineStats,
+        },
+      };
     });
   }
 
@@ -420,7 +598,14 @@ export class ToolRegistry {
       }
 
       await fs.mkdir(this.resolveTarget(dirPath), { recursive: true });
-      return { success: true, output: `Created directory ${dirPath}`, preview };
+      return {
+        success: true,
+        output: `Created directory ${dirPath}`,
+        preview,
+        metadata: {
+          directoriesCreated: [dirPath],
+        },
+      };
     });
   }
 
@@ -443,17 +628,33 @@ export class ToolRegistry {
         before = '';
       }
 
-      const preview = await buildDiffPreview(filePath, before, content);
+      const diff = await buildDiffPreview(filePath, before, content);
       if ('updatePreview' in approvalPromise && typeof approvalPromise.updatePreview === 'function') {
-        approvalPromise.updatePreview(preview);
+        approvalPromise.updatePreview(diff.preview);
       }
       if (!(await approvalPromise)) {
-        return { success: false, output: 'Rejected by user.', preview };
+        return {
+          success: false,
+          output: 'Rejected by user.',
+          preview: diff.preview,
+          metadata: {
+            fileWrites: [filePath],
+            lineStats: diff.lineStats,
+          },
+        };
       }
 
       await fs.mkdir(path.dirname(absolutePath), { recursive: true });
       await fs.writeFile(absolutePath, content, 'utf8');
-      return { success: true, output: `Successfully wrote to ${filePath}`, preview };
+      return {
+        success: true,
+        output: `Successfully wrote to ${filePath}`,
+        preview: diff.preview,
+        metadata: {
+          fileWrites: [filePath],
+          lineStats: diff.lineStats,
+        },
+      };
     });
   }
 
@@ -466,13 +667,24 @@ export class ToolRegistry {
 
       const absolutePath = this.resolveTarget(filePath);
       const stat = await fs.stat(absolutePath);
-      const preview = stat.isDirectory()
-        ? `Delete directory ${filePath}`
+      const diff = stat.isDirectory()
+        ? {
+            preview: `Delete directory ${filePath}`,
+            lineStats: { changedFiles: 0, addedLines: 0, removedLines: 0 },
+          }
         : await buildDiffPreview(filePath, await fs.readFile(absolutePath, 'utf8'), '');
       if (policy.requiresApproval) {
-        const approved = await this.withApproval('delete_file', filePath, preview);
+        const approved = await this.withApproval('delete_file', filePath, diff.preview);
         if (!approved) {
-          return { success: false, output: 'Rejected by user.', preview };
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: {
+              fileDeletes: stat.isDirectory() ? undefined : [filePath],
+              lineStats: diff.lineStats,
+            },
+          };
         }
       }
 
@@ -481,7 +693,15 @@ export class ToolRegistry {
       } else {
         await fs.unlink(absolutePath);
       }
-      return { success: true, output: `Deleted ${filePath}`, preview };
+      return {
+        success: true,
+        output: `Deleted ${filePath}`,
+        preview: diff.preview,
+        metadata: {
+          fileDeletes: stat.isDirectory() ? undefined : [filePath],
+          lineStats: diff.lineStats,
+        },
+      };
     });
   }
 
@@ -492,10 +712,28 @@ export class ToolRegistry {
           cwd: this.context.cwd,
           maxBuffer: MAX_BUFFER_BYTES,
         });
-        return { success: true, output: stdout.trim() || 'Clean tree' };
+        return {
+          success: true,
+          output: stdout.trim() || 'Clean tree',
+          metadata: {
+            command: {
+              command: 'git status -s',
+              success: true,
+            },
+          },
+        };
       } catch (error) {
         if (isNotGitRepository(error)) {
-          return { success: true, output: 'Not a git repository.' };
+          return {
+            success: true,
+            output: 'Not a git repository.',
+            metadata: {
+              command: {
+                command: 'git status -s',
+                success: true,
+              },
+            },
+          };
         }
         throw error;
       }
@@ -509,15 +747,42 @@ export class ToolRegistry {
           cwd: this.context.cwd,
           maxBuffer: MAX_BUFFER_BYTES,
         });
-        return { success: true, output: stdout.trim() || 'No output' };
+        const truncated = truncateOutputResult(stdout);
+        return {
+          success: true,
+          output: truncated.text || 'No output',
+          metadata: {
+            command: {
+              command: 'git diff --',
+              success: true,
+            },
+            truncated: truncated.truncated,
+          },
+        };
       } catch (error: any) {
         if (isNotGitRepository(error)) {
-          return { success: true, output: 'Not a git repository.' };
+          return {
+            success: true,
+            output: 'Not a git repository.',
+            metadata: {
+              command: {
+                command: 'git diff --',
+                success: true,
+              },
+            },
+          };
         }
         if (typeof error?.stdout === 'string' && error.stdout.trim()) {
           return {
             success: true,
             output: `${truncateOutput(error.stdout)}\n\n[git diff truncated: output exceeded buffer]`,
+            metadata: {
+              command: {
+                command: 'git diff --',
+                success: true,
+              },
+              truncated: true,
+            },
           };
         }
         throw error;
@@ -558,13 +823,27 @@ export class ToolRegistry {
         };
       }
 
+      const commandStartedAt = Date.now();
       const { stdout, stderr } = await execFileAsync(commandName, commandArgs, {
         cwd: this.context.cwd,
         timeout: 30000,
         maxBuffer: MAX_BUFFER_BYTES,
       });
+      const truncated = truncateOutputResult(stdout || stderr || 'No output');
 
-      return { success: true, output: truncateOutput(stdout || stderr || 'No output'), preview };
+      return {
+        success: true,
+        output: truncated.text,
+        preview,
+        metadata: {
+          command: {
+            command,
+            success: true,
+            durationMs: Date.now() - commandStartedAt,
+          },
+          truncated: truncated.truncated,
+        },
+      };
     });
   }
 }

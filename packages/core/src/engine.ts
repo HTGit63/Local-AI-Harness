@@ -1,15 +1,19 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { ApprovalQueueManager, ApprovalRequestPayload } from '@local-harness/approval-workflow';
 import { ModelAdapter, ModelRuntimeState } from '@local-harness/model-adapter';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
 import { RepoIndexer, ProjectContext } from '@local-harness/repo-indexer';
-import { FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
-import { ToolRegistry } from '@local-harness/tool-runtime';
+import { AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
+import { ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
+import { AgentRunBuilder, buildFinalAnswer, summarizeRun } from './agent-run';
+import { classifyIntent, IntentDecision, TaskIntent } from './intent-classifier';
 // PromptAnalyzer removed — passes messages straight through for lower latency
 
 const SUPPORTED_TOOLS = [
@@ -26,6 +30,7 @@ const SUPPORTED_TOOLS = [
   'gitDiff',
 ] as const;
 const AUTO_REPO_CONTEXT_ENABLED = process.env.HARNESS_AUTO_REPO_CONTEXT === '1';
+const execFileAsync = promisify(execFile);
 
 type SupportedTool = (typeof SUPPORTED_TOOLS)[number];
 type TurnExecutionMode = 'direct' | 'agentic';
@@ -35,6 +40,9 @@ type ManualToolDecision =
   | { kind: 'final'; content: string };
 type ImmediateChatAnswer = { content: string; action: string; source: string };
 type ToolProtocolMode = 'native' | 'manual_preferred' | 'manual_fallback';
+type BootstrapPlanStep =
+  | { type: 'inventory'; title: string }
+  | { type: 'tool'; title: string; toolName: SupportedTool; args: Record<string, unknown> };
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -56,10 +64,54 @@ export interface ChatToolEvent {
   success?: boolean;
 }
 
+export interface RunStartedEvent {
+  type: 'run_started';
+  runId: string;
+  sessionId: string;
+  intent: string;
+  workspaceBound: boolean;
+  browserContextActive: boolean;
+  workspaceSource: 'backend' | 'browser_snapshot';
+  executionMode: TurnExecutionMode;
+}
+
+export interface RunStepEvent {
+  type: 'run_step';
+  runId: string;
+  step: AgentRunStep;
+}
+
+export interface RunMetricEvent {
+  type: 'run_metric';
+  runId: string;
+  metrics: Partial<{
+    filesRead: number;
+    directoriesRead: number;
+    filesWritten: number;
+    commandsRun: number;
+    searchesRun: number;
+    approvals: number;
+    addedLines: number;
+    removedLines: number;
+    firstTokenMs: number;
+    totalMs: number;
+  }>;
+}
+
+export interface RunSummaryEvent {
+  type: 'run_summary';
+  runId: string;
+  summary: AgentRun;
+}
+
 export interface ChatStreamHandlers {
   onStatus?: (event: ChatStatusEvent) => void;
   onDelta?: (chunk: string) => void;
   onTool?: (event: ChatToolEvent) => void;
+  onRunStarted?: (event: RunStartedEvent) => void;
+  onRunStep?: (event: RunStepEvent) => void;
+  onRunMetric?: (event: RunMetricEvent) => void;
+  onRunSummary?: (event: RunSummaryEvent) => void;
 }
 
 export interface EngineConfig {
@@ -105,6 +157,10 @@ function createSessionId(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function createRunId(): string {
+  return `run_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function toolActionToChangeType(action: string): ApprovalRequestPayload['changeType'] {
   switch (action) {
     case 'writeFile':
@@ -141,6 +197,22 @@ function toolActionToSeverity(action: string): ApprovalRequestPayload['severity'
     default:
       return 'info';
   }
+}
+
+function summarizeInventoryForPrompt(inventory: Awaited<ReturnType<RepoIndexer['buildWorkspaceInventory']>>): string {
+  const appPreview = inventory.apps.slice(0, 6).map((entry) => entry.path).join(', ') || 'none';
+  const packagePreview = inventory.packages.slice(0, 8).map((entry) => entry.path).join(', ') || 'none';
+  return [
+    '[Workspace Inventory]',
+    `Root package: ${inventory.rootPackageName || 'unknown'}`,
+    `Apps: ${appPreview}`,
+    `Packages: ${packagePreview}`,
+    `Top-level areas: ${inventory.topLevelAreas.join(', ') || 'none'}`,
+  ].join('\n');
+}
+
+function mergeSkills(base: string[], additional: string[]): string[] {
+  return Array.from(new Set([...base, ...additional]));
 }
 
 function getRequiredStringArg(args: Record<string, unknown>, key: string, toolName: SupportedTool): string {
@@ -749,13 +821,12 @@ export class CoreEngine extends EventEmitter {
       };
     }
 
-    const nativeToolsForced = process.env.HARNESS_FORCE_NATIVE_TOOLS === '1';
-    const normalizedModel = this.config.model.toLowerCase();
-    if (!nativeToolsForced && normalizedModel.includes('gemma4')) {
+    const manualToolsForced = process.env.HARNESS_FORCE_MANUAL_TOOLS === '1';
+    if (manualToolsForced) {
       return {
         manualToolProtocol: true,
         mode: 'manual_preferred',
-        reason: 'Gemma 4 native tool selection is much slower than manual JSON tool routing on local Ollama.',
+        reason: 'Manual tool protocol forced by HARNESS_FORCE_MANUAL_TOOLS=1.',
       };
     }
 
@@ -1060,6 +1131,126 @@ export class CoreEngine extends EventEmitter {
     }
 
     return SUPPORTED_TOOLS.filter((toolName) => selected.has(toolName));
+  }
+
+  private selectOperationalSkills(intent: TaskIntent, promptMode: RunMode): string[] {
+    const selected = ['session-continuity', 'local-safety-operator'];
+
+    switch (intent) {
+      case 'workspace_overview':
+        selected.push('repo-cartographer');
+        break;
+      case 'read_file':
+      case 'explain_code':
+        selected.push('file-explainer');
+        break;
+      case 'edit_code':
+        selected.push('tool-router', 'patch-surgeon', 'diff-summarizer');
+        break;
+      case 'review_diff':
+        selected.push('diff-summarizer');
+        break;
+      case 'workspace_binding_needed':
+      case 'browser_snapshot_only':
+        selected.push('workspace-binder');
+        break;
+      case 'run_command':
+        selected.push('command-runner', 'test-runner');
+        break;
+      default:
+        break;
+    }
+
+    if (promptMode === 'code_review') {
+      selected.push('diff-summarizer');
+    }
+
+    return selected;
+  }
+
+  private buildBootstrapPlan(intentDecision: IntentDecision): BootstrapPlanStep[] {
+    switch (intentDecision.intent) {
+      case 'workspace_overview':
+        return [
+          { type: 'inventory', title: 'Build workspace inventory' },
+          { type: 'tool', title: 'List workspace root', toolName: 'listDir', args: { dirPath: '.' } },
+        ];
+      case 'find_file':
+        if (!intentDecision.targetPath) return [];
+        return [
+          {
+            type: 'tool',
+            title: `Find ${intentDecision.targetPath}`,
+            toolName: 'glob',
+            args: { pattern: `**/*${path.basename(intentDecision.targetPath)}*` },
+          },
+        ];
+      case 'read_file':
+        if (!intentDecision.targetPath) return [];
+        return [
+          {
+            type: 'tool',
+            title: `Read ${intentDecision.targetPath}`,
+            toolName: 'readFile',
+            args: { filePath: intentDecision.targetPath },
+          },
+        ];
+      case 'search_text':
+        if (!intentDecision.searchQuery) return [];
+        return [
+          {
+            type: 'tool',
+            title: `Search for ${intentDecision.searchQuery}`,
+            toolName: 'searchText',
+            args: { query: intentDecision.searchQuery },
+          },
+        ];
+      case 'review_diff':
+        return [
+          { type: 'tool', title: 'Read git diff', toolName: 'gitDiff', args: {} },
+        ];
+      default:
+        return [];
+    }
+  }
+
+  private emitRunStarted(handlers: ChatStreamHandlers | undefined, event: RunStartedEvent) {
+    handlers?.onRunStarted?.(event);
+  }
+
+  private emitRunStep(handlers: ChatStreamHandlers | undefined, runId: string, step: AgentRunStep) {
+    handlers?.onRunStep?.({
+      type: 'run_step',
+      runId,
+      step,
+    });
+  }
+
+  private emitRunMetric(handlers: ChatStreamHandlers | undefined, runId: string, run: AgentRun) {
+    handlers?.onRunMetric?.({
+      type: 'run_metric',
+      runId,
+      metrics: {
+        filesRead: run.filesRead.length,
+        directoriesRead: run.directoriesRead.length,
+        filesWritten: run.filesWritten.length,
+        commandsRun: run.commands.length,
+        searchesRun: run.searches.length,
+        approvals: run.approvals.length,
+        addedLines: run.git?.addedLines ?? 0,
+        removedLines: run.git?.removedLines ?? 0,
+        firstTokenMs: run.metrics?.firstTokenMs,
+        totalMs: run.metrics?.totalMs,
+      },
+    });
+  }
+
+  private emitRunSummary(handlers: ChatStreamHandlers | undefined, runId: string, summary: AgentRun) {
+    handlers?.onRunSummary?.({
+      type: 'run_summary',
+      runId,
+      summary,
+    });
   }
 
   private selectMaxTokens(latestUserMessage: string, promptMode: RunMode, usingTools: boolean): number {
@@ -1399,6 +1590,160 @@ export class CoreEngine extends EventEmitter {
     return result;
   }
 
+  private recordRunToolMetadata(builder: AgentRunBuilder, metadata?: ToolResultMetadata) {
+    builder.recordToolMetadata(metadata);
+  }
+
+  private async executeBootstrapPlan(
+    plan: BootstrapPlanStep[],
+    currentMessages: ChatMessage[],
+    handlers: ChatStreamHandlers | undefined,
+    builder: AgentRunBuilder,
+  ): Promise<void> {
+    for (const stepPlan of plan) {
+      const step = builder.startNamedStep(
+        stepPlan.type === 'inventory' ? 'inventory' : 'tool',
+        stepPlan.title,
+      );
+      this.planner.upsertRunStep({
+        id: step.id,
+        type: step.type,
+        title: step.title,
+        status: step.status,
+        detail: step.detail,
+      });
+      this.emitRunStep(handlers, builder.snapshot().id, step);
+
+      if (stepPlan.type === 'inventory') {
+        const inventory = await this.repoIndexer.buildWorkspaceInventory();
+        currentMessages.push({
+          role: 'system',
+          content: summarizeInventoryForPrompt(inventory),
+        });
+        builder.finishStep(step.id, {
+          detail: `Indexed ${inventory.apps.length} apps and ${inventory.packages.length} packages.`,
+        });
+        const finished = builder.snapshot().steps.find((entry) => entry.id === step.id);
+        if (finished) {
+          this.planner.upsertRunStep({
+            id: finished.id,
+            type: finished.type,
+            title: finished.title,
+            status: finished.status,
+            detail: finished.detail,
+          });
+          this.emitRunStep(handlers, builder.snapshot().id, finished);
+        }
+        continue;
+      }
+
+      const toolEventId = `${builder.snapshot().id}_${step.id}`;
+      this.emitChatToolEvent(handlers, {
+        id: toolEventId,
+        name: stepPlan.toolName,
+        state: 'start',
+        inputSummary: summarizeToolArgs(stepPlan.toolName, stepPlan.args),
+      });
+      this.planner.setCurrentTool(stepPlan.toolName);
+
+      const toolResult = await this.executeToolCall(stepPlan.toolName, stepPlan.args);
+      const toolOutput = toolResult.preview ? `${toolResult.output}\n\n${toolResult.preview}` : toolResult.output;
+      this.emitChatToolEvent(handlers, {
+        id: toolEventId,
+        name: stepPlan.toolName,
+        state: 'done',
+        inputSummary: summarizeToolArgs(stepPlan.toolName, stepPlan.args),
+        output: truncateStreamPreview(toolOutput),
+        success: toolResult.success,
+      });
+      this.recordRunToolMetadata(builder, toolResult.metadata);
+      currentMessages.push({
+        role: 'system',
+        content: `[Bootstrap ${stepPlan.toolName}]\n${toolResult.output}`,
+      });
+      builder.finishStep(step.id, {
+        detail: toolResult.success ? toolResult.output.slice(0, 240) : `Error: ${toolResult.output.slice(0, 240)}`,
+        toolName: stepPlan.toolName,
+        toolInputSummary: summarizeToolArgs(stepPlan.toolName, stepPlan.args),
+        toolOutputPreview: truncateStreamPreview(toolOutput),
+        filePaths: [
+          ...(toolResult.metadata?.fileReads ?? []),
+          ...(toolResult.metadata?.fileWrites ?? []),
+          ...(toolResult.metadata?.fileDeletes ?? []),
+        ],
+        command: toolResult.metadata?.command?.command,
+      }, toolResult.success ? 'done' : 'error');
+      const finished = builder.snapshot().steps.find((entry) => entry.id === step.id);
+      if (finished) {
+        this.planner.upsertRunStep({
+          id: finished.id,
+          type: finished.type,
+          title: finished.title,
+          status: finished.status,
+          detail: finished.detail,
+          toolName: finished.toolName,
+        });
+        this.emitRunStep(handlers, builder.snapshot().id, finished);
+      }
+      this.emitRunMetric(handlers, builder.snapshot().id, builder.snapshot());
+    }
+    this.planner.setCurrentTool(undefined);
+  }
+
+  private async computeGitDiffStats(fallback: AgentRunLineStats | undefined): Promise<AgentRunLineStats | undefined> {
+    try {
+      const { stdout } = await execFileAsync('git', ['diff', '--numstat', '--'], {
+        cwd: this.config.workspaceRoot,
+        maxBuffer: 1024 * 1024,
+      });
+      if (!stdout.trim()) {
+        return fallback ?? { changedFiles: 0, addedLines: 0, removedLines: 0 };
+      }
+
+      const stats = stdout
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .reduce((acc, line) => {
+          const [added, removed] = line.split('\t');
+          const addedValue = added === '-' ? 0 : Number(added) || 0;
+          const removedValue = removed === '-' ? 0 : Number(removed) || 0;
+          acc.changedFiles += 1;
+          acc.addedLines += addedValue;
+          acc.removedLines += removedValue;
+          return acc;
+        }, { changedFiles: 0, addedLines: 0, removedLines: 0 });
+
+      return stats;
+    } catch (error: any) {
+      const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+      if (message.includes('not a git repository')) {
+        return fallback;
+      }
+      return fallback;
+    }
+  }
+
+  private updateLatestTurnRunSummary(intent: TaskIntent, run: AgentRun) {
+    if (!this.currentSession?.turnHistory?.length) {
+      return;
+    }
+
+    const turnHistory = [...this.currentSession.turnHistory];
+    const lastTurn = {
+      ...turnHistory[turnHistory.length - 1],
+      intent,
+      summary: run.summary,
+      firstTokenMs: run.metrics?.firstTokenMs,
+      totalDurationMs: run.metrics?.totalMs,
+      runSummary: run,
+    };
+    turnHistory[turnHistory.length - 1] = lastTurn;
+    this.currentSession = {
+      ...this.currentSession,
+      turnHistory,
+    };
+  }
+
   private getToolDefinitions(toolNames: SupportedTool[] = [...SUPPORTED_TOOLS]): any[] {
     return [
       {
@@ -1652,6 +1997,7 @@ export class CoreEngine extends EventEmitter {
     reasoningEffort: ReasoningEffort | undefined,
     signal?: AbortSignal,
     think?: boolean,
+    onFirstToken?: () => void,
   ): Promise<any> {
     const stream = await this.modelAdapter.createChatCompletion({
       messages: currentMessages,
@@ -1696,6 +2042,9 @@ export class CoreEngine extends EventEmitter {
     const appendContent = (chunk: string) => {
       if (!chunk) {
         return;
+      }
+      if (!message.content) {
+        onFirstToken?.();
       }
       message.content += chunk;
       handlers.onDelta?.(chunk);
@@ -1805,309 +2154,484 @@ export class CoreEngine extends EventEmitter {
 
     const latestUserMessage = this.getLatestUserMessage(messages);
     const browserFolderContextActive = this.hasBrowserFolderContext(messages);
+    const workspaceBound = !browserFolderContextActive;
+    const workspaceSource = workspaceBound ? 'backend' as const : 'browser_snapshot' as const;
     const promptMode = this.choosePromptMode(messages);
+    const intentStartedAt = Date.now();
+    const intentDecision = classifyIntent({
+      latestUserMessage,
+      browserContextActive: browserFolderContextActive,
+      workspaceBound,
+    });
+    const classificationMs = Date.now() - intentStartedAt;
 
     await this.recordTurnExecution('agentic', {
       promptMode,
       messageCount: messages.length,
       thinkingEnabled: options?.think === true,
     });
-    this.emitChatStatus(streamHandlers, 'mode', 'Agentic coding mode', 0);
+    const runBuilder = new AgentRunBuilder({
+      id: createRunId(),
+      sessionId: this.currentSession!.id,
+      startedAt: Date.now(),
+      executionMode: 'agentic',
+      workspaceRoot: this.config.workspaceRoot,
+      workspaceSource,
+      model: this.config.model,
+      promptMode,
+      intent: intentDecision.intent,
+      browserContextActive: browserFolderContextActive,
+      workspaceBound,
+      usedNativeTools: false,
+      usedManualFallback: false,
+      steps: [],
+      filesRead: [],
+      directoriesRead: [],
+      filesWritten: [],
+      filesDeleted: [],
+      directoriesCreated: [],
+      searches: [],
+      commands: [],
+      approvals: [],
+      metrics: {
+        classificationMs,
+      },
+    });
+    const runId = runBuilder.snapshot().id;
+    this.planner.startRun(runId);
+    this.planner.setTaskSummary(`Intent: ${intentDecision.intent}`);
+    this.planner.setPhase('planning');
+    this.planner.setActiveSkills(mergeSkills(this.currentSession?.skillsActive ?? [], this.selectOperationalSkills(intentDecision.intent, promptMode)));
+    this.planner.setIntendedAction('Classifying request');
 
-    if (!browserFolderContextActive && this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
-      const localAnswer = await this.tryAnswerFromLocalState(latestUserMessage);
-      if (localAnswer !== null) {
-        this.completeImmediateResponse(streamHandlers, localAnswer);
-        await this.persistCurrentSession();
-        return localAnswer.content;
+    this.emitChatStatus(
+      streamHandlers,
+      'mode',
+      workspaceBound ? 'Agentic coding mode' : 'Snapshot-only analysis mode',
+      0,
+    );
+    this.emitRunStarted(streamHandlers, {
+      type: 'run_started',
+      runId,
+      sessionId: this.currentSession!.id,
+      intent: intentDecision.intent,
+      workspaceBound,
+      browserContextActive: browserFolderContextActive,
+      workspaceSource,
+      executionMode: 'agentic',
+    });
+
+    const classifyStep = runBuilder.startNamedStep('classify', 'Classify request', intentDecision.reasons.join(' '));
+    runBuilder.finishStep(classifyStep.id, {
+      detail: `${intentDecision.intent} (${intentDecision.confidence})`,
+    });
+    const classified = runBuilder.snapshot().steps.find((entry) => entry.id === classifyStep.id);
+    if (classified) {
+      this.planner.upsertRunStep({
+        id: classified.id,
+        type: classified.type,
+        title: classified.title,
+        status: classified.status,
+        detail: classified.detail,
+      });
+      this.emitRunStep(streamHandlers, runId, classified);
+    }
+
+    const traceListener = (event: TraceEvent) => {
+      if (event.type === 'approval_enqueued') {
+        const approval = event.data as ApprovalRequestPayload;
+        runBuilder.recordApprovalRequested({
+          id: approval.id,
+          target: approval.target,
+          approved: null,
+        });
+        this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+      } else if (event.type === 'approval_resolved') {
+        const approval = event.data as { id: string; approved?: boolean };
+        runBuilder.recordApprovalResolved(approval.id, approval.approved ?? null);
+        this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
       }
-    }
+    };
+    this.traceBus.on('trace', traceListener);
 
-    const directWorkspaceAnswer = !browserFolderContextActive
-      ? await this.tryAnswerFromDirectWorkspaceTools(latestUserMessage)
-      : null;
-    if (directWorkspaceAnswer !== null) {
-      this.completeImmediateResponse(streamHandlers, directWorkspaceAnswer);
-      await this.persistCurrentSession();
-      return directWorkspaceAnswer.content;
-    }
-
-    const includeWorkspaceContext = !browserFolderContextActive && this.isWorkspaceQuestion(latestUserMessage, promptMode);
-    const includeRepoContext = !browserFolderContextActive && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
-    const selectedToolNames = browserFolderContextActive ? [] : this.selectToolNames(latestUserMessage, promptMode);
-    const modelCapabilities = await this.modelAdapter.getModelCapabilities(this.config.model);
-    const toolProtocol = this.selectToolProtocol(selectedToolNames, modelCapabilities);
-    const rootManifestAnswer = !browserFolderContextActive
-      ? await this.tryAnswerFromRootManifest(latestUserMessage)
-      : null;
-    if (rootManifestAnswer !== null) {
-      this.completeImmediateResponse(streamHandlers, rootManifestAnswer);
-      await this.persistCurrentSession();
-      return rootManifestAnswer.content;
-    }
-    const localRepoOverview = !browserFolderContextActive
-      ? await this.tryAnswerFromLocalRepoOverview(latestUserMessage)
-      : null;
-    if (localRepoOverview !== null) {
-      this.completeImmediateResponse(streamHandlers, localRepoOverview);
-      await this.persistCurrentSession();
-      return localRepoOverview.content;
-    }
-
-    let manualToolProtocol = toolProtocol.manualToolProtocol;
-    let manualProtocolPromptInjected = manualToolProtocol;
-    let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol
-      ? this.getToolDefinitions(selectedToolNames)
-      : undefined;
-    const maxTokens = manualToolProtocol
-      ? Math.min(256, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
-      : this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0);
-    const reasoningEffort = manualToolProtocol
-      ? 'none'
-      : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
-
-    if (toolProtocol.mode === 'manual_fallback') {
-      this.traceBus.emitEvent({
-        type: 'manual_tool_fallback',
-        data: {
-          model: this.config.model,
-          reason: toolProtocol.reason,
-          manualToolProtocol: true,
-          selectedTools: selectedToolNames,
-        },
+    const finalizeRun = async (baseAnswer: string, error?: string): Promise<string> => {
+      const gitStats = await this.computeGitDiffStats(runBuilder.snapshot().git);
+      runBuilder.setGitStats(gitStats);
+      const summary = summarizeRun(runBuilder.snapshot());
+      runBuilder.finalize({
+        finalAnswer: baseAnswer,
+        summary,
+        error,
       });
-      this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', 0);
-    } else if (toolProtocol.mode === 'manual_preferred') {
-      this.traceBus.emitEvent({
-        type: 'manual_tool_strategy_selected',
-        data: {
-          model: this.config.model,
-          reason: toolProtocol.reason,
-          manualToolProtocol: true,
-          selectedTools: selectedToolNames,
-        },
+      const completedRun = runBuilder.snapshot();
+      this.updateLatestTurnRunSummary(intentDecision.intent, completedRun);
+      this.planner.setRunSummary({
+        id: completedRun.id,
+        summary: completedRun.summary,
+        changedFiles: completedRun.git?.changedFiles,
+        addedLines: completedRun.git?.addedLines,
+        removedLines: completedRun.git?.removedLines,
       });
-      this.emitChatStatus(streamHandlers, 'mode', 'Low-latency manual tool protocol active', 0);
-    }
+      this.emitRunMetric(streamHandlers, runId, completedRun);
+      this.emitRunSummary(streamHandlers, runId, completedRun);
+      await this.persistCurrentSession();
+      return buildFinalAnswer(baseAnswer, completedRun);
+    };
 
-    if (options?.think === true && !this.supportsThinking(modelCapabilities)) {
+    try {
+      if (!browserFolderContextActive && this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
+        const localAnswer = await this.tryAnswerFromLocalState(latestUserMessage);
+        if (localAnswer !== null) {
+          this.completeImmediateResponse(streamHandlers, localAnswer);
+          return await finalizeRun(localAnswer.content);
+        }
+      }
+
+      if (intentDecision.intent === 'workspace_binding_needed') {
+        const bindingAnswer = [
+          'Workspace is browser snapshot only.',
+          'I can inspect snapshot and suggest edits.',
+          'To write files or run commands, bind real backend workspace first.',
+        ].join(' ');
+        this.completeImmediateResponse(streamHandlers, {
+          content: bindingAnswer,
+          action: 'Explaining workspace binding requirement',
+          source: 'workspace_binding',
+        });
+        return await finalizeRun(bindingAnswer);
+      }
+
+      const directWorkspaceAnswer = workspaceBound
+        ? await this.tryAnswerFromDirectWorkspaceTools(latestUserMessage)
+        : null;
+      if (directWorkspaceAnswer !== null) {
+        this.completeImmediateResponse(streamHandlers, directWorkspaceAnswer);
+        return await finalizeRun(directWorkspaceAnswer.content);
+      }
+
+      const localRepoOverviewAnswer = workspaceBound
+        ? await this.tryAnswerFromLocalRepoOverview(latestUserMessage)
+        : null;
+      if (localRepoOverviewAnswer !== null) {
+        this.completeImmediateResponse(streamHandlers, localRepoOverviewAnswer);
+        return await finalizeRun(localRepoOverviewAnswer.content);
+      }
+
+      const includeWorkspaceContext = workspaceBound && this.isWorkspaceQuestion(latestUserMessage, promptMode);
+      const includeRepoContext = workspaceBound && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
+      const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
+      const modelCapabilities = await this.modelAdapter.getModelCapabilities(this.config.model);
+      const toolProtocol = this.selectToolProtocol(selectedToolNames, modelCapabilities);
+      const rootManifestAnswer = workspaceBound && !['workspace_overview', 'review_diff', 'find_file', 'read_file', 'search_text'].includes(intentDecision.intent)
+        ? await this.tryAnswerFromRootManifest(latestUserMessage)
+        : null;
+      if (rootManifestAnswer !== null) {
+        this.completeImmediateResponse(streamHandlers, rootManifestAnswer);
+        return await finalizeRun(rootManifestAnswer.content);
+      }
+
+      let manualToolProtocol = toolProtocol.manualToolProtocol;
+      let manualProtocolPromptInjected = manualToolProtocol;
+      let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol
+        ? this.getToolDefinitions(selectedToolNames)
+        : undefined;
+      const maxTokens = manualToolProtocol
+        ? Math.min(256, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
+        : this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0);
+      const reasoningEffort = manualToolProtocol
+        ? 'none'
+        : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
+
+      if (toolProtocol.mode !== 'native') {
+        runBuilder.markManualFallback(toolProtocol.reason);
+      }
+
+      if (toolProtocol.mode === 'manual_fallback') {
+        this.traceBus.emitEvent({
+          type: 'manual_tool_fallback',
+          data: {
+            model: this.config.model,
+            reason: toolProtocol.reason,
+            manualToolProtocol: true,
+            selectedTools: selectedToolNames,
+          },
+        });
+        this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', 0);
+      } else if (toolProtocol.mode === 'manual_preferred') {
+        this.traceBus.emitEvent({
+          type: 'manual_tool_strategy_selected',
+          data: {
+            model: this.config.model,
+            reason: toolProtocol.reason,
+            manualToolProtocol: true,
+            selectedTools: selectedToolNames,
+          },
+        });
+        this.emitChatStatus(streamHandlers, 'mode', 'Manual tool protocol forced', 0);
+      }
+
+      if (options?.think === true && !this.supportsThinking(modelCapabilities)) {
+        this.traceBus.emitEvent({
+          type: 'thinking_unsupported',
+          data: {
+            model: this.config.model,
+            reason: 'Current model does not report thinking capability.',
+            requestedThink: true,
+            modelCapabilities: modelCapabilities ?? [],
+          },
+        });
+        this.emitChatStatus(streamHandlers, 'warning', 'Thinking unavailable on current model', 0);
+      }
+
       this.traceBus.emitEvent({
-        type: 'thinking_unsupported',
+        type: 'chat_execution_plan',
         data: {
-          model: this.config.model,
-          reason: 'Current model does not report thinking capability.',
-          requestedThink: true,
+          executionMode: 'agentic',
+          promptMode,
+          toolNames: selectedToolNames,
+          nativeTools: Boolean(nativeToolDefinitions),
+          manualToolProtocol,
+          toolProtocolMode: toolProtocol.mode,
+          includeRepoContext,
+          browserFolderContextActive,
+          workspaceBound,
+          workspaceSource,
+          intent: intentDecision.intent,
+          maxTokens,
+          reasoningEffort,
           modelCapabilities: modelCapabilities ?? [],
         },
       });
-      this.emitChatStatus(streamHandlers, 'warning', 'Thinking unavailable on current model', 0);
-    }
 
-    this.traceBus.emitEvent({
-      type: 'chat_execution_plan',
-      data: {
-        executionMode: 'agentic',
-        promptMode,
-        toolNames: selectedToolNames,
-        nativeTools: Boolean(nativeToolDefinitions),
-        manualToolProtocol,
-        toolProtocolMode: toolProtocol.mode,
-        includeRepoContext,
-        browserFolderContextActive,
-        maxTokens,
-        reasoningEffort,
-        modelCapabilities: modelCapabilities ?? [],
-      },
-    });
-
-    if (manualToolProtocol) {
-      this.traceBus.emitEvent({
-        type: 'prompt_recipe_selected',
-        data: {
-          mode: promptMode,
-          taskPreview: latestUserMessage.slice(0, 120),
-          manualToolProtocol: true,
-          recipe: 'manual_tool_plan',
-        },
-      });
-    }
-
-    const promptMessages = manualToolProtocol
-      ? [
-          {
-            role: 'system' as const,
-            content: [
-              `Manual tool plan (${promptMode}):`,
-              'Inspect only the minimum files needed before editing.',
-              'Use exactly one JSON tool action at a time, then wait for the next tool result.',
-              'When the task is complete, reply with {"final":"..."} and keep it brief.',
-            ].join('\n'),
-          },
-          ...messages,
-        ]
-      : this.applyPromptOptimization(
-          messages,
-          promptMode,
-          includeRepoContext || promptMode !== 'quick_inspect' || (selectedToolNames.length > 0 && !manualToolProtocol),
-        );
-
-    const currentMessages: any[] = [
-      ...(await this.buildContextMessages(messages, promptMode, includeWorkspaceContext, includeRepoContext)),
-      ...(manualToolProtocol ? [{ role: 'system', content: this.buildManualToolProtocol(selectedToolNames) }] : []),
-      ...promptMessages,
-    ];
-    let streamedToolEventCounter = 0;
-    const nextStreamToolEventId = () => `tool-${++streamedToolEventCounter}`;
-    let manualBootstrapTool = manualToolProtocol
-      ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, selectedToolNames)
-      : null;
-    let loopCount = 0;
-    const MAX_LOOPS = 10;
-    let manualProtocolCorrectionCount = 0;
-    let simulatedToolReplyCount = 0;
-
-    while (loopCount < MAX_LOOPS) {
-      if (manualToolProtocol && manualBootstrapTool) {
-        const bootstrapDecision = manualBootstrapTool;
-        manualBootstrapTool = null;
-        loopCount += 1;
-        this.planner.setPhase('execution');
-        this.planner.setIntendedAction(`Executing ${bootstrapDecision.name}`);
-        this.emitChatStatus(streamHandlers, 'execution', `Executing ${bootstrapDecision.name}`, loopCount);
+      if (manualToolProtocol) {
         this.traceBus.emitEvent({
-          type: 'manual_tool_bootstrap_selected',
+          type: 'prompt_recipe_selected',
           data: {
-            model: this.config.model,
-            promptMode,
-            action: bootstrapDecision.name,
-            args: bootstrapDecision.args,
+            mode: promptMode,
+            taskPreview: latestUserMessage.slice(0, 120),
+            manualToolProtocol: true,
+            recipe: 'manual_tool_plan',
           },
         });
-
-        const toolEventId = nextStreamToolEventId();
-        this.emitChatToolEvent(streamHandlers, {
-          id: toolEventId,
-          name: bootstrapDecision.name,
-          state: 'start',
-          inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
-        });
-        try {
-          const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args);
-          const streamedOutput = toolResult.preview
-            ? `${toolResult.output}\n\n${toolResult.preview}`
-            : toolResult.output;
-          this.emitChatToolEvent(streamHandlers, {
-            id: toolEventId,
-            name: bootstrapDecision.name,
-            state: 'done',
-            inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
-            output: truncateStreamPreview(streamedOutput),
-            success: toolResult.success,
-          });
-          currentMessages.push({
-            role: 'user',
-            content: this.formatManualToolResult(bootstrapDecision.name, toolResult.output),
-          });
-        } catch (error: any) {
-          this.emitChatToolEvent(streamHandlers, {
-            id: toolEventId,
-            name: bootstrapDecision.name,
-            state: 'done',
-            inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
-            output: truncateStreamPreview(`Error: ${error.message}`),
-            success: false,
-          });
-          currentMessages.push({
-            role: 'user',
-            content: this.formatManualToolResult(bootstrapDecision.name, `Error: ${error.message}`),
-          });
-        }
-        continue;
       }
 
-      this.planner.setPhase('model');
-      this.planner.setIntendedAction(loopCount === 0 ? 'Generating assistant response' : 'Processing tool results');
-      this.emitChatStatus(
-        streamHandlers,
-        'model',
-        loopCount === 0 ? 'Generating assistant response' : 'Processing tool results',
-        loopCount,
-      );
-      this.traceBus.emitEvent({
-        type: 'chat_request',
-        data: {
-          messageCount: currentMessages.length,
-          loop: loopCount,
-          profile: this.config.profile,
-        },
-      });
-
-      let result: any;
-      let message: any;
-      try {
-        if (streamHandlers) {
-          message = await this.streamAssistantMessage(
-            currentMessages,
-            streamHandlers,
-            nativeToolDefinitions,
-            maxTokens,
-            reasoningEffort,
-            options?.signal,
-            options?.think,
+      const promptMessages = manualToolProtocol
+        ? [
+            {
+              role: 'system' as const,
+              content: [
+                `Manual tool plan (${promptMode}):`,
+                'Inspect minimum files needed before editing.',
+                'Use exactly one JSON tool action at a time.',
+                'After tool results, decide next single action or return {"final":"..."} .',
+              ].join('\n'),
+            },
+            ...messages,
+          ]
+        : this.applyPromptOptimization(
+            messages,
+            promptMode,
+            includeRepoContext || promptMode !== 'quick_inspect' || (selectedToolNames.length > 0 && !manualToolProtocol),
           );
-        } else {
-          result = await this.modelAdapter.createChatCompletion({
-            messages: currentMessages,
-            stream: false,
-            tools: nativeToolDefinitions,
-            max_tokens: maxTokens,
-            reasoning_effort: reasoningEffort,
-            think: options?.think,
-            signal: options?.signal,
+
+      const runtimeContract: ChatMessage = {
+        role: 'system',
+        content: [
+          '[Harness Runtime]',
+          `Intent: ${intentDecision.intent}`,
+          `Workspace source: ${workspaceSource}`,
+          `Workspace bound: ${workspaceBound ? 'yes' : 'no'}`,
+          `Available tools: ${selectedToolNames.length > 0 ? selectedToolNames.join(', ') : 'none'}`,
+          `Tool protocol: ${manualToolProtocol ? 'manual' : 'native'}`,
+          'Never simulate tool execution or file changes.',
+          'Finish with concise answer, What I did, and Files changed.',
+        ].join('\n'),
+      };
+
+      const currentMessages: any[] = [
+        ...(await this.buildContextMessages(messages, promptMode, includeWorkspaceContext, includeRepoContext)),
+        runtimeContract,
+        ...(manualToolProtocol ? [{ role: 'system', content: this.buildManualToolProtocol(selectedToolNames) }] : []),
+        ...promptMessages,
+      ];
+
+      if (workspaceBound) {
+        await this.executeBootstrapPlan(this.buildBootstrapPlan(intentDecision), currentMessages, streamHandlers, runBuilder);
+      }
+
+      let streamedToolEventCounter = 0;
+      const nextStreamToolEventId = () => `tool-${++streamedToolEventCounter}`;
+      let manualBootstrapTool = manualToolProtocol && workspaceBound
+        ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, selectedToolNames)
+        : null;
+      let loopCount = 0;
+      const MAX_LOOPS = intentDecision.intent === 'edit_code'
+        ? 5
+        : intentDecision.intent === 'run_command'
+          ? 4
+          : 3;
+      let manualProtocolCorrectionCount = 0;
+      let simulatedToolReplyCount = 0;
+      let firstModelCallRecorded = false;
+      let firstTokenRecorded = false;
+
+      while (loopCount < MAX_LOOPS) {
+        if (manualToolProtocol && manualBootstrapTool) {
+          const bootstrapDecision = manualBootstrapTool;
+          manualBootstrapTool = null;
+          loopCount += 1;
+          runBuilder.setLoopCount(loopCount);
+          const toolStep = runBuilder.startNamedStep('tool', `Bootstrap ${bootstrapDecision.name}`);
+          this.planner.upsertRunStep({
+            id: toolStep.id,
+            type: toolStep.type,
+            title: toolStep.title,
+            status: toolStep.status,
+            toolName: bootstrapDecision.name,
           });
-          message = result?.choices?.[0]?.message;
-        }
-      } catch (error: any) {
-        const errorMessage = error?.message || '';
-        // If the model does not support tools, retry without them
-        if (errorMessage.includes('does not support tools') || errorMessage.includes('tools is not supported')) {
-          nativeToolDefinitions = undefined;
-          manualToolProtocol = selectedToolNames.length > 0;
+          this.emitRunStep(streamHandlers, runId, toolStep);
+          this.planner.setPhase('execution');
+          this.planner.setCurrentTool(bootstrapDecision.name);
+          this.planner.setIntendedAction(`Executing ${bootstrapDecision.name}`);
+          this.emitChatStatus(streamHandlers, 'execution', `Executing ${bootstrapDecision.name}`, loopCount);
           this.traceBus.emitEvent({
-            type: 'tools_unsupported',
-            data: { model: this.config.model, reason: errorMessage },
-          });
-          this.traceBus.emitEvent({
-            type: 'manual_tool_fallback',
+            type: 'manual_tool_bootstrap_selected',
             data: {
               model: this.config.model,
-              reason: errorMessage,
-              manualToolProtocol: manualToolProtocol,
-              selectedTools: selectedToolNames,
+              promptMode,
+              action: bootstrapDecision.name,
+              args: bootstrapDecision.args,
             },
           });
-          this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', loopCount);
-          if (manualToolProtocol && !manualProtocolPromptInjected) {
-            currentMessages.push({
-              role: 'system',
-              content: this.buildManualToolProtocol(selectedToolNames),
+
+          const toolEventId = nextStreamToolEventId();
+          this.emitChatToolEvent(streamHandlers, {
+            id: toolEventId,
+            name: bootstrapDecision.name,
+            state: 'start',
+            inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
+          });
+          try {
+            const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args);
+            const streamedOutput = toolResult.preview
+              ? `${toolResult.output}\n\n${toolResult.preview}`
+              : toolResult.output;
+            this.emitChatToolEvent(streamHandlers, {
+              id: toolEventId,
+              name: bootstrapDecision.name,
+              state: 'done',
+              inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
+              output: truncateStreamPreview(streamedOutput),
+              success: toolResult.success,
             });
-            manualProtocolPromptInjected = true;
+            this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+            currentMessages.push({
+              role: 'user',
+              content: this.formatManualToolResult(bootstrapDecision.name, toolResult.output),
+            });
+            runBuilder.finishStep(toolStep.id, {
+              toolName: bootstrapDecision.name,
+              toolInputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
+              toolOutputPreview: truncateStreamPreview(streamedOutput),
+              command: toolResult.metadata?.command?.command,
+            }, toolResult.success ? 'done' : 'error');
+          } catch (error: any) {
+            this.emitChatToolEvent(streamHandlers, {
+              id: toolEventId,
+              name: bootstrapDecision.name,
+              state: 'done',
+              inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
+              output: truncateStreamPreview(`Error: ${error.message}`),
+              success: false,
+            });
+            currentMessages.push({
+              role: 'user',
+              content: this.formatManualToolResult(bootstrapDecision.name, `Error: ${error.message}`),
+            });
+            runBuilder.finishStep(toolStep.id, {
+              detail: error.message,
+              toolName: bootstrapDecision.name,
+              toolInputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
+            }, 'error');
           }
+          const finishedBootstrap = runBuilder.snapshot().steps.find((entry) => entry.id === toolStep.id);
+          if (finishedBootstrap) {
+            this.planner.upsertRunStep({
+              id: finishedBootstrap.id,
+              type: finishedBootstrap.type,
+              title: finishedBootstrap.title,
+              status: finishedBootstrap.status,
+              detail: finishedBootstrap.detail,
+              toolName: finishedBootstrap.toolName,
+            });
+            this.emitRunStep(streamHandlers, runId, finishedBootstrap);
+          }
+          this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+          continue;
+        }
+
+        loopCount += 1;
+        runBuilder.setLoopCount(loopCount);
+        this.planner.setPhase('model');
+        this.planner.setCurrentTool(undefined);
+        this.planner.setIntendedAction(loopCount === 1 ? 'Generating assistant response' : 'Processing tool results');
+        this.emitChatStatus(
+          streamHandlers,
+          'model',
+          loopCount === 1 ? 'Generating assistant response' : 'Processing tool results',
+          loopCount,
+        );
+        this.traceBus.emitEvent({
+          type: 'chat_request',
+          data: {
+            messageCount: currentMessages.length,
+            loop: loopCount,
+            profile: this.config.profile,
+            intent: intentDecision.intent,
+          },
+        });
+        const modelStep = runBuilder.startNamedStep('model', loopCount === 1 ? 'Generate response' : 'Continue response');
+        this.planner.upsertRunStep({
+          id: modelStep.id,
+          type: modelStep.type,
+          title: modelStep.title,
+          status: modelStep.status,
+        });
+        this.emitRunStep(streamHandlers, runId, modelStep);
+        if (!firstModelCallRecorded) {
+          firstModelCallRecorded = true;
+          runBuilder.setMetric({
+            firstModelCallMs: Date.now() - runBuilder.snapshot().startedAt,
+          });
+        }
+
+        let result: any;
+        let message: any;
+        try {
           if (streamHandlers) {
             message = await this.streamAssistantMessage(
               currentMessages,
               streamHandlers,
-              undefined,
+              nativeToolDefinitions,
               maxTokens,
               reasoningEffort,
               options?.signal,
               options?.think,
+              () => {
+                if (!firstTokenRecorded) {
+                  firstTokenRecorded = true;
+                  runBuilder.setMetric({
+                    firstTokenMs: Date.now() - runBuilder.snapshot().startedAt,
+                  });
+                  this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+                }
+              },
             );
           } else {
             result = await this.modelAdapter.createChatCompletion({
               messages: currentMessages,
               stream: false,
+              tools: nativeToolDefinitions,
               max_tokens: maxTokens,
               reasoning_effort: reasoningEffort,
               think: options?.think,
@@ -2115,98 +2639,347 @@ export class CoreEngine extends EventEmitter {
             });
             message = result?.choices?.[0]?.message;
           }
-        } else {
+        } catch (error: any) {
+          const errorMessage = error?.message || '';
+          if (errorMessage.includes('does not support tools') || errorMessage.includes('tools is not supported')) {
+            nativeToolDefinitions = undefined;
+            manualToolProtocol = selectedToolNames.length > 0;
+            if (manualToolProtocol) {
+              runBuilder.markManualFallback(errorMessage);
+            }
+            this.traceBus.emitEvent({
+              type: 'tools_unsupported',
+              data: { model: this.config.model, reason: errorMessage },
+            });
+            this.traceBus.emitEvent({
+              type: 'manual_tool_fallback',
+              data: {
+                model: this.config.model,
+                reason: errorMessage,
+                manualToolProtocol,
+                selectedTools: selectedToolNames,
+              },
+            });
+            this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', loopCount);
+            if (manualToolProtocol && !manualProtocolPromptInjected) {
+              currentMessages.push({
+                role: 'system',
+                content: this.buildManualToolProtocol(selectedToolNames),
+              });
+              manualProtocolPromptInjected = true;
+            }
+            runBuilder.finishStep(modelStep.id, { detail: errorMessage }, 'skipped');
+            const fallbackStep = runBuilder.startNamedStep('fallback', 'Switch to manual fallback', errorMessage);
+            runBuilder.finishStep(fallbackStep.id, { detail: errorMessage }, 'done');
+            const finishedFallback = runBuilder.snapshot().steps.find((entry) => entry.id === fallbackStep.id);
+            if (finishedFallback) {
+              this.planner.upsertRunStep({
+                id: finishedFallback.id,
+                type: finishedFallback.type,
+                title: finishedFallback.title,
+                status: finishedFallback.status,
+                detail: finishedFallback.detail,
+              });
+              this.emitRunStep(streamHandlers, runId, finishedFallback);
+            }
+            continue;
+          }
+          runBuilder.finishStep(modelStep.id, { detail: errorMessage }, 'error');
           throw error;
         }
-      }
 
-      if (!message) {
-        break;
-      }
+        if (!message) {
+          runBuilder.finishStep(modelStep.id, { detail: 'Model returned no message.' }, 'error');
+          break;
+        }
 
-      message.content = composeAssistantContent(message as Record<string, unknown>);
+        message.content = composeAssistantContent(message as Record<string, unknown>);
+        currentMessages.push(message);
 
-      currentMessages.push(message);
+        if (nativeToolDefinitions && message.tool_calls && message.tool_calls.length > 0) {
+          runBuilder.markNativeToolsUsed();
+          runBuilder.finishStep(modelStep.id, { detail: `Requested ${message.tool_calls.length} tool call(s).` }, 'done');
+          const finishedModelStep = runBuilder.snapshot().steps.find((entry) => entry.id === modelStep.id);
+          if (finishedModelStep) {
+            this.planner.upsertRunStep({
+              id: finishedModelStep.id,
+              type: finishedModelStep.type,
+              title: finishedModelStep.title,
+              status: finishedModelStep.status,
+              detail: finishedModelStep.detail,
+            });
+            this.emitRunStep(streamHandlers, runId, finishedModelStep);
+          }
+          this.planner.setPhase('execution');
+          this.emitChatStatus(streamHandlers, 'execution', 'Executing tool calls', loopCount);
 
-      if (nativeToolDefinitions && message.tool_calls && message.tool_calls.length > 0) {
-        loopCount += 1;
-        this.planner.setPhase('execution');
-        this.emitChatStatus(streamHandlers, 'execution', 'Executing tool calls', loopCount);
-
-        for (const toolCall of message.tool_calls) {
-          const name = toolCall.function.name as SupportedTool;
-          const toolEventId = nextStreamToolEventId();
-          let args: Record<string, unknown> = {};
-          try {
-            args = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
-          } catch (error: any) {
+          for (const toolCall of message.tool_calls) {
+            const name = toolCall.function.name as SupportedTool;
+            const toolStep = runBuilder.startNamedStep('tool', `Execute ${name}`);
+            const toolEventId = nextStreamToolEventId();
+            let args: Record<string, unknown> = {};
+            try {
+              args = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
+            } catch (error: any) {
+              this.emitChatToolEvent(streamHandlers, {
+                id: toolEventId,
+                name,
+                state: 'done',
+                inputSummary: truncateStreamPreview(toolCall.function.arguments || '{}'),
+                output: truncateStreamPreview(`Error: Invalid tool arguments - ${error.message}`),
+                success: false,
+              });
+              currentMessages.push({
+                role: 'tool',
+                tool_call_id: toolCall.id,
+                name,
+                content: `Error: Invalid tool arguments - ${error.message}`,
+              });
+              runBuilder.finishStep(toolStep.id, {
+                detail: error.message,
+                toolName: name,
+              }, 'error');
+              continue;
+            }
+            this.planner.setCurrentTool(name);
+            this.planner.setIntendedAction(`Executing ${name}`);
+            this.planner.upsertRunStep({
+              id: toolStep.id,
+              type: toolStep.type,
+              title: toolStep.title,
+              status: toolStep.status,
+              toolName: name,
+            });
+            this.emitRunStep(streamHandlers, runId, toolStep);
+            this.emitChatStatus(streamHandlers, 'execution', `Executing ${name}`, loopCount);
             this.emitChatToolEvent(streamHandlers, {
               id: toolEventId,
               name,
-              state: 'done',
-              inputSummary: truncateStreamPreview(toolCall.function.arguments || '{}'),
-              output: truncateStreamPreview(`Error: Invalid tool arguments - ${error.message}`),
-              success: false,
+              state: 'start',
+              inputSummary: summarizeToolArgs(name, args),
             });
+
+            try {
+              const toolResult = await this.executeToolCall(name, args);
+              const streamedOutput = toolResult.preview
+                ? `${toolResult.output}\n\n${toolResult.preview}`
+                : toolResult.output;
+              this.emitChatToolEvent(streamHandlers, {
+                id: toolEventId,
+                name,
+                state: 'done',
+                inputSummary: summarizeToolArgs(name, args),
+                output: truncateStreamPreview(streamedOutput),
+                success: toolResult.success,
+              });
+              this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+              currentMessages.push({
+                role: 'tool',
+                tool_call_id: toolCall.id,
+                name,
+                content: toolResult.output,
+              });
+              runBuilder.finishStep(toolStep.id, {
+                toolName: name,
+                toolInputSummary: summarizeToolArgs(name, args),
+                toolOutputPreview: truncateStreamPreview(streamedOutput),
+                filePaths: [
+                  ...(toolResult.metadata?.fileReads ?? []),
+                  ...(toolResult.metadata?.fileWrites ?? []),
+                  ...(toolResult.metadata?.fileDeletes ?? []),
+                ],
+                command: toolResult.metadata?.command?.command,
+              }, toolResult.success ? 'done' : 'error');
+            } catch (error: any) {
+              this.emitChatToolEvent(streamHandlers, {
+                id: toolEventId,
+                name,
+                state: 'done',
+                inputSummary: summarizeToolArgs(name, args),
+                output: truncateStreamPreview(`Error: ${error.message}`),
+                success: false,
+              });
+              currentMessages.push({
+                role: 'tool',
+                tool_call_id: toolCall.id,
+                name,
+                content: `Error: ${error.message}`,
+              });
+              runBuilder.finishStep(toolStep.id, {
+                detail: error.message,
+                toolName: name,
+                toolInputSummary: summarizeToolArgs(name, args),
+              }, 'error');
+            }
+            const finishedToolStep = runBuilder.snapshot().steps.find((entry) => entry.id === toolStep.id);
+            if (finishedToolStep) {
+              this.planner.upsertRunStep({
+                id: finishedToolStep.id,
+                type: finishedToolStep.type,
+                title: finishedToolStep.title,
+                status: finishedToolStep.status,
+                detail: finishedToolStep.detail,
+                toolName: finishedToolStep.toolName,
+              });
+              this.emitRunStep(streamHandlers, runId, finishedToolStep);
+            }
+            this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+          }
+          continue;
+        }
+
+        const response = extractTextSegment(message.content);
+        runBuilder.finishStep(modelStep.id, {
+          detail: response.slice(0, 240) || 'No natural-language response.',
+        }, 'done');
+        const finishedModelStep = runBuilder.snapshot().steps.find((entry) => entry.id === modelStep.id);
+        if (finishedModelStep) {
+          this.planner.upsertRunStep({
+            id: finishedModelStep.id,
+            type: finishedModelStep.type,
+            title: finishedModelStep.title,
+            status: finishedModelStep.status,
+            detail: finishedModelStep.detail,
+          });
+          this.emitRunStep(streamHandlers, runId, finishedModelStep);
+        }
+
+        if (manualToolProtocol) {
+          if (looksLikeSimulatedToolCall(response)) {
+            simulatedToolReplyCount += 1;
+            this.traceBus.emitEvent({
+              type: 'tool_simulation_detected',
+              data: {
+                model: this.config.model,
+                attempt: simulatedToolReplyCount,
+                preview: response.slice(0, 240),
+                manualToolProtocol: true,
+              },
+            });
+
+            if (simulatedToolReplyCount < 2) {
+              currentMessages.push({
+                role: 'system',
+                content: RECIPES.manualToolCorrection(),
+              });
+              continue;
+            }
+
+            const warning = 'Model attempted to simulate tool usage in plain text. No tools were executed.';
+            this.planner.setPhase('ready');
+            this.planner.setIntendedAction('Awaiting user input');
+            this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
+            this.traceBus.emitEvent({
+              type: 'chat_response',
+              data: { length: warning.length, simulatedTools: true, manualToolProtocol: true },
+            });
+            return await finalizeRun(`${warning} Retry request or switch models.`, warning);
+          }
+
+          const manualDecision = this.parseManualToolResponse(response, selectedToolNames);
+          if (manualDecision?.kind === 'tool') {
+            const toolStep = runBuilder.startNamedStep('tool', `Execute ${manualDecision.name}`);
+            this.planner.setPhase('execution');
+            this.planner.setCurrentTool(manualDecision.name);
+            this.planner.setIntendedAction(`Executing ${manualDecision.name}`);
+            this.planner.upsertRunStep({
+              id: toolStep.id,
+              type: toolStep.type,
+              title: toolStep.title,
+              status: toolStep.status,
+              toolName: manualDecision.name,
+            });
+            this.emitRunStep(streamHandlers, runId, toolStep);
+            this.emitChatStatus(streamHandlers, 'execution', `Executing ${manualDecision.name}`, loopCount);
+
+            const toolEventId = nextStreamToolEventId();
+            this.emitChatToolEvent(streamHandlers, {
+              id: toolEventId,
+              name: manualDecision.name,
+              state: 'start',
+              inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
+            });
+            try {
+              const toolResult = await this.executeToolCall(manualDecision.name, manualDecision.args);
+              const streamedOutput = toolResult.preview
+                ? `${toolResult.output}\n\n${toolResult.preview}`
+                : toolResult.output;
+              this.emitChatToolEvent(streamHandlers, {
+                id: toolEventId,
+                name: manualDecision.name,
+                state: 'done',
+                inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
+                output: truncateStreamPreview(streamedOutput),
+                success: toolResult.success,
+              });
+              this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+              currentMessages.push({
+                role: 'user',
+                content: this.formatManualToolResult(manualDecision.name, toolResult.output),
+              });
+              runBuilder.finishStep(toolStep.id, {
+                toolName: manualDecision.name,
+                toolInputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
+                toolOutputPreview: truncateStreamPreview(streamedOutput),
+                command: toolResult.metadata?.command?.command,
+              }, toolResult.success ? 'done' : 'error');
+            } catch (error: any) {
+              this.emitChatToolEvent(streamHandlers, {
+                id: toolEventId,
+                name: manualDecision.name,
+                state: 'done',
+                inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
+                output: truncateStreamPreview(`Error: ${error.message}`),
+                success: false,
+              });
+              currentMessages.push({
+                role: 'user',
+                content: this.formatManualToolResult(manualDecision.name, `Error: ${error.message}`),
+              });
+              runBuilder.finishStep(toolStep.id, {
+                detail: error.message,
+                toolName: manualDecision.name,
+              }, 'error');
+            }
+            const finishedManualToolStep = runBuilder.snapshot().steps.find((entry) => entry.id === toolStep.id);
+            if (finishedManualToolStep) {
+              this.planner.upsertRunStep({
+                id: finishedManualToolStep.id,
+                type: finishedManualToolStep.type,
+                title: finishedManualToolStep.title,
+                status: finishedManualToolStep.status,
+                detail: finishedManualToolStep.detail,
+                toolName: finishedManualToolStep.toolName,
+              });
+              this.emitRunStep(streamHandlers, runId, finishedManualToolStep);
+            }
+            this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+            continue;
+          }
+
+          if (manualDecision?.kind === 'final') {
+            this.planner.setPhase('ready');
+            this.planner.setCurrentTool(undefined);
+            this.planner.setIntendedAction('Awaiting user input');
+            this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
+            this.traceBus.emitEvent({
+              type: 'chat_response',
+              data: { length: manualDecision.content.length, manualToolProtocol: true },
+            });
+            return await finalizeRun(manualDecision.content);
+          }
+
+          if (selectedToolNames.length > 0 && manualProtocolCorrectionCount < 2) {
+            manualProtocolCorrectionCount += 1;
             currentMessages.push({
-              role: 'tool',
-              tool_call_id: toolCall.id,
-              name,
-              content: `Error: Invalid tool arguments - ${error.message}`,
+              role: 'system',
+              content: RECIPES.manualToolCorrection(),
             });
             continue;
           }
-          this.planner.setIntendedAction(`Executing ${name}`);
-          this.emitChatStatus(streamHandlers, 'execution', `Executing ${name}`, loopCount);
-          this.emitChatToolEvent(streamHandlers, {
-            id: toolEventId,
-            name,
-            state: 'start',
-            inputSummary: summarizeToolArgs(name, args),
-          });
-
-          try {
-            const toolResult = await this.executeToolCall(name, args);
-            const streamedOutput = toolResult.preview
-              ? `${toolResult.output}\n\n${toolResult.preview}`
-              : toolResult.output;
-            this.emitChatToolEvent(streamHandlers, {
-              id: toolEventId,
-              name,
-              state: 'done',
-              inputSummary: summarizeToolArgs(name, args),
-              output: truncateStreamPreview(streamedOutput),
-              success: toolResult.success,
-            });
-            currentMessages.push({
-              role: 'tool',
-              tool_call_id: toolCall.id,
-              name,
-              content: toolResult.output,
-            });
-          } catch (error: any) {
-            this.emitChatToolEvent(streamHandlers, {
-              id: toolEventId,
-              name,
-              state: 'done',
-              inputSummary: summarizeToolArgs(name, args),
-              output: truncateStreamPreview(`Error: ${error.message}`),
-              success: false,
-            });
-            currentMessages.push({
-              role: 'tool',
-              tool_call_id: toolCall.id,
-              name,
-              content: `Error: ${error.message}`,
-            });
-          }
         }
-        continue;
-      }
 
-      const response = extractTextSegment(message.content);
-      if (manualToolProtocol) {
-        if (looksLikeSimulatedToolCall(response)) {
+        if (nativeToolDefinitions && looksLikeSimulatedToolCall(response)) {
           simulatedToolReplyCount += 1;
           this.traceBus.emitEvent({
             type: 'tool_simulation_detected',
@@ -2214,157 +2987,60 @@ export class CoreEngine extends EventEmitter {
               model: this.config.model,
               attempt: simulatedToolReplyCount,
               preview: response.slice(0, 240),
-              manualToolProtocol: true,
             },
           });
 
           if (simulatedToolReplyCount < 2) {
             currentMessages.push({
               role: 'system',
-              content: RECIPES.manualToolCorrection(),
+              content: RECIPES.toolCorrection(),
             });
-            loopCount += 1;
             continue;
           }
 
           const warning = 'Model attempted to simulate tool usage in plain text. No tools were executed.';
           this.planner.setPhase('ready');
+          this.planner.setCurrentTool(undefined);
           this.planner.setIntendedAction('Awaiting user input');
           this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
           this.traceBus.emitEvent({
             type: 'chat_response',
-            data: { length: warning.length, simulatedTools: true, manualToolProtocol: true },
+            data: { length: warning.length, simulatedTools: true },
           });
-          await this.persistCurrentSession();
-          return `${warning} Retry the request or switch models.`;
+          return await finalizeRun(`${warning} Retry request or switch models.`, warning);
         }
 
-        const manualDecision = this.parseManualToolResponse(response, selectedToolNames);
-        if (manualDecision?.kind === 'tool') {
-          loopCount += 1;
-          this.planner.setPhase('execution');
-          this.planner.setIntendedAction(`Executing ${manualDecision.name}`);
-          this.emitChatStatus(streamHandlers, 'execution', `Executing ${manualDecision.name}`, loopCount);
-
-          const toolEventId = nextStreamToolEventId();
-          this.emitChatToolEvent(streamHandlers, {
-            id: toolEventId,
-            name: manualDecision.name,
-            state: 'start',
-            inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
-          });
-          try {
-            const toolResult = await this.executeToolCall(manualDecision.name, manualDecision.args);
-            const streamedOutput = toolResult.preview
-              ? `${toolResult.output}\n\n${toolResult.preview}`
-              : toolResult.output;
-            this.emitChatToolEvent(streamHandlers, {
-              id: toolEventId,
-              name: manualDecision.name,
-              state: 'done',
-              inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
-              output: truncateStreamPreview(streamedOutput),
-              success: toolResult.success,
-            });
-            currentMessages.push({
-              role: 'user',
-              content: this.formatManualToolResult(manualDecision.name, toolResult.output),
-            });
-          } catch (error: any) {
-            this.emitChatToolEvent(streamHandlers, {
-              id: toolEventId,
-              name: manualDecision.name,
-              state: 'done',
-              inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
-              output: truncateStreamPreview(`Error: ${error.message}`),
-              success: false,
-            });
-            currentMessages.push({
-              role: 'user',
-              content: this.formatManualToolResult(manualDecision.name, `Error: ${error.message}`),
-            });
-          }
-          continue;
-        }
-
-        if (manualDecision?.kind === 'final') {
-          this.planner.setPhase('ready');
-          this.planner.setIntendedAction('Awaiting user input');
-          this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
+        const optimizer = new PromptOptimizer(promptMode);
+        if (optimizer.detectReframing(response)) {
           this.traceBus.emitEvent({
-            type: 'chat_response',
-            data: { length: manualDecision.content.length, manualToolProtocol: true },
+            type: 'prompt_reframe_suggested',
+            data: {
+              reason: 'Model response appears too broad for a tool-driven workflow.',
+            },
           });
-          await this.persistCurrentSession();
-          return manualDecision.content;
         }
 
-        if (selectedToolNames.length > 0 && manualProtocolCorrectionCount < 2) {
-          manualProtocolCorrectionCount += 1;
-          currentMessages.push({
-            role: 'system',
-            content: RECIPES.manualToolCorrection(),
-          });
-          loopCount += 1;
-          continue;
-        }
-      }
-
-      if (nativeToolDefinitions && looksLikeSimulatedToolCall(response)) {
-        simulatedToolReplyCount += 1;
-        this.traceBus.emitEvent({
-          type: 'tool_simulation_detected',
-          data: {
-            model: this.config.model,
-            attempt: simulatedToolReplyCount,
-            preview: response.slice(0, 240),
-          },
-        });
-
-        if (simulatedToolReplyCount < 2) {
-          currentMessages.push({
-            role: 'system',
-            content: RECIPES.toolCorrection(),
-          });
-          loopCount += 1;
-          continue;
-        }
-
-        const warning = 'Model attempted to simulate tool usage in plain text. No tools were executed.';
         this.planner.setPhase('ready');
+        this.planner.setCurrentTool(undefined);
         this.planner.setIntendedAction('Awaiting user input');
         this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
         this.traceBus.emitEvent({
           type: 'chat_response',
-          data: { length: warning.length, simulatedTools: true },
+          data: { length: response.length, intent: intentDecision.intent },
         });
-        await this.persistCurrentSession();
-        return `${warning} Retry the request or switch models.`;
+
+        return await finalizeRun(response);
       }
 
-      const optimizer = new PromptOptimizer(promptMode);
-      if (optimizer.detectReframing(response)) {
-        this.traceBus.emitEvent({
-          type: 'prompt_reframe_suggested',
-          data: {
-            reason: 'Model response appears too broad for a tool-driven workflow.',
-          },
-        });
-      }
-
-      this.planner.setPhase('ready');
-      this.planner.setIntendedAction('Awaiting user input');
-      this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
-      this.traceBus.emitEvent({
-        type: 'chat_response',
-        data: { length: response.length },
-      });
-      await this.persistCurrentSession();
-
-      return response;
+      const limitWarning = 'Maximum tool execution loops reached or no response from model.';
+      this.planner.failRun(limitWarning);
+      return await finalizeRun(limitWarning, limitWarning);
+    } catch (error: any) {
+      this.planner.failRun(error?.message || 'Agentic run failed.');
+      throw error;
+    } finally {
+      this.traceBus.off('trace', traceListener);
     }
-
-    return 'Maximum tool execution loops reached or no response from model.';
   }
 
   private ensureToolAllowed(toolName: SupportedTool) {

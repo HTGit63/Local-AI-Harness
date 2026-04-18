@@ -1,9 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
-import 'katex/dist/katex.min.css';
+import { ChatMessageRow } from './components/ChatMessageRow';
+import { useStreamingBuffer } from './hooks/useStreamingBuffer';
 
 /* ─────────── API helpers ─────────── */
 function getApiBase(): string {
@@ -49,6 +46,8 @@ interface ChatMessage {
   toolEvents: ChatToolEvent[];
   status?: 'sending' | 'streaming' | 'sent' | 'error';
   attachments?: MessageImageAttachment[];
+  runSummary?: AgentRunSummary;
+  runSteps?: AgentRunStep[];
 }
 
 interface MessageImageAttachment {
@@ -172,6 +171,47 @@ interface RepoContext {
   summary: string;
 }
 
+interface AgentRunStep {
+  id: string;
+  type: string;
+  title: string;
+  detail?: string;
+  status: 'running' | 'done' | 'error' | 'skipped';
+  toolName?: string;
+  toolInputSummary?: string;
+  toolOutputPreview?: string;
+  command?: string;
+}
+
+interface AgentRunSummary {
+  id: string;
+  intent: string;
+  workspaceSource: 'backend' | 'browser_snapshot';
+  workspaceBound: boolean;
+  browserContextActive: boolean;
+  filesRead: string[];
+  directoriesRead: string[];
+  filesWritten: string[];
+  filesDeleted: string[];
+  directoriesCreated: string[];
+  searches: Array<{ query: string; pattern?: string }>;
+  commands: Array<{ command: string; success: boolean; durationMs?: number }>;
+  approvals: Array<{ id: string; target: string; approved: boolean | null }>;
+  git?: {
+    changedFiles: number;
+    addedLines: number;
+    removedLines: number;
+  };
+  metrics?: {
+    totalMs?: number;
+    firstTokenMs?: number;
+  };
+  usedManualFallback: boolean;
+  fallbackReason?: string;
+  summary?: string;
+  steps: AgentRunStep[];
+}
+
 interface BrowserFileNode {
   kind: 'file';
   name: string;
@@ -217,6 +257,10 @@ interface BrowserPreview {
 type ChatStreamEvent =
   | { type: 'status'; phase: string; action: string; loop: number }
   | ({ type: 'tool' } & ChatToolEvent)
+  | { type: 'run_started'; runId: string; sessionId: string; intent: string; workspaceBound: boolean; browserContextActive: boolean; workspaceSource: 'backend' | 'browser_snapshot'; executionMode: ExecutionMode }
+  | { type: 'run_step'; runId: string; step: AgentRunStep }
+  | { type: 'run_metric'; runId: string; metrics: Partial<{ filesRead: number; directoriesRead: number; filesWritten: number; commandsRun: number; searchesRun: number; approvals: number; addedLines: number; removedLines: number; firstTokenMs: number; totalMs: number }> }
+  | { type: 'run_summary'; runId: string; summary: AgentRunSummary }
   | { type: 'delta'; delta: string }
   | { type: 'done'; response: string }
   | { type: 'error'; message: string };
@@ -555,57 +599,16 @@ function upsertToolEvent(current: ChatToolEvent[], next: ChatToolEvent): ChatToo
   return updated;
 }
 
-function splitAssistantContent(content: string): Array<{ kind: 'thought' | 'content'; value: string }> {
-  return content
-    .split(/(<think>[\s\S]*?(?:<\/think>|$))/gi)
-    .filter(Boolean)
-    .map((part) => {
-      if (part.toLowerCase().startsWith('<think>')) {
-        let inner = part.slice(7);
-        if (inner.toLowerCase().endsWith('</think>')) {
-          inner = inner.slice(0, -8);
-        }
-        return { kind: 'thought' as const, value: inner.trim() };
-      }
-      return { kind: 'content' as const, value: part };
-    })
-    .filter((part) => part.value.trim().length > 0);
-}
+function upsertRunStep(current: AgentRunStep[], next: AgentRunStep): AgentRunStep[] {
+  const index = current.findIndex((entry) => entry.id === next.id);
+  if (index === -1) return [...current, next];
 
-function hasRenderableContent(content: string): boolean {
-  return splitAssistantContent(content).some((part) => part.kind === 'content' && part.value.trim().length > 0);
-}
-
-function buildToolSummaryMarkdown(toolEvents: ChatToolEvent[]): string {
-  const completed = toolEvents.filter((event) => event.state === 'done');
-  if (completed.length === 0) return '';
-
-  const lines = completed.slice(-8).map((event) => {
-    const suffix = event.success === false ? ' failed' : ' done';
-    return `- \`${event.name}\`: ${event.inputSummary}${suffix === ' done' ? '' : ` (${suffix.trim()})`}`;
-  });
-
-  return [
-    `Completed ${completed.length} tool step${completed.length === 1 ? '' : 's'}.`,
-    '',
-    ...lines,
-  ].join('\n');
-}
-
-function MarkdownContent({ content, className }: { content: string; className?: string }) {
-  return (
-    <div className={className || 'markdown-body'}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex]}
-        components={{
-          a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
-        }}
-      >
-        {content}
-      </ReactMarkdown>
-    </div>
-  );
+  const updated = [...current];
+  updated[index] = {
+    ...updated[index],
+    ...next,
+  };
+  return updated;
 }
 
 async function buildFromHandle(handle: BrowserDirectoryHandle): Promise<BrowserSelection> {
@@ -773,6 +776,13 @@ function HarnessApp() {
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const lastConfigSigRef = useRef('');
   const lastTraceTimestampRef = useRef(0);
+  const streamBuffer = useStreamingBuffer((messageId, text) => {
+    setMessages((current) => current.map((message) => (
+      message.id === messageId
+        ? { ...message, content: message.content + text, status: 'streaming' }
+        : message
+    )));
+  }, 45);
 
   // Derived
   const modelOptions = useMemo(() => {
@@ -893,13 +903,16 @@ function HarnessApp() {
 
   useEffect(() => {
     void refreshDashboard('full');
+    if (isSending) {
+      return;
+    }
     const liveId = setInterval(() => void refreshDashboard('live'), 3000);
     const fullId = setInterval(() => void refreshDashboard('full'), 15000);
     return () => {
       clearInterval(liveId);
       clearInterval(fullId);
     };
-  }, [refreshDashboard]);
+  }, [isSending, refreshDashboard]);
 
   useEffect(() => {
     if (folderInputRef.current) {
@@ -909,8 +922,14 @@ function HarnessApp() {
   }, []);
 
   useEffect(() => {
-    chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages]);
+    const node = chatScrollRef.current;
+    if (!node) return;
+    const nearBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 140;
+    if (!nearBottom && !isSending) {
+      return;
+    }
+    node.scrollTo({ top: node.scrollHeight, behavior: isSending ? 'auto' : 'smooth' });
+  }, [isSending, messages]);
 
   useEffect(() => {
     if (!workspaceSelection) return;
@@ -1096,16 +1115,96 @@ function HarnessApp() {
           return;
         }
 
-        if (event.type === 'delta') {
+        if (event.type === 'run_started') {
           setMessages(cur => cur.map(m => (
             m.id === placeholderId
-              ? { ...m, content: m.content + event.delta, status: 'streaming' }
+              ? {
+                  ...m,
+                  runSummary: {
+                    id: event.runId,
+                    intent: event.intent,
+                    workspaceSource: event.workspaceSource,
+                    workspaceBound: event.workspaceBound,
+                    browserContextActive: event.browserContextActive,
+                    filesRead: [],
+                    directoriesRead: [],
+                    filesWritten: [],
+                    filesDeleted: [],
+                    directoriesCreated: [],
+                    searches: [],
+                    commands: [],
+                    approvals: [],
+                    usedManualFallback: false,
+                    steps: [],
+                  },
+                  runSteps: [],
+                }
               : m
           )));
           return;
         }
 
+        if (event.type === 'run_step') {
+          setMessages(cur => cur.map(m => (
+            m.id === placeholderId
+              ? { ...m, runSteps: upsertRunStep(m.runSteps || [], event.step) }
+              : m
+          )));
+          return;
+        }
+
+        if (event.type === 'run_metric') {
+          setMessages(cur => cur.map(m => (
+            m.id === placeholderId && m.runSummary
+              ? {
+                  ...m,
+                  runSummary: {
+                    ...m.runSummary,
+                    metrics: {
+                      ...m.runSummary.metrics,
+                      totalMs: event.metrics.totalMs ?? m.runSummary.metrics?.totalMs,
+                      firstTokenMs: event.metrics.firstTokenMs ?? m.runSummary.metrics?.firstTokenMs,
+                    },
+                    git: m.runSummary.git
+                      ? {
+                          ...m.runSummary.git,
+                          addedLines: event.metrics.addedLines ?? m.runSummary.git.addedLines,
+                          removedLines: event.metrics.removedLines ?? m.runSummary.git.removedLines,
+                        }
+                      : event.metrics.addedLines !== undefined || event.metrics.removedLines !== undefined
+                        ? {
+                            changedFiles: 0,
+                            addedLines: event.metrics.addedLines ?? 0,
+                            removedLines: event.metrics.removedLines ?? 0,
+                          }
+                        : undefined,
+                  },
+                }
+              : m
+          )));
+          return;
+        }
+
+        if (event.type === 'run_summary') {
+          setMessages(cur => cur.map(m => (
+            m.id === placeholderId
+              ? {
+                  ...m,
+                  runSummary: event.summary,
+                  runSteps: event.summary.steps || m.runSteps || [],
+                }
+              : m
+          )));
+          return;
+        }
+
+        if (event.type === 'delta') {
+          streamBuffer.push(placeholderId, event.delta);
+          return;
+        }
+
         if (event.type === 'done') {
+          streamBuffer.flush(placeholderId);
           setMessages(cur => cur.map(m => (
             m.id === placeholderId
               ? { ...m, content: event.response || m.content, status: 'sent' }
@@ -1115,6 +1214,7 @@ function HarnessApp() {
           return;
         }
 
+        streamBuffer.flush(placeholderId);
         setMessages(cur => cur.map(m => (
           m.id === placeholderId
             ? { ...m, content: `Error: ${event.message}`, activity: pushActivityStep(m.activity, 'Error'), status: 'error' }
@@ -1123,6 +1223,7 @@ function HarnessApp() {
         setStreamStatus('');
       });
     } catch (err) {
+      streamBuffer.flush(placeholderId);
       const errMsg = err instanceof Error ? err.message : 'Failed to get response.';
       setMessages(cur => cur.map(m => (
         m.id === placeholderId || m.status === 'sending' || m.status === 'streaming'
@@ -1131,6 +1232,10 @@ function HarnessApp() {
       )));
       setStreamStatus('');
     } finally {
+      streamBuffer.flushAll();
+      if (placeholderId) {
+        streamBuffer.clear(placeholderId);
+      }
       setIsSending(false);
       setStreamStatus('');
       setAttachedImages([]);
@@ -1425,148 +1530,23 @@ function HarnessApp() {
                 </div>
               </div>
             ) : (
-              messages.map(msg => {
-                const hasUserImages = msg.role === 'user' && (msg.attachments?.length || 0) > 0;
-                const fallbackAssistantContent = msg.role === 'assistant' && msg.executionMode === 'agentic' && !hasRenderableContent(msg.content)
-                  ? buildToolSummaryMarkdown(msg.toolEvents)
-                  : '';
-                const renderedMessageContent = msg.role === 'assistant' && fallbackAssistantContent
-                  ? fallbackAssistantContent
-                  : msg.content;
-                const showMessageBody = msg.status === 'sending' || Boolean(renderedMessageContent);
-                const assistantParts = msg.role === 'assistant' ? splitAssistantContent(renderedMessageContent) : [];
-                return (
-                  <div key={msg.id} className={`chat-msg ${msg.status === 'sending' ? 'chat-msg-pending' : ''} ${msg.status === 'error' ? 'chat-msg-error' : ''}`}>
-                    <div className={`chat-msg-row ${msg.role === 'user' ? 'chat-msg-row-user' : ''}`}>
-                      <div className={`chat-avatar ${msg.role === 'user' ? 'chat-avatar-user' : 'chat-avatar-assistant'}`}>
-                        {msg.role === 'user' ? 'U' : 'G4'}
-                      </div>
-                      <div className="chat-msg-content">
-                        <div className="chat-msg-header">
-                          <span className="chat-msg-name">{msg.role === 'user' ? 'You' : 'Assistant'}</span>
-                          <span className="chat-msg-time">{formatTime(msg.createdAt)}</span>
-                        </div>
-                        {msg.role === 'assistant' && msg.executionMode === 'agentic' && (msg.activity.length > 0 || msg.toolEvents.length > 0) && (
-                          <div className="tool-execution-tracker">
-                            <div className="tool-tracker-header">
-                              <span>🔄 Tool Activity</span>
-                            </div>
-                            {(msg.activity.length > 0 || msg.toolEvents.length > 0) && (
-                              <div className="tool-summary-line">
-                                {msg.toolEvents.filter((event) => event.state === 'done').length > 0
-                                  ? `${msg.toolEvents.filter((event) => event.state === 'done').length} tool step${msg.toolEvents.filter((event) => event.state === 'done').length === 1 ? '' : 's'} completed`
-                                  : 'Preparing agentic run'}
-                              </div>
-                            )}
-                            <div className="tool-tracker-steps">
-                              {msg.activity.map((step, index) => {
-                                let badgeClass = 'tool-badge-system';
-                                let badgeText = 'SYS';
-                                const lowerStep = step.toLowerCase();
-                                if (lowerStep.includes('read') || lowerStep.includes('search') || lowerStep.includes('glob') || lowerStep.includes('list')) {
-                                  badgeClass = 'tool-badge-read';
-                                  badgeText = 'READ';
-                                } else if (lowerStep.includes('write') || lowerStep.includes('patch') || lowerStep.includes('make')) {
-                                  badgeClass = 'tool-badge-write';
-                                  badgeText = 'WRITE';
-                                } else if (lowerStep.includes('delete') || lowerStep.includes('run') || lowerStep.includes('git')) {
-                                  badgeClass = 'tool-badge-danger';
-                                  badgeText = 'EXEC';
-                                }
-                                const isActive = index === msg.activity.length - 1 && msg.status !== 'sent';
-                                const isDone = msg.status === 'sent' || index < msg.activity.length - 1;
-                                return (
-                                  <div
-                                    key={`${msg.id}-step-${index}`}
-                                    className={`tool-tracker-step ${isActive ? 'active' : ''} ${isDone ? 'done' : ''}`}
-                                  >
-                                    <span className={`tool-badge ${badgeClass}`}>{badgeText}</span>
-                                    <span>{step}</span>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                            {msg.toolEvents.length > 0 && (
-                              <div className="tool-call-list">
-                                {msg.toolEvents.map((event) => {
-                                  const stateClass = event.state === 'start'
-                                    ? 'tool-call-card-running'
-                                    : event.success === false
-                                      ? 'tool-call-card-error'
-                                      : 'tool-call-card-done';
-                                  const stateLabel = event.state === 'start'
-                                    ? 'Running'
-                                    : event.success === false
-                                      ? 'Failed'
-                                      : 'Done';
-                                  return (
-                                    <div key={event.id} className={`tool-call-card ${stateClass}`}>
-                                      <div className="tool-call-card-top">
-                                        <span className="tool-call-name">{event.name}</span>
-                                        <span className="tool-call-state">{stateLabel}</span>
-                                      </div>
-                                      <div className="tool-call-input">{event.inputSummary}</div>
-                                      {event.output && (
-                                        <pre className="tool-call-output">{event.output}</pre>
-                                      )}
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                        {hasUserImages && (
-                          <div className="chat-msg-attachments">
-                            {msg.attachments?.map(image => (
-                              <a
-                                key={image.id}
-                                className="chat-msg-attachment"
-                                href={image.dataUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                                title={image.name}
-                              >
-                                <img src={image.dataUrl} alt={image.name} loading="lazy" />
-                              </a>
-                            ))}
-                          </div>
-                        )}
-                        {showMessageBody && (
-                          <div className="chat-msg-body">
-                            {msg.status === 'sending' && !renderedMessageContent ? (
-                              <div className="chat-typing">
-                                <span /><span /><span />
-                              </div>
-                            ) : msg.role !== 'assistant' ? (
-                              <MarkdownContent content={renderedMessageContent} />
-                            ) : (
-                              assistantParts.map((part, i) => {
-                                if (part.kind === 'thought') {
-                                  return (
-                                    <details key={i} className="ai-thought-block" open={(msg.status === 'sending') || (part.value.length < 500)}>
-                                      <summary className="ai-thought-header">
-                                        <span className="ai-thought-icon">🧠</span>
-                                        <span>Reasoning Process</span>
-                                      </summary>
-                                      <MarkdownContent content={part.value} className="markdown-body ai-thought-content" />
-                                    </details>
-                                  );
-                                }
-                                return <MarkdownContent key={i} content={part.value} />;
-                              })
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })
+              messages.map(msg => (
+                <ChatMessageRow key={msg.id} message={msg} />
+              ))
             )}
           </div>
 
           {/* Composer */}
+          {browserSelection && !workspaceSelection && (
+            <div className="tool-execution-tracker" style={{ margin: '0 20px 12px' }}>
+              <div className="tool-tracker-header">
+                <span>Workspace Binding</span>
+              </div>
+              <div className="tool-summary-line">
+                Browser snapshot active. Assistant can inspect attached folder, but backend writes and commands stay disabled until workspace binds.
+              </div>
+            </div>
+          )}
           <div className="composer-wrapper">
             <div className="composer">
               <div className="composer-meta">

@@ -1,8 +1,39 @@
+export interface ToolDiffStats {
+  changedFiles: number;
+  addedLines: number;
+  removedLines: number;
+}
+
+export interface ToolSearchRecord {
+  query: string;
+  pattern?: string;
+}
+
+export interface ToolCommandRecord {
+  command: string;
+  success: boolean;
+  durationMs?: number;
+}
+
+export interface ToolResultMetadata {
+  durationMs?: number;
+  fileReads?: string[];
+  directoriesRead?: string[];
+  fileWrites?: string[];
+  fileDeletes?: string[];
+  directoriesCreated?: string[];
+  searches?: ToolSearchRecord[];
+  command?: ToolCommandRecord;
+  lineStats?: ToolDiffStats;
+  truncated?: boolean;
+}
+
 export interface ToolResult {
   success: boolean;
   output: string;
   preview?: string;
   error?: string;
+  metadata?: ToolResultMetadata;
 }
 
 export type ApprovalDecision = Promise<boolean> & {

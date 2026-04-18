@@ -27,6 +27,11 @@ interface SessionState {
   id: string;
   turnHistory?: Array<{
     executionMode: 'direct' | 'agentic';
+    runSummary?: {
+      summary?: string;
+      workspaceSource?: 'backend' | 'browser_snapshot';
+      workspaceBound?: boolean;
+    };
   }>;
 }
 
@@ -62,7 +67,8 @@ async function waitFor<T>(factory: () => Promise<T | null>, timeoutMs = 10000): 
   throw new Error('Timed out waiting for condition.');
 }
 
-async function startMockModelServer(): Promise<{ server: http.Server; baseUrl: string }> {
+async function startMockModelServer(): Promise<{ server: http.Server; baseUrl: string; getChatRequests: () => any[] }> {
+  const chatRequests: any[] = [];
   const server = http.createServer((req, res) => {
     const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
     const chunks: Buffer[] = [];
@@ -91,6 +97,7 @@ async function startMockModelServer(): Promise<{ server: http.Server; baseUrl: s
       }
 
       if (requestUrl.pathname === '/api/chat') {
+        chatRequests.push(body);
         if (body.stream) {
           res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' });
           res.write(`${JSON.stringify({
@@ -133,6 +140,7 @@ async function startMockModelServer(): Promise<{ server: http.Server; baseUrl: s
   return {
     server,
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    getChatRequests: () => [...chatRequests],
   };
 }
 
@@ -284,6 +292,49 @@ async function testApiWorkflow() {
 
     const configAfterResolve = await fetchJson<{ workspaceRoot: string }>(`${API_BASE}/api/config`);
     assert.strictEqual(configAfterResolve.workspaceRoot, pickedWorkspace);
+
+    const chatRequestsBeforeAgentic = mockModel.getChatRequests().length;
+    const agenticEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: 'Reply with exactly: API agentic' }],
+      }),
+    });
+    const agenticDone = agenticEvents.find((event) => event.type === 'done');
+    assert.ok(String(agenticDone?.response || '').includes('Direct stream works.'));
+    assert.ok(String(agenticDone?.response || '').includes('What I did:'));
+    const agenticRunSummary = agenticEvents.find((event) => event.type === 'run_summary');
+    assert.ok(agenticRunSummary);
+    assert.strictEqual(agenticRunSummary?.summary?.workspaceSource, 'backend');
+    assert.strictEqual(agenticRunSummary?.summary?.workspaceBound, true);
+    assert.ok(mockModel.getChatRequests().length > chatRequestsBeforeAgentic);
+
+    const sessionAfterAgentic = await fetchJson<SessionState>(`${API_BASE}/api/session`);
+    const latestAgenticTurn = [...(sessionAfterAgentic.turnHistory || [])]
+      .reverse()
+      .find((turn) => turn.executionMode === 'agentic');
+    assert.ok(latestAgenticTurn?.runSummary?.summary);
+    assert.strictEqual(latestAgenticTurn?.runSummary?.workspaceSource, 'backend');
+
+    const chatRequestsBeforeSnapshot = mockModel.getChatRequests().length;
+    const snapshotEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'system', content: '[Browser Folder Context]\nFolder label: art-gallery\nTree:\n- src/\n  - index.ts' },
+          { role: 'user', content: 'Create notes.txt and run npm test' },
+        ],
+      }),
+    });
+    const snapshotDone = snapshotEvents.find((event) => event.type === 'done');
+    assert.ok(String(snapshotDone?.response || '').includes('Workspace is browser snapshot only.'));
+    const snapshotRunSummary = snapshotEvents.find((event) => event.type === 'run_summary');
+    assert.ok(snapshotRunSummary);
+    assert.strictEqual(snapshotRunSummary?.summary?.workspaceSource, 'browser_snapshot');
+    assert.strictEqual(snapshotRunSummary?.summary?.workspaceBound, false);
+    assert.strictEqual(mockModel.getChatRequests().length, chatRequestsBeforeSnapshot);
 
     const streamEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
       method: 'POST',

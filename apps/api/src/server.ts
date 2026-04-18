@@ -93,7 +93,7 @@ function startNdjson(req: http.IncomingMessage, res: http.ServerResponse) {
   });
 }
 
-function writeNdjson(res: http.ServerResponse, event: Record<string, unknown>) {
+function writeNdjson(res: http.ServerResponse, event: unknown) {
   if (!res.writableEnded) {
     res.write(`${JSON.stringify(event)}\n`);
   }
@@ -651,6 +651,10 @@ const server = http.createServer(async (req, res) => {
               onStatus: (event: { phase: string; action: string; loop: number }) => writeNdjson(res, { type: 'status', ...event }),
               onDelta: (delta: string) => writeNdjson(res, { type: 'delta', delta }),
               onTool: (event) => writeNdjson(res, { type: 'tool', ...event }),
+              onRunStarted: (event) => writeNdjson(res, event),
+              onRunStep: (event) => writeNdjson(res, event),
+              onRunMetric: (event) => writeNdjson(res, event),
+              onRunSummary: (event) => writeNdjson(res, event),
             },
             { signal: abortController.signal, think: thinkingEnabled }
           );
@@ -666,6 +670,10 @@ const server = http.createServer(async (req, res) => {
             onStatus: (event: { phase: string; action: string; loop: number }) => writeNdjson(res, { type: 'status', ...event }),
             onDelta: (delta: string) => writeNdjson(res, { type: 'delta', delta }),
             onTool: (event) => writeNdjson(res, { type: 'tool', ...event }),
+            onRunStarted: (event) => writeNdjson(res, event),
+            onRunStep: (event) => writeNdjson(res, event),
+            onRunMetric: (event) => writeNdjson(res, event),
+            onRunSummary: (event) => writeNdjson(res, event),
           },
           { signal: abortController.signal, think: thinkingEnabled },
         );

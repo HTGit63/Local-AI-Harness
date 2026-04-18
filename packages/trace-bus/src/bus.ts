@@ -2,10 +2,13 @@ import { EventEmitter } from 'events';
 import { TraceEvent } from './types';
 
 export class TraceBus extends EventEmitter {
+  private sequence = 0;
+
   emitEvent(event: Omit<TraceEvent, 'id' | 'timestamp'>) {
+    const timestamp = Date.now();
     const fullEvent: TraceEvent = {
-        id: Math.random().toString(36).substring(2, 9),
-        timestamp: Date.now(),
+        id: `evt_${timestamp}_${++this.sequence}`,
+        timestamp,
         ...event
     };
     this.emit('trace', fullEvent);
