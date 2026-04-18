@@ -1,4 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+import 'katex/dist/katex.min.css';
 
 /* ─────────── API helpers ─────────── */
 function getApiBase(): string {
@@ -22,14 +27,26 @@ type ChatRole = 'user' | 'assistant';
 type ConversationMode = 'general' | 'architecture' | 'data-analysis' | 'code-review' | 'implementation';
 type BackendStatus = 'ok' | 'degraded' | 'offline';
 type SettingsTab = 'connection' | 'workspace' | 'sessions' | 'activity';
+type ExecutionMode = 'direct' | 'agentic';
+
+interface ChatToolEvent {
+  id: string;
+  name: string;
+  state: 'start' | 'done';
+  inputSummary: string;
+  output?: string;
+  success?: boolean;
+}
 
 interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
   mode: ConversationMode;
+  executionMode: ExecutionMode;
   createdAt: number;
   activity: string[];
+  toolEvents: ChatToolEvent[];
   status?: 'sending' | 'streaming' | 'sent' | 'error';
   attachments?: MessageImageAttachment[];
 }
@@ -199,6 +216,7 @@ interface BrowserPreview {
 
 type ChatStreamEvent =
   | { type: 'status'; phase: string; action: string; loop: number }
+  | ({ type: 'tool' } & ChatToolEvent)
   | { type: 'delta'; delta: string }
   | { type: 'done'; response: string }
   | { type: 'error'; message: string };
@@ -523,6 +541,73 @@ function pushActivityStep(current: string[], nextStep: string): string[] {
   return [...current, step];
 }
 
+function upsertToolEvent(current: ChatToolEvent[], next: ChatToolEvent): ChatToolEvent[] {
+  const index = current.findIndex((entry) => entry.id === next.id);
+  if (index === -1) return [...current, next];
+
+  const updated = [...current];
+  updated[index] = {
+    ...updated[index],
+    ...next,
+    output: next.output ?? updated[index].output,
+    success: next.success ?? updated[index].success,
+  };
+  return updated;
+}
+
+function splitAssistantContent(content: string): Array<{ kind: 'thought' | 'content'; value: string }> {
+  return content
+    .split(/(<think>[\s\S]*?(?:<\/think>|$))/gi)
+    .filter(Boolean)
+    .map((part) => {
+      if (part.toLowerCase().startsWith('<think>')) {
+        let inner = part.slice(7);
+        if (inner.toLowerCase().endsWith('</think>')) {
+          inner = inner.slice(0, -8);
+        }
+        return { kind: 'thought' as const, value: inner.trim() };
+      }
+      return { kind: 'content' as const, value: part };
+    })
+    .filter((part) => part.value.trim().length > 0);
+}
+
+function hasRenderableContent(content: string): boolean {
+  return splitAssistantContent(content).some((part) => part.kind === 'content' && part.value.trim().length > 0);
+}
+
+function buildToolSummaryMarkdown(toolEvents: ChatToolEvent[]): string {
+  const completed = toolEvents.filter((event) => event.state === 'done');
+  if (completed.length === 0) return '';
+
+  const lines = completed.slice(-8).map((event) => {
+    const suffix = event.success === false ? ' failed' : ' done';
+    return `- \`${event.name}\`: ${event.inputSummary}${suffix === ' done' ? '' : ` (${suffix.trim()})`}`;
+  });
+
+  return [
+    `Completed ${completed.length} tool step${completed.length === 1 ? '' : 's'}.`,
+    '',
+    ...lines,
+  ].join('\n');
+}
+
+function MarkdownContent({ content, className }: { content: string; className?: string }) {
+  return (
+    <div className={className || 'markdown-body'}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
+        components={{
+          a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 async function buildFromHandle(handle: BrowserDirectoryHandle): Promise<BrowserSelection> {
   async function visit(h: BrowserDirectoryHandle, p: string): Promise<BrowserDirectoryNode> {
     const node: BrowserDirectoryNode = { kind: 'directory', name: h.name, path: p, children: [] };
@@ -831,7 +916,7 @@ function HarnessApp() {
     if (!workspaceSelection) return;
     setExpandedPaths(new Set(['.']));
     setWorkspacePreview(null);
-  }, [workspaceSelection?.label]);
+  }, [workspaceSelection]);
 
   useEffect(() => {
     try {
@@ -940,12 +1025,24 @@ function HarnessApp() {
         role: 'user',
         content,
         mode: chatMode,
+        executionMode: isAgentic ? 'agentic' : 'direct',
         createdAt: now,
         activity: [],
+        toolEvents: [],
         status: 'sent',
         attachments: userAttachments,
       };
-      const placeholder: ChatMessage = { id: makeId('msg'), role: 'assistant', content: '', mode: chatMode, createdAt: now + 1, activity: [], status: 'sending' };
+      const placeholder: ChatMessage = {
+        id: makeId('msg'),
+        role: 'assistant',
+        content: '',
+        mode: chatMode,
+        executionMode: isAgentic ? 'agentic' : 'direct',
+        createdAt: now + 1,
+        activity: [],
+        toolEvents: [],
+        status: 'sending',
+      };
       placeholderId = placeholder.id;
       const browserContext = buildBrowserContextMessage(browserSelection, browserPreview);
       const activeSkillsForPrompt = isAgentic ? selectedSkills : selectedSkills.filter(s => s !== 'caveman');
@@ -985,6 +1082,15 @@ function HarnessApp() {
           setMessages(cur => cur.map(m => (
             m.id === placeholderId
               ? { ...m, activity: pushActivityStep(m.activity, nextStep), status: m.content ? 'streaming' : m.status }
+              : m
+          )));
+          return;
+        }
+
+        if (event.type === 'tool') {
+          setMessages(cur => cur.map(m => (
+            m.id === placeholderId
+              ? { ...m, toolEvents: upsertToolEvent(m.toolEvents, event), status: m.status === 'sending' ? 'streaming' : m.status }
               : m
           )));
           return;
@@ -1321,7 +1427,14 @@ function HarnessApp() {
             ) : (
               messages.map(msg => {
                 const hasUserImages = msg.role === 'user' && (msg.attachments?.length || 0) > 0;
-                const showMessageBody = msg.status === 'sending' || Boolean(msg.content);
+                const fallbackAssistantContent = msg.role === 'assistant' && msg.executionMode === 'agentic' && !hasRenderableContent(msg.content)
+                  ? buildToolSummaryMarkdown(msg.toolEvents)
+                  : '';
+                const renderedMessageContent = msg.role === 'assistant' && fallbackAssistantContent
+                  ? fallbackAssistantContent
+                  : msg.content;
+                const showMessageBody = msg.status === 'sending' || Boolean(renderedMessageContent);
+                const assistantParts = msg.role === 'assistant' ? splitAssistantContent(renderedMessageContent) : [];
                 return (
                   <div key={msg.id} className={`chat-msg ${msg.status === 'sending' ? 'chat-msg-pending' : ''} ${msg.status === 'error' ? 'chat-msg-error' : ''}`}>
                     <div className={`chat-msg-row ${msg.role === 'user' ? 'chat-msg-row-user' : ''}`}>
@@ -1333,11 +1446,18 @@ function HarnessApp() {
                           <span className="chat-msg-name">{msg.role === 'user' ? 'You' : 'Assistant'}</span>
                           <span className="chat-msg-time">{formatTime(msg.createdAt)}</span>
                         </div>
-                        {msg.role === 'assistant' && msg.activity.length > 0 && (
+                        {msg.role === 'assistant' && msg.executionMode === 'agentic' && (msg.activity.length > 0 || msg.toolEvents.length > 0) && (
                           <div className="tool-execution-tracker">
                             <div className="tool-tracker-header">
                               <span>🔄 Tool Activity</span>
                             </div>
+                            {(msg.activity.length > 0 || msg.toolEvents.length > 0) && (
+                              <div className="tool-summary-line">
+                                {msg.toolEvents.filter((event) => event.state === 'done').length > 0
+                                  ? `${msg.toolEvents.filter((event) => event.state === 'done').length} tool step${msg.toolEvents.filter((event) => event.state === 'done').length === 1 ? '' : 's'} completed`
+                                  : 'Preparing agentic run'}
+                              </div>
+                            )}
                             <div className="tool-tracker-steps">
                               {msg.activity.map((step, index) => {
                                 let badgeClass = 'tool-badge-system';
@@ -1366,6 +1486,34 @@ function HarnessApp() {
                                 );
                               })}
                             </div>
+                            {msg.toolEvents.length > 0 && (
+                              <div className="tool-call-list">
+                                {msg.toolEvents.map((event) => {
+                                  const stateClass = event.state === 'start'
+                                    ? 'tool-call-card-running'
+                                    : event.success === false
+                                      ? 'tool-call-card-error'
+                                      : 'tool-call-card-done';
+                                  const stateLabel = event.state === 'start'
+                                    ? 'Running'
+                                    : event.success === false
+                                      ? 'Failed'
+                                      : 'Done';
+                                  return (
+                                    <div key={event.id} className={`tool-call-card ${stateClass}`}>
+                                      <div className="tool-call-card-top">
+                                        <span className="tool-call-name">{event.name}</span>
+                                        <span className="tool-call-state">{stateLabel}</span>
+                                      </div>
+                                      <div className="tool-call-input">{event.inputSummary}</div>
+                                      {event.output && (
+                                        <pre className="tool-call-output">{event.output}</pre>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
                           </div>
                         )}
                         {hasUserImages && (
@@ -1386,28 +1534,26 @@ function HarnessApp() {
                         )}
                         {showMessageBody && (
                           <div className="chat-msg-body">
-                            {msg.status === 'sending' && !msg.content ? (
+                            {msg.status === 'sending' && !renderedMessageContent ? (
                               <div className="chat-typing">
                                 <span /><span /><span />
                               </div>
+                            ) : msg.role !== 'assistant' ? (
+                              <MarkdownContent content={renderedMessageContent} />
                             ) : (
-                              msg.content.split(/(<think>[\s\S]*?(?:<\/think>|$))/gi).map((part, i) => {
-                                if (part.toLowerCase().startsWith('<think>')) {
-                                  let inner = part.slice(7);
-                                  if (inner.toLowerCase().endsWith('</think>')) {
-                                    inner = inner.slice(0, -8);
-                                  }
+                              assistantParts.map((part, i) => {
+                                if (part.kind === 'thought') {
                                   return (
-                                    <details key={i} className="ai-thought-block" open={(msg.status === 'sending') || (inner.length < 500)}>
+                                    <details key={i} className="ai-thought-block" open={(msg.status === 'sending') || (part.value.length < 500)}>
                                       <summary className="ai-thought-header">
                                         <span className="ai-thought-icon">🧠</span>
                                         <span>Reasoning Process</span>
                                       </summary>
-                                      <div className="ai-thought-content">{inner}</div>
+                                      <MarkdownContent content={part.value} className="markdown-body ai-thought-content" />
                                     </details>
                                   );
                                 }
-                                return <span key={i} style={{ whiteSpace: 'pre-wrap' }}>{part}</span>;
+                                return <MarkdownContent key={i} content={part.value} />;
                               })
                             )}
                           </div>

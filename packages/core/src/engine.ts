@@ -47,9 +47,19 @@ export interface ChatStatusEvent {
   loop: number;
 }
 
+export interface ChatToolEvent {
+  id: string;
+  name: SupportedTool;
+  state: 'start' | 'done';
+  inputSummary: string;
+  output?: string;
+  success?: boolean;
+}
+
 export interface ChatStreamHandlers {
   onStatus?: (event: ChatStatusEvent) => void;
   onDelta?: (chunk: string) => void;
+  onTool?: (event: ChatToolEvent) => void;
 }
 
 export interface EngineConfig {
@@ -272,6 +282,57 @@ function appendToolCallDeltas(target: any[], deltas: any[]) {
         toolCall.function.arguments += delta.function.arguments;
       }
     }
+  }
+}
+
+const STREAM_TOOL_OUTPUT_MAX_LINES = 12;
+const STREAM_TOOL_OUTPUT_MAX_CHARS = 900;
+
+function truncateStreamPreview(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) {
+    return '';
+  }
+
+  const lines = normalized.split('\n');
+  const clippedLines = lines.slice(0, STREAM_TOOL_OUTPUT_MAX_LINES);
+  let clipped = clippedLines.join('\n');
+  if (clipped.length > STREAM_TOOL_OUTPUT_MAX_CHARS) {
+    clipped = `${clipped.slice(0, STREAM_TOOL_OUTPUT_MAX_CHARS)}...`;
+  }
+
+  if (lines.length > STREAM_TOOL_OUTPUT_MAX_LINES || clipped.length < normalized.length) {
+    return `${clipped}\n... truncated ...`;
+  }
+
+  return clipped;
+}
+
+function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown>): string {
+  switch (toolName) {
+    case 'readFile':
+    case 'writeFile':
+    case 'patchFile':
+    case 'deleteFile':
+      return `Path: ${getRequiredStringArg(args, 'filePath', toolName)}`;
+    case 'listDir':
+      return `Path: ${getOptionalStringArg(args, 'dirPath') || '.'}`;
+    case 'glob':
+      return `Pattern: ${getRequiredStringArg(args, 'pattern', toolName)}`;
+    case 'searchText':
+      return [
+        `Query: ${getRequiredStringArg(args, 'query', toolName)}`,
+        getOptionalStringArg(args, 'filePattern') ? `Files: ${getOptionalStringArg(args, 'filePattern')}` : null,
+      ].filter((entry): entry is string => Boolean(entry)).join(' | ');
+    case 'makeDir':
+      return `Path: ${getRequiredStringArg(args, 'dirPath', toolName)}`;
+    case 'runCommand':
+      return `Command: ${getRequiredStringArg(args, 'command', toolName)}`;
+    case 'gitStatus':
+    case 'gitDiff':
+      return 'Workspace command';
+    default:
+      return truncateStreamPreview(JSON.stringify(args));
   }
 }
 
@@ -1542,7 +1603,7 @@ export class CoreEngine extends EventEmitter {
       thinkingEnabled: options?.think === true,
     });
     this.emitChatStatus(handlers, 'mode', 'Direct chat mode', 0);
-    this.emitChatStatus(handlers, 'Generating', 'Normal Chat Mode', 0);
+    this.emitChatStatus(handlers, 'model', 'Generating assistant response', 0);
 
     const message = await this.streamAssistantMessage(
       messages,
@@ -1558,6 +1619,13 @@ export class CoreEngine extends EventEmitter {
 
   private emitChatStatus(handlers: ChatStreamHandlers | undefined, phase: string, action: string, loop: number) {
     handlers?.onStatus?.({ phase, action, loop });
+  }
+
+  private emitChatToolEvent(
+    handlers: ChatStreamHandlers | undefined,
+    event: ChatToolEvent,
+  ) {
+    handlers?.onTool?.(event);
   }
 
   private completeImmediateResponse(
@@ -1888,6 +1956,8 @@ export class CoreEngine extends EventEmitter {
       ...(manualToolProtocol ? [{ role: 'system', content: this.buildManualToolProtocol(selectedToolNames) }] : []),
       ...promptMessages,
     ];
+    let streamedToolEventCounter = 0;
+    const nextStreamToolEventId = () => `tool-${++streamedToolEventCounter}`;
     let manualBootstrapTool = manualToolProtocol
       ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, selectedToolNames)
       : null;
@@ -1914,13 +1984,39 @@ export class CoreEngine extends EventEmitter {
           },
         });
 
+        const toolEventId = nextStreamToolEventId();
+        this.emitChatToolEvent(streamHandlers, {
+          id: toolEventId,
+          name: bootstrapDecision.name,
+          state: 'start',
+          inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
+        });
         try {
           const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args);
+          const streamedOutput = toolResult.preview
+            ? `${toolResult.output}\n\n${toolResult.preview}`
+            : toolResult.output;
+          this.emitChatToolEvent(streamHandlers, {
+            id: toolEventId,
+            name: bootstrapDecision.name,
+            state: 'done',
+            inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
+            output: truncateStreamPreview(streamedOutput),
+            success: toolResult.success,
+          });
           currentMessages.push({
             role: 'user',
             content: this.formatManualToolResult(bootstrapDecision.name, toolResult.output),
           });
         } catch (error: any) {
+          this.emitChatToolEvent(streamHandlers, {
+            id: toolEventId,
+            name: bootstrapDecision.name,
+            state: 'done',
+            inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
+            output: truncateStreamPreview(`Error: ${error.message}`),
+            success: false,
+          });
           currentMessages.push({
             role: 'user',
             content: this.formatManualToolResult(bootstrapDecision.name, `Error: ${error.message}`),
@@ -2039,10 +2135,19 @@ export class CoreEngine extends EventEmitter {
 
         for (const toolCall of message.tool_calls) {
           const name = toolCall.function.name as SupportedTool;
+          const toolEventId = nextStreamToolEventId();
           let args: Record<string, unknown> = {};
           try {
             args = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
           } catch (error: any) {
+            this.emitChatToolEvent(streamHandlers, {
+              id: toolEventId,
+              name,
+              state: 'done',
+              inputSummary: truncateStreamPreview(toolCall.function.arguments || '{}'),
+              output: truncateStreamPreview(`Error: Invalid tool arguments - ${error.message}`),
+              success: false,
+            });
             currentMessages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
@@ -2053,9 +2158,26 @@ export class CoreEngine extends EventEmitter {
           }
           this.planner.setIntendedAction(`Executing ${name}`);
           this.emitChatStatus(streamHandlers, 'execution', `Executing ${name}`, loopCount);
+          this.emitChatToolEvent(streamHandlers, {
+            id: toolEventId,
+            name,
+            state: 'start',
+            inputSummary: summarizeToolArgs(name, args),
+          });
 
           try {
             const toolResult = await this.executeToolCall(name, args);
+            const streamedOutput = toolResult.preview
+              ? `${toolResult.output}\n\n${toolResult.preview}`
+              : toolResult.output;
+            this.emitChatToolEvent(streamHandlers, {
+              id: toolEventId,
+              name,
+              state: 'done',
+              inputSummary: summarizeToolArgs(name, args),
+              output: truncateStreamPreview(streamedOutput),
+              success: toolResult.success,
+            });
             currentMessages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
@@ -2063,6 +2185,14 @@ export class CoreEngine extends EventEmitter {
               content: toolResult.output,
             });
           } catch (error: any) {
+            this.emitChatToolEvent(streamHandlers, {
+              id: toolEventId,
+              name,
+              state: 'done',
+              inputSummary: summarizeToolArgs(name, args),
+              output: truncateStreamPreview(`Error: ${error.message}`),
+              success: false,
+            });
             currentMessages.push({
               role: 'tool',
               tool_call_id: toolCall.id,
@@ -2116,13 +2246,39 @@ export class CoreEngine extends EventEmitter {
           this.planner.setIntendedAction(`Executing ${manualDecision.name}`);
           this.emitChatStatus(streamHandlers, 'execution', `Executing ${manualDecision.name}`, loopCount);
 
+          const toolEventId = nextStreamToolEventId();
+          this.emitChatToolEvent(streamHandlers, {
+            id: toolEventId,
+            name: manualDecision.name,
+            state: 'start',
+            inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
+          });
           try {
             const toolResult = await this.executeToolCall(manualDecision.name, manualDecision.args);
+            const streamedOutput = toolResult.preview
+              ? `${toolResult.output}\n\n${toolResult.preview}`
+              : toolResult.output;
+            this.emitChatToolEvent(streamHandlers, {
+              id: toolEventId,
+              name: manualDecision.name,
+              state: 'done',
+              inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
+              output: truncateStreamPreview(streamedOutput),
+              success: toolResult.success,
+            });
             currentMessages.push({
               role: 'user',
               content: this.formatManualToolResult(manualDecision.name, toolResult.output),
             });
           } catch (error: any) {
+            this.emitChatToolEvent(streamHandlers, {
+              id: toolEventId,
+              name: manualDecision.name,
+              state: 'done',
+              inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
+              output: truncateStreamPreview(`Error: ${error.message}`),
+              success: false,
+            });
             currentMessages.push({
               role: 'user',
               content: this.formatManualToolResult(manualDecision.name, `Error: ${error.message}`),

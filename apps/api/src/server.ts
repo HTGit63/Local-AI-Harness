@@ -638,14 +638,6 @@ const server = http.createServer(async (req, res) => {
           }
         }
 
-        if (!isAgentic) {
-          await engine.recordTurnExecution('direct', {
-            messageCount: messages.length,
-            thinkingEnabled,
-            imageCount: images.length,
-          });
-        }
-
         startNdjson(req, res);
 
         if (!isAgentic) {
@@ -658,6 +650,7 @@ const server = http.createServer(async (req, res) => {
             {
               onStatus: (event: { phase: string; action: string; loop: number }) => writeNdjson(res, { type: 'status', ...event }),
               onDelta: (delta: string) => writeNdjson(res, { type: 'delta', delta }),
+              onTool: (event) => writeNdjson(res, { type: 'tool', ...event }),
             },
             { signal: abortController.signal, think: thinkingEnabled }
           );
@@ -672,6 +665,7 @@ const server = http.createServer(async (req, res) => {
           {
             onStatus: (event: { phase: string; action: string; loop: number }) => writeNdjson(res, { type: 'status', ...event }),
             onDelta: (delta: string) => writeNdjson(res, { type: 'delta', delta }),
+            onTool: (event) => writeNdjson(res, { type: 'tool', ...event }),
           },
           { signal: abortController.signal, think: thinkingEnabled },
         );

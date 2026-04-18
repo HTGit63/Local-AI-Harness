@@ -174,6 +174,79 @@ async function testEngineChatStream() {
   }
 }
 
+async function testEngineChatStreamEmitsToolEvents() {
+  const originalFetch = globalThis.fetch;
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-tool-stream-'));
+  const toolEvents: Array<{ name: string; state: string; output?: string; success?: boolean }> = [];
+
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({ name: 'tool-stream-test' }), 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    chatResponder(body) {
+      if (body.messages?.some((message: { role?: string }) => message.role === 'tool')) {
+        return {
+          id: 'mock-tool-final',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: 'The file exports `ok` as `true`.',
+            },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+        };
+      }
+
+      return {
+        id: 'mock-tool-call',
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+              function: {
+                name: 'readFile',
+                arguments: JSON.stringify({ filePath: 'src/index.ts' }),
+              },
+            }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({
+      workspaceRoot,
+      model: 'qwen3.5:9b-q4_K_M',
+    });
+    const response = await engine.chatStream(
+      [{ role: 'user', content: 'Read src/index.ts and tell me what it exports' }],
+      {
+        onTool: (event) => toolEvents.push(event),
+      },
+    );
+
+    assert.ok(response.includes('exports `ok`'));
+    assert.ok(toolEvents.some((event) => event.name === 'readFile' && event.state === 'start'));
+    const doneEvent = toolEvents.find((event) => event.name === 'readFile' && event.state === 'done');
+    assert.ok(doneEvent);
+    assert.strictEqual(doneEvent?.success, true);
+    assert.ok(doneEvent?.output?.includes('export const ok = true;'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testEngineRecordsExecutionModes() {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = createMockFetch() as typeof fetch;
@@ -713,6 +786,7 @@ async function run() {
   await testModelAdapterPrefersNativeOllamaChat();
   await testEnginePromptRecipeSelection();
   await testEngineChatStream();
+  await testEngineChatStreamEmitsToolEvents();
   await testEngineRecordsExecutionModes();
   await testEnginePrioritizesEditsWithoutAutoRepoContext();
   await testRepoIndexerExcludesVendoredAndSessionDirs();
