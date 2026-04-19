@@ -25,16 +25,16 @@ export class WorkspacePolicy {
   }
 
   checkAction(action: ActionType, targetPath?: string): PolicyCheckResult {
-    if (this.mode === 'danger') {
-      return { allowed: true, requiresApproval: false };
-    }
-
     if (targetPath && !this.isPathWithinWorkspace(targetPath)) {
       return {
         allowed: false,
         requiresApproval: false,
-        reason: 'Action outside workspace root is denied in the current mode.',
+        reason: 'Action outside workspace root is denied, including in danger mode.',
       };
+    }
+
+    if (this.mode === 'danger') {
+      return { allowed: true, requiresApproval: false };
     }
 
     if (action === 'read') {

@@ -15,7 +15,7 @@ const IGNORED_DIR_NAMES = new Set([
 const MAX_MANIFEST_PREVIEW = 8;
 const MAX_ENTRY_POINT_PREVIEW = 8;
 const MAX_README_PREVIEW = 4;
-const DEFAULT_CACHE_TTL_MS = 30_000;
+const DEFAULT_CACHE_TTL_MS = 300_000;
 
 export interface ProjectContext {
   cwd: string;

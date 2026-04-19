@@ -679,6 +679,31 @@ export class ModelAdapter {
     }
   }
 
+  async canAttemptNativeToolCalling(modelName = this.model, capabilities?: string[] | null): Promise<boolean> {
+    const normalizedModelName = modelName.trim();
+    if (!normalizedModelName) {
+      return false;
+    }
+
+    if (Array.isArray(capabilities) && capabilities.includes('tools')) {
+      return true;
+    }
+
+    const nativeChatSupported = await this.supportsOllamaNativeChat();
+    if (!nativeChatSupported) {
+      return false;
+    }
+
+    if (!Array.isArray(capabilities)) {
+      return true;
+    }
+
+    // Ollama `/api/show` can omit `tools` for Gemma/Qwen families even when
+    // `/api/chat` handles native tool calls correctly. Prefer one real native
+    // attempt before dropping into manual JSON fallback.
+    return /gemma|qwen/i.test(normalizedModelName);
+  }
+
   async activateModel(requestedModel: string, previousModel: string | null = null): Promise<ModelSwitchResult> {
     const targetModel = requestedModel.trim();
     if (!targetModel) {

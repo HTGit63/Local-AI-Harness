@@ -15,6 +15,17 @@ export interface ToolCommandRecord {
   durationMs?: number;
 }
 
+export interface ToolWebSearchRecord {
+  query: string;
+  engine: string;
+  resultCount: number;
+}
+
+export interface ToolWebFetchRecord {
+  url: string;
+  title?: string;
+}
+
 export interface ToolResultMetadata {
   durationMs?: number;
   fileReads?: string[];
@@ -23,6 +34,8 @@ export interface ToolResultMetadata {
   fileDeletes?: string[];
   directoriesCreated?: string[];
   searches?: ToolSearchRecord[];
+  webSearches?: ToolWebSearchRecord[];
+  webFetches?: ToolWebFetchRecord[];
   command?: ToolCommandRecord;
   lineStats?: ToolDiffStats;
   truncated?: boolean;
@@ -49,6 +62,7 @@ export interface ToolApprovalRequest {
 
 export interface ToolActionContext {
   cwd: string;
+  internetAccessEnabled?: boolean;
   emitTrace: (type: string, data: unknown) => void;
   checkPolicy: (action: 'read' | 'write' | 'delete' | 'execute', target?: string) => {
     allowed: boolean;

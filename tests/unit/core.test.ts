@@ -58,11 +58,15 @@ async function testPromptAnalyzerIsPassThrough() {
 function testWorkspacePolicy() {
   const root = '/tmp/gamma-project';
   const policy = new WorkspacePolicy({ workspaceRoot: root, mode: 'workspace-write' });
+  const dangerPolicy = new WorkspacePolicy({ workspaceRoot: root, mode: 'danger' });
 
   assert.deepStrictEqual(policy.checkAction('read', 'src/index.ts').allowed, true);
   assert.deepStrictEqual(policy.checkAction('write', 'src/index.ts').requiresApproval, true);
   assert.deepStrictEqual(policy.checkAction('write', '/etc/passwd').allowed, false);
   assert.deepStrictEqual(policy.checkAction('write', `${root}-outside/file.ts`).allowed, false);
+  assert.deepStrictEqual(dangerPolicy.checkAction('write', 'src/index.ts').allowed, true);
+  assert.deepStrictEqual(dangerPolicy.checkAction('write', 'src/index.ts').requiresApproval, false);
+  assert.deepStrictEqual(dangerPolicy.checkAction('write', '/etc/passwd').allowed, false);
 }
 
 async function testModelAdapter() {
@@ -141,6 +145,15 @@ async function testEnginePromptRecipeSelection() {
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+async function testEngineSanitizesDisabledSkills() {
+  const engine = new CoreEngine();
+  const session = engine.startSession(['caveman', 'patch-surgeon', 'patch-surgeon']);
+  assert.deepStrictEqual(session.skillsActive, ['patch-surgeon']);
+
+  const updated = await engine.updateSessionSkills(['caveman', 'repo-cartographer']);
+  assert.deepStrictEqual(updated.skillsActive, ['repo-cartographer']);
 }
 
 async function testEngineChatStream() {
@@ -429,6 +442,102 @@ async function testEnginePrefersNativeToolsForGemmaTargetedEdits() {
     assert.strictEqual(chatRequests[0].options?.num_predict ?? chatRequests[0].max_tokens, 128);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+}
+
+async function testEngineKeepsNativeToolsWhenCapabilitiesOmitTools() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    showResponder: () => ({ capabilities: ['completion', 'thinking'] }),
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Native tool trial stayed active.' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ model: 'gemma4:e4b' });
+    const response = await engine.chat([
+      { role: 'user', content: 'Fix src/index.ts so it exports a default value' },
+    ]);
+
+    assertAgenticResponse(response, 'Native tool trial stayed active.');
+    assert.ok(chatRequests.length >= 1);
+    assert.ok(Array.isArray(chatRequests[0].tools));
+    assert.ok(chatRequests[0].tools.length > 0);
+    assert.ok(!JSON.stringify(chatRequests[0].messages).includes('Use exactly one JSON tool action at a time.'));
+    assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'manual_tool_fallback'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testEngineRecoversFromPlanningOnlyNativeReply() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-planning-only-'));
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
+
+  let chatCalls = 0;
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder(body) {
+      chatCalls += 1;
+      if (body.messages?.some((message: { role?: string }) => message.role === 'tool')) {
+        return {
+          ...MOCK_CHAT_RESPONSE,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'Recovered after tool call.' }, finish_reason: 'stop' }],
+        };
+      }
+
+      if (chatCalls === 1) {
+        return {
+          ...MOCK_CHAT_RESPONSE,
+          choices: [{ index: 0, message: { role: 'assistant', content: '<think>Need to inspect file before editing.</think>' }, finish_reason: 'stop' }],
+        };
+      }
+
+      return {
+        ...MOCK_CHAT_RESPONSE,
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+              function: {
+                name: 'readFile',
+                arguments: JSON.stringify({ filePath: 'src/index.ts' }),
+              },
+            }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, model: 'gemma4:e4b' });
+    const response = await engine.chat([
+      { role: 'user', content: 'Read src/index.ts and tell me what it exports.' },
+    ]);
+
+    assertAgenticResponse(response, 'Recovered after tool call.');
+    assert.ok(chatRequests.length >= 2);
+    assert.ok(chatRequests.some((body) => Array.isArray(body.tools) && body.tools.length > 0));
+    assert.ok(chatRequests.some((body) => JSON.stringify(body.messages).includes('Planning-only text is not enough.')));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'native_tool_retry_requested'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
 }
 
@@ -795,6 +904,7 @@ async function run() {
   await testModelAdapter();
   await testModelAdapterPrefersNativeOllamaChat();
   await testEnginePromptRecipeSelection();
+  await testEngineSanitizesDisabledSkills();
   await testEngineChatStream();
   await testEngineChatStreamEmitsToolEvents();
   await testEngineRecordsExecutionModes();
@@ -803,6 +913,8 @@ async function run() {
   await testRepoIndexerBuildsWorkspaceInventory();
   await testEngineKeepsSimplePromptsLean();
   await testEnginePrefersNativeToolsForGemmaTargetedEdits();
+  await testEngineKeepsNativeToolsWhenCapabilitiesOmitTools();
+  await testEngineRecoversFromPlanningOnlyNativeReply();
   await testEngineUsesManualToolProtocolWhenModelLacksNativeTools();
   await testEngineAnswersRepoOverviewFromLocalInventory();
   await testEngineAnswersRootManifestNameFromLocalInventory();

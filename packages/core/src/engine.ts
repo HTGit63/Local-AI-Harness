@@ -21,6 +21,8 @@ const SUPPORTED_TOOLS = [
   'readFile',
   'searchText',
   'listDir',
+  'webSearch',
+  'fetchUrl',
   'writeFile',
   'patchFile',
   'makeDir',
@@ -31,10 +33,15 @@ const SUPPORTED_TOOLS = [
 ] as const;
 const AUTO_REPO_CONTEXT_ENABLED = process.env.HARNESS_AUTO_REPO_CONTEXT === '1';
 const execFileAsync = promisify(execFile);
+const DISABLED_SKILL_SLUGS = new Set(['caveman']);
 
 type SupportedTool = (typeof SUPPORTED_TOOLS)[number];
 type TurnExecutionMode = 'direct' | 'agentic';
 type ReasoningEffort = 'high' | 'medium' | 'low' | 'none';
+type StreamIdleTimeoutError = Error & {
+  code: 'stream_idle_timeout';
+  receivedContent: boolean;
+};
 type ManualToolDecision =
   | { kind: 'tool'; name: SupportedTool; args: Record<string, unknown> }
   | { kind: 'final'; content: string };
@@ -62,6 +69,15 @@ export interface ChatToolEvent {
   inputSummary: string;
   output?: string;
   success?: boolean;
+}
+
+export interface ChatApprovalEvent {
+  type: 'approval';
+  state: 'pending' | 'updated' | 'resolved';
+  approval: Partial<ApprovalRequestPayload> & {
+    id: string;
+    approved?: boolean | null;
+  };
 }
 
 export interface RunStartedEvent {
@@ -108,6 +124,7 @@ export interface ChatStreamHandlers {
   onStatus?: (event: ChatStatusEvent) => void;
   onDelta?: (chunk: string) => void;
   onTool?: (event: ChatToolEvent) => void;
+  onApproval?: (event: ChatApprovalEvent) => void;
   onRunStarted?: (event: RunStartedEvent) => void;
   onRunStep?: (event: RunStepEvent) => void;
   onRunMetric?: (event: RunMetricEvent) => void;
@@ -122,6 +139,8 @@ export interface EngineConfig {
   workspaceRoot: string;
   mode: PolicyMode;
   sessionDataDir: string;
+  internetAccessEnabled: boolean;
+  streamIdleTimeoutMs: number;
 }
 
 export interface PublicEngineConfig {
@@ -131,6 +150,8 @@ export interface PublicEngineConfig {
   workspaceRoot: string;
   mode: PolicyMode;
   sessionDataDir: string;
+  internetAccessEnabled: boolean;
+  streamIdleTimeoutMs: number;
 }
 
 export interface UpdateConfigOptions {
@@ -145,6 +166,8 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   workspaceRoot: process.cwd(),
   mode: 'workspace-write',
   sessionDataDir: '.gamma-harness/sessions',
+  internetAccessEnabled: process.env.HARNESS_INTERNET_ACCESS !== '0',
+  streamIdleTimeoutMs: Number(process.env.HARNESS_STREAM_IDLE_TIMEOUT_MS || 45000),
 };
 
 function resolveSessionDataDir(workspaceRoot: string, sessionDataDir: string): string {
@@ -215,6 +238,14 @@ function mergeSkills(base: string[], additional: string[]): string[] {
   return Array.from(new Set([...base, ...additional]));
 }
 
+function sanitizeActiveSkills(skills: string[]): string[] {
+  return Array.from(new Set(
+    skills
+      .map((skill) => skill.trim())
+      .filter((skill) => skill.length > 0 && !DISABLED_SKILL_SLUGS.has(skill)),
+  ));
+}
+
 function getRequiredStringArg(args: Record<string, unknown>, key: string, toolName: SupportedTool): string {
   const value = args[key];
   if (typeof value === 'string' && value.trim()) {
@@ -227,6 +258,14 @@ function getRequiredStringArg(args: Record<string, unknown>, key: string, toolNa
 function getOptionalStringArg(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function extractFirstUrl(value: string): string | undefined {
+  return value.match(/https?:\/\/[^\s)>\]]+/i)?.[0];
+}
+
+function isStreamIdleTimeoutError(error: unknown): error is StreamIdleTimeoutError {
+  return Boolean(error && typeof error === 'object' && (error as { code?: string }).code === 'stream_idle_timeout');
 }
 
 function looksLikeSimulatedToolCall(content: string): boolean {
@@ -396,6 +435,10 @@ function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown
         `Query: ${getRequiredStringArg(args, 'query', toolName)}`,
         getOptionalStringArg(args, 'filePattern') ? `Files: ${getOptionalStringArg(args, 'filePattern')}` : null,
       ].filter((entry): entry is string => Boolean(entry)).join(' | ');
+    case 'webSearch':
+      return `Query: ${getRequiredStringArg(args, 'query', toolName)}`;
+    case 'fetchUrl':
+      return `URL: ${getRequiredStringArg(args, 'url', toolName)}`;
     case 'makeDir':
       return `Path: ${getRequiredStringArg(args, 'dirPath', toolName)}`;
     case 'runCommand':
@@ -436,6 +479,9 @@ export class CoreEngine extends EventEmitter {
       workspaceRoot,
       sessionDataDir,
     };
+    if (!Number.isFinite(this.config.streamIdleTimeoutMs) || this.config.streamIdleTimeoutMs < 0) {
+      this.config.streamIdleTimeoutMs = DEFAULT_ENGINE_CONFIG.streamIdleTimeoutMs;
+    }
 
     this.modelAdapter = new ModelAdapter(this.config);
     this.workspacePolicy = new WorkspacePolicy({
@@ -449,6 +495,7 @@ export class CoreEngine extends EventEmitter {
     this.repoIndexer = new RepoIndexer(this.config.workspaceRoot);
     this.toolRegistry = new ToolRegistry({
       cwd: this.config.workspaceRoot,
+      internetAccessEnabled: this.config.internetAccessEnabled,
       emitTrace: (type: string, data: unknown) => this.traceBus.emitEvent({ type, data }),
       checkPolicy: (action: ActionType, target?: string) => this.workspacePolicy.checkAction(action, target),
       requestApproval: (request: { action: string; target: string; preview: string; metadata?: Record<string, string> }) => {
@@ -490,7 +537,12 @@ export class CoreEngine extends EventEmitter {
       }
 
       if (event.type === 'approval_resolved') {
-        this.emit('approval_resolved', event.data);
+        const resolved = event.data as { id: string; response?: { approved?: boolean; editInstruction?: string } };
+        this.emit('approval_resolved', {
+          id: resolved.id,
+          approved: resolved.response?.approved ?? null,
+          editInstruction: resolved.response?.editInstruction,
+        });
       }
 
       if (event.type === 'planner_trace') {
@@ -507,6 +559,8 @@ export class CoreEngine extends EventEmitter {
       workspaceRoot: this.config.workspaceRoot,
       mode: this.config.mode,
       sessionDataDir: this.config.sessionDataDir,
+      internetAccessEnabled: this.config.internetAccessEnabled,
+      streamIdleTimeoutMs: this.config.streamIdleTimeoutMs,
     };
   }
 
@@ -562,10 +616,14 @@ export class CoreEngine extends EventEmitter {
       workspaceRoot,
       mode: this.config.mode,
     });
-    this.toolRegistry.updateContext({ cwd: workspaceRoot });
+    this.toolRegistry.updateContext({
+      cwd: workspaceRoot,
+      internetAccessEnabled: this.config.internetAccessEnabled,
+    });
   }
 
   startSession(skills: string[] = []): SessionMetadata {
+    const sanitizedSkills = sanitizeActiveSkills(skills);
     const session: SessionMetadata = {
       id: createSessionId(),
       createdAt: Date.now(),
@@ -573,7 +631,7 @@ export class CoreEngine extends EventEmitter {
       model: this.config.model,
       mode: this.config.mode,
       cwd: this.config.workspaceRoot,
-      skillsActive: skills,
+      skillsActive: sanitizedSkills,
       toolsAllowlist: [...SUPPORTED_TOOLS],
       turnHistory: [],
     };
@@ -581,7 +639,7 @@ export class CoreEngine extends EventEmitter {
     this.currentSession = session;
     this.planner.setTaskSummary('Interactive coding session');
     this.planner.setPhase('ready');
-    this.planner.setActiveSkills(skills);
+    this.planner.setActiveSkills(sanitizedSkills);
     this.planner.setIntendedAction('Awaiting user input');
     this.traceBus.emitEvent({ type: 'session_started', data: session });
     void this.persistCurrentSession();
@@ -595,13 +653,20 @@ export class CoreEngine extends EventEmitter {
       return null;
     }
 
-    this.currentSession = session;
+    const sanitizedSkills = sanitizeActiveSkills(session.skillsActive || []);
+    this.currentSession = {
+      ...session,
+      skillsActive: sanitizedSkills,
+    };
     this.planner.setTaskSummary(`Resumed session ${session.id}`);
     this.planner.setPhase('ready');
-    this.planner.setActiveSkills(session.skillsActive);
+    this.planner.setActiveSkills(sanitizedSkills);
     this.planner.setIntendedAction('Awaiting user input');
     this.traceBus.emitEvent({ type: 'session_resumed', data: { id: session.id } });
-    return session;
+    if (sanitizedSkills.length !== (session.skillsActive || []).length) {
+      await this.persistCurrentSession();
+    }
+    return this.currentSession;
   }
 
   async listSessions(): Promise<SessionMetadata[]> {
@@ -621,11 +686,12 @@ export class CoreEngine extends EventEmitter {
   }
 
   async updateSessionSkills(skills: string[]): Promise<SessionMetadata> {
+    const sanitizedSkills = sanitizeActiveSkills(skills);
     if (!this.currentSession) {
-      this.startSession(skills);
+      this.startSession(sanitizedSkills);
     } else {
-      this.currentSession.skillsActive = [...skills];
-      this.planner.setActiveSkills(skills);
+      this.currentSession.skillsActive = [...sanitizedSkills];
+      this.planner.setActiveSkills(sanitizedSkills);
       await this.persistCurrentSession();
     }
 
@@ -658,6 +724,7 @@ export class CoreEngine extends EventEmitter {
     const previousMode = this.config.mode;
     const previousModel = this.config.model;
     const previousBaseUrl = this.config.baseUrl;
+    const previousInternetAccess = this.config.internetAccessEnabled;
 
     this.config = {
       ...this.config,
@@ -671,12 +738,13 @@ export class CoreEngine extends EventEmitter {
 
     const workspaceChanged = this.config.workspaceRoot !== previousWorkspaceRoot;
     const modeChanged = this.config.mode !== previousMode;
+    const internetAccessChanged = this.config.internetAccessEnabled !== previousInternetAccess;
     this.workspacePolicy.updateConfig({
       workspaceRoot: this.config.workspaceRoot,
       mode: this.config.mode,
     });
 
-    if (workspaceChanged) {
+    if (workspaceChanged || internetAccessChanged) {
       this.refreshWorkspaceRuntime(this.config.workspaceRoot);
     }
 
@@ -801,24 +869,12 @@ export class CoreEngine extends EventEmitter {
     );
   }
 
-  private selectToolProtocol(
+  private async selectToolProtocol(
     toolNames: SupportedTool[],
     modelCapabilities: string[] | null,
-  ): { manualToolProtocol: boolean; mode: ToolProtocolMode; reason?: string } {
+  ): Promise<{ manualToolProtocol: boolean; mode: ToolProtocolMode; reason?: string }> {
     if (toolNames.length === 0) {
       return { manualToolProtocol: false, mode: 'native' };
-    }
-
-    if (!Array.isArray(modelCapabilities)) {
-      return { manualToolProtocol: false, mode: 'native' };
-    }
-
-    if (!modelCapabilities.includes('tools')) {
-      return {
-        manualToolProtocol: true,
-        mode: 'manual_fallback',
-        reason: 'Model capabilities do not include native tools.',
-      };
     }
 
     const manualToolsForced = process.env.HARNESS_FORCE_MANUAL_TOOLS === '1';
@@ -827,6 +883,19 @@ export class CoreEngine extends EventEmitter {
         manualToolProtocol: true,
         mode: 'manual_preferred',
         reason: 'Manual tool protocol forced by HARNESS_FORCE_MANUAL_TOOLS=1.',
+      };
+    }
+
+    const canAttemptNativeTools = await this.modelAdapter.canAttemptNativeToolCalling(this.config.model, modelCapabilities);
+    if (canAttemptNativeTools || !Array.isArray(modelCapabilities)) {
+      return { manualToolProtocol: false, mode: 'native' };
+    }
+
+    if (!modelCapabilities.includes('tools')) {
+      return {
+        manualToolProtocol: true,
+        mode: 'manual_fallback',
+        reason: 'Model capabilities do not include native tools.',
       };
     }
 
@@ -1168,7 +1237,11 @@ export class CoreEngine extends EventEmitter {
     return selected;
   }
 
-  private buildBootstrapPlan(intentDecision: IntentDecision): BootstrapPlanStep[] {
+  private buildBootstrapPlan(
+    intentDecision: IntentDecision,
+    promptMode: RunMode,
+    toolNames: SupportedTool[],
+  ): BootstrapPlanStep[] {
     switch (intentDecision.intent) {
       case 'workspace_overview':
         return [
@@ -1210,8 +1283,29 @@ export class CoreEngine extends EventEmitter {
           { type: 'tool', title: 'Read git diff', toolName: 'gitDiff', args: {} },
         ];
       default:
-        return [];
+        break;
     }
+
+    if (!toolNames.includes('listDir')) {
+      return [];
+    }
+
+    if (
+      promptMode === 'targeted_edit' ||
+      intentDecision.intent === 'general_chat' ||
+      intentDecision.intent === 'explain_code' ||
+      intentDecision.intent === 'run_command'
+    ) {
+      const steps: BootstrapPlanStep[] = [
+        { type: 'tool', title: 'List workspace root', toolName: 'listDir', args: { dirPath: '.' } },
+      ];
+      if (promptMode === 'targeted_edit' || intentDecision.intent === 'general_chat') {
+        steps.unshift({ type: 'inventory', title: 'Build workspace inventory' });
+      }
+      return steps;
+    }
+
+    return [];
   }
 
   private emitRunStarted(handlers: ChatStreamHandlers | undefined, event: RunStartedEvent) {
@@ -1505,7 +1599,7 @@ export class CoreEngine extends EventEmitter {
           `Mode: ${this.config.mode}`,
           `Configured model: ${this.config.model}`,
           'If the user asks which folder is open, answer from the workspace root or session cwd above.',
-          'All tool paths are relative to the workspace root unless absolute.',
+          'All file and command-path targets must stay inside the workspace root, including in danger mode.',
           workspaceNotice ? `\n${workspaceNotice}` : '',
         ].filter(Boolean).join('\n'),
       },
@@ -1973,6 +2067,13 @@ export class CoreEngine extends EventEmitter {
     handlers?.onTool?.(event);
   }
 
+  private emitChatApprovalEvent(
+    handlers: ChatStreamHandlers | undefined,
+    event: ChatApprovalEvent,
+  ) {
+    handlers?.onApproval?.(event);
+  }
+
   private completeImmediateResponse(
     handlers: ChatStreamHandlers | undefined,
     answer: ImmediateChatAnswer,
@@ -2237,6 +2338,7 @@ export class CoreEngine extends EventEmitter {
       this.emitRunStep(streamHandlers, runId, classified);
     }
 
+    let loopCount = 0;
     const traceListener = (event: TraceEvent) => {
       if (event.type === 'approval_enqueued') {
         const approval = event.data as ApprovalRequestPayload;
@@ -2245,10 +2347,44 @@ export class CoreEngine extends EventEmitter {
           target: approval.target,
           approved: null,
         });
+        this.emitChatApprovalEvent(streamHandlers, {
+          type: 'approval',
+          state: 'pending',
+          approval: {
+            ...approval,
+            approved: null,
+          },
+        });
+        this.emitChatStatus(streamHandlers, 'approval', `Approval required for ${approval.target}`, loopCount);
         this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+      } else if (event.type === 'approval_preview_updated') {
+        const approval = event.data as { id: string; preview?: string };
+        this.emitChatApprovalEvent(streamHandlers, {
+          type: 'approval',
+          state: 'updated',
+          approval: {
+            id: approval.id,
+            diffPreview: approval.preview,
+          },
+        });
       } else if (event.type === 'approval_resolved') {
-        const approval = event.data as { id: string; approved?: boolean };
-        runBuilder.recordApprovalResolved(approval.id, approval.approved ?? null);
+        const approval = event.data as { id: string; response?: { approved?: boolean } };
+        const approved = approval.response?.approved ?? null;
+        runBuilder.recordApprovalResolved(approval.id, approved);
+        this.emitChatApprovalEvent(streamHandlers, {
+          type: 'approval',
+          state: 'resolved',
+          approval: {
+            id: approval.id,
+            approved,
+          },
+        });
+        this.emitChatStatus(
+          streamHandlers,
+          'approval',
+          approved === true ? `Approval granted for ${approval.id}` : `Approval rejected for ${approval.id}`,
+          loopCount,
+        );
         this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
       }
     };
@@ -2321,7 +2457,7 @@ export class CoreEngine extends EventEmitter {
       const includeRepoContext = workspaceBound && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
       const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
       const modelCapabilities = await this.modelAdapter.getModelCapabilities(this.config.model);
-      const toolProtocol = this.selectToolProtocol(selectedToolNames, modelCapabilities);
+      const toolProtocol = await this.selectToolProtocol(selectedToolNames, modelCapabilities);
       const rootManifestAnswer = workspaceBound && !['workspace_overview', 'review_diff', 'find_file', 'read_file', 'search_text'].includes(intentDecision.intent)
         ? await this.tryAnswerFromRootManifest(latestUserMessage)
         : null;
@@ -2443,6 +2579,7 @@ export class CoreEngine extends EventEmitter {
           `Workspace bound: ${workspaceBound ? 'yes' : 'no'}`,
           `Available tools: ${selectedToolNames.length > 0 ? selectedToolNames.join(', ') : 'none'}`,
           `Tool protocol: ${manualToolProtocol ? 'manual' : 'native'}`,
+          'If workspace tools are available and the request is about repo behavior, inspect workspace facts before asking the user for more detail.',
           'Never simulate tool execution or file changes.',
           'Finish with concise answer, What I did, and Files changed.',
         ].join('\n'),
@@ -2456,7 +2593,12 @@ export class CoreEngine extends EventEmitter {
       ];
 
       if (workspaceBound) {
-        await this.executeBootstrapPlan(this.buildBootstrapPlan(intentDecision), currentMessages, streamHandlers, runBuilder);
+        await this.executeBootstrapPlan(
+          this.buildBootstrapPlan(intentDecision, promptMode, selectedToolNames),
+          currentMessages,
+          streamHandlers,
+          runBuilder,
+        );
       }
 
       let streamedToolEventCounter = 0;
@@ -2464,13 +2606,13 @@ export class CoreEngine extends EventEmitter {
       let manualBootstrapTool = manualToolProtocol && workspaceBound
         ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, selectedToolNames)
         : null;
-      let loopCount = 0;
       const MAX_LOOPS = intentDecision.intent === 'edit_code'
         ? 5
         : intentDecision.intent === 'run_command'
           ? 4
           : 3;
       let manualProtocolCorrectionCount = 0;
+      let planningOnlyNativeRetryCount = 0;
       let simulatedToolReplyCount = 0;
       let firstModelCallRecorded = false;
       let firstTokenRecorded = false;
@@ -2829,6 +2971,71 @@ export class CoreEngine extends EventEmitter {
         }
 
         const response = extractTextSegment(message.content);
+        const visibleResponse = response.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+        const planningOnlyResponse = Boolean(
+          nativeToolDefinitions &&
+          selectedToolNames.length > 0 &&
+          response.includes('<think>') &&
+          visibleResponse.length === 0,
+        );
+        if (planningOnlyResponse) {
+          const retryReason = 'Model returned planning-only text without executing tools.';
+          runBuilder.finishStep(modelStep.id, { detail: retryReason }, 'skipped');
+          const finishedPlanningOnlyStep = runBuilder.snapshot().steps.find((entry) => entry.id === modelStep.id);
+          if (finishedPlanningOnlyStep) {
+            this.planner.upsertRunStep({
+              id: finishedPlanningOnlyStep.id,
+              type: finishedPlanningOnlyStep.type,
+              title: finishedPlanningOnlyStep.title,
+              status: finishedPlanningOnlyStep.status,
+              detail: finishedPlanningOnlyStep.detail,
+            });
+            this.emitRunStep(streamHandlers, runId, finishedPlanningOnlyStep);
+          }
+
+          if (planningOnlyNativeRetryCount < 1) {
+            planningOnlyNativeRetryCount += 1;
+            this.traceBus.emitEvent({
+              type: 'native_tool_retry_requested',
+              data: {
+                model: this.config.model,
+                reason: retryReason,
+                promptMode,
+                selectedTools: selectedToolNames,
+              },
+            });
+            currentMessages.push({
+              role: 'system',
+              content: RECIPES.nativeToolNudge(),
+            });
+            continue;
+          }
+
+          nativeToolDefinitions = undefined;
+          manualToolProtocol = selectedToolNames.length > 0;
+          if (manualToolProtocol) {
+            runBuilder.markManualFallback(retryReason);
+            this.traceBus.emitEvent({
+              type: 'manual_tool_fallback',
+              data: {
+                model: this.config.model,
+                reason: retryReason,
+                manualToolProtocol: true,
+                selectedTools: selectedToolNames,
+              },
+            });
+            this.emitChatStatus(streamHandlers, 'warning', 'Native tool retry failed; manual fallback active', loopCount);
+            if (!manualProtocolPromptInjected) {
+              currentMessages.push({
+                role: 'system',
+                content: this.buildManualToolProtocol(selectedToolNames),
+              });
+              manualProtocolPromptInjected = true;
+            }
+            continue;
+          }
+        }
+
         runBuilder.finishStep(modelStep.id, {
           detail: response.slice(0, 240) || 'No natural-language response.',
         }, 'done');

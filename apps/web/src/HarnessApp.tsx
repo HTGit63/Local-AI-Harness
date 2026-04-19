@@ -18,6 +18,8 @@ const MAX_BROWSER_TREE_LINES = 220;
 const MAX_IMAGE_ATTACHMENTS = 2;
 const MAX_IMAGE_BYTES = 1024 * 1024;
 const AGENTIC_STORAGE_KEY = 'gamma-harness.agentic-mode';
+const LIVE_REFRESH_MS = 6000;
+const FULL_REFRESH_MS = 45000;
 
 /* ─────────── Types ─────────── */
 type ChatRole = 'user' | 'assistant';
@@ -102,6 +104,7 @@ interface ApprovalItem {
   severity: string;
   diffPreview?: string;
   warningMessage?: string;
+  approved?: boolean | null;
 }
 
 interface PlanState {
@@ -257,6 +260,7 @@ interface BrowserPreview {
 type ChatStreamEvent =
   | { type: 'status'; phase: string; action: string; loop: number }
   | ({ type: 'tool' } & ChatToolEvent)
+  | { type: 'approval'; state: 'pending' | 'updated' | 'resolved'; approval: ApprovalItem }
   | { type: 'run_started'; runId: string; sessionId: string; intent: string; workspaceBound: boolean; browserContextActive: boolean; workspaceSource: 'backend' | 'browser_snapshot'; executionMode: ExecutionMode }
   | { type: 'run_step'; runId: string; step: AgentRunStep }
   | { type: 'run_metric'; runId: string; metrics: Partial<{ filesRead: number; directoriesRead: number; filesWritten: number; commandsRun: number; searchesRun: number; approvals: number; addedLines: number; removedLines: number; firstTokenMs: number; totalMs: number }> }
@@ -611,6 +615,29 @@ function upsertRunStep(current: AgentRunStep[], next: AgentRunStep): AgentRunSte
   return updated;
 }
 
+function mergeApprovalEvent(current: ApprovalItem[], event: Extract<ChatStreamEvent, { type: 'approval' }>): ApprovalItem[] {
+  if (event.state === 'resolved') {
+    return current.filter((entry) => entry.id !== event.approval.id);
+  }
+
+  const index = current.findIndex((entry) => entry.id === event.approval.id);
+  if (index === -1) {
+    if (event.state !== 'pending') {
+      return current;
+    }
+    return [...current, event.approval as ApprovalItem];
+  }
+
+  const next = [...current];
+  next[index] = {
+    ...next[index],
+    ...event.approval,
+    diffPreview: event.approval.diffPreview ?? next[index].diffPreview,
+    warningMessage: event.approval.warningMessage ?? next[index].warningMessage,
+  };
+  return next;
+}
+
 async function buildFromHandle(handle: BrowserDirectoryHandle): Promise<BrowserSelection> {
   async function visit(h: BrowserDirectoryHandle, p: string): Promise<BrowserDirectoryNode> {
     const node: BrowserDirectoryNode = { kind: 'directory', name: h.name, path: p, children: [] };
@@ -669,7 +696,7 @@ function buildSystemPrompt(mode: ConversationMode, opts: {
   ].filter(Boolean).join(' ');
   const skillsList = opts.selectedSkills.join(', ');
   const skills = opts.selectedSkills.length > 0
-    ? `Active skills: ${skillsList}. ${opts.selectedSkills.includes('caveman') ? 'Guardrail: Never compress structured JSON, code blocks, shell commands, safety warnings, or approval prompts.' : ''}`
+    ? `Active skills: ${skillsList}.`
     : '';
   return [
     'You are a local-first agentic coding assistant.',
@@ -714,6 +741,34 @@ function TreeView({ node, depth, expanded, onToggle, onSelect, selected }: {
   );
 }
 
+function ApprovalCards({ approvals, onResolve }: {
+  approvals: ApprovalItem[];
+  onResolve: (id: string, approved: boolean) => void;
+}) {
+  return (
+    <>
+      {approvals.map((approval) => (
+        <div key={approval.id} className="approval-card">
+          <div className="approval-card-head">
+            <span className="approval-card-title">{approval.changeType}</span>
+            <span className={`approval-severity ${approval.severity === 'danger' ? 'approval-severity-danger' : approval.severity === 'info' ? 'approval-severity-info' : ''}`}>
+              {approval.severity}
+            </span>
+          </div>
+          <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '6px' }}>{approval.target}</div>
+          {(approval.diffPreview || approval.warningMessage) && (
+            <div className="approval-preview">{approval.diffPreview || approval.warningMessage}</div>
+          )}
+          <div className="approval-actions">
+            <button className="approval-btn approval-btn-approve" onClick={() => void onResolve(approval.id, true)} type="button">Approve</button>
+            <button className="approval-btn approval-btn-reject" onClick={() => void onResolve(approval.id, false)} type="button">Reject</button>
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
 /* ═══════════ MAIN APP ═══════════ */
 function HarnessApp() {
   // UI state
@@ -728,7 +783,7 @@ function HarnessApp() {
   const [session, setSession] = useState<SessionState | null>(null);
   const [sessions, setSessions] = useState<SessionState[]>([]);
   const [skills, setSkills] = useState<SkillMetadata[]>([]);
-  const [selectedSkills, setSelectedSkills] = useState<string[]>(['caveman']);
+  const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [traces, setTraces] = useState<TraceEntry[]>([]);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [plan, setPlan] = useState<PlanState | null>(null);
@@ -806,14 +861,22 @@ function HarnessApp() {
   const activeModelLabel = modelRuntime?.activeModel || config?.model || 'No model';
 
   /* ─── Refresh dashboard data ─── */
-  const refreshDashboard = useCallback(async (mode: 'full' | 'live' = 'full') => {
+  const refreshDashboard = useCallback(async (
+    mode: 'full' | 'live' = 'full',
+    options?: { includeHeavy?: boolean },
+  ) => {
     const safe = async <T,>(url: string, fallback: T): Promise<T> => {
       try { return await fetchJson<T>(url); } catch { return fallback; }
     };
     try {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden' && mode !== 'full') {
+        return;
+      }
+
       const traceUrl = mode === 'full' || lastTraceTimestampRef.current === 0
         ? `${API}/trace?limit=240`
         : `${API}/trace?since=${lastTraceTimestampRef.current}`;
+      const includeHeavy = options?.includeHeavy ?? (mode === 'full' && (!repoContext || (settingsOpen && settingsTab === 'activity')));
 
       const applyCoreState = (
         health: { status: BackendStatus },
@@ -879,7 +942,7 @@ function HarnessApp() {
         return;
       }
 
-      const [health, cfg, tr, ap, pl, mrt, sess, sessList, sk, repo, diff] = await Promise.all([
+      const [health, cfg, tr, ap, pl, mrt, sess, sessList, sk] = await Promise.all([
         safe<{ status: BackendStatus }>(`${API}/health`, { status: 'offline' }),
         safe<ConfigState | null>(`${API}/config`, null),
         safe<TraceEntry[]>(traceUrl, []),
@@ -889,25 +952,30 @@ function HarnessApp() {
         safe<SessionState | null>(`${API}/session`, null),
         safe<SessionState[]>(`${API}/sessions`, []),
         safe<SkillMetadata[]>(`${API}/skills`, []),
-        safe<RepoContext | null>(`${API}/workspace/index`, null),
-        safe<{ output: string }>(`${API}/workspace/git/diff`, { output: '' }),
       ]);
 
       applyCoreState(health, cfg, tr, ap, pl, mrt, sess);
       setSessions(sessList);
       setSkills(sk);
-      setRepoContext(repo);
-      setGitDiff(diff.output);
+
+      if (includeHeavy) {
+        const [repo, diff] = await Promise.all([
+          safe<RepoContext | null>(`${API}/workspace/index`, null),
+          safe<{ output: string }>(`${API}/workspace/git/diff`, { output: '' }),
+        ]);
+        setRepoContext(repo);
+        setGitDiff(diff.output);
+      }
     } catch { setBackendStatus('offline'); }
-  }, []);
+  }, [repoContext, settingsOpen, settingsTab]);
 
   useEffect(() => {
-    void refreshDashboard('full');
+    void refreshDashboard('full', { includeHeavy: true });
     if (isSending) {
       return;
     }
-    const liveId = setInterval(() => void refreshDashboard('live'), 3000);
-    const fullId = setInterval(() => void refreshDashboard('full'), 15000);
+    const liveId = setInterval(() => void refreshDashboard('live'), LIVE_REFRESH_MS);
+    const fullId = setInterval(() => void refreshDashboard('full'), FULL_REFRESH_MS);
     return () => {
       clearInterval(liveId);
       clearInterval(fullId);
@@ -963,7 +1031,7 @@ function HarnessApp() {
     });
     setSession(created);
     setSelectedSkills(created.skillsActive);
-    await refreshDashboard();
+    await refreshDashboard('full', { includeHeavy: true });
     return created;
   }
 
@@ -976,7 +1044,7 @@ function HarnessApp() {
     setSession(created);
     setSelectedSkills(created.skillsActive);
     setMessages([]);
-    await refreshDashboard();
+    await refreshDashboard('full', { includeHeavy: true });
   }
 
   async function resumeSession(id: string) {
@@ -984,7 +1052,7 @@ function HarnessApp() {
     setSession(resumed);
     setSelectedSkills(resumed.skillsActive);
     setMessages([]);
-    await refreshDashboard();
+    await refreshDashboard('full', { includeHeavy: true });
   }
 
   async function bindWorkspaceSelection(selection: BrowserSelection, nativeWorkspaceRoot?: string | null): Promise<boolean> {
@@ -1006,7 +1074,7 @@ function HarnessApp() {
         });
       }
 
-      await refreshDashboard();
+      await refreshDashboard('full', { includeHeavy: true });
       setBrowserSelection(null);
       setBrowserPreview(null);
       setWorkspacePreview(null);
@@ -1064,11 +1132,10 @@ function HarnessApp() {
       };
       placeholderId = placeholder.id;
       const browserContext = buildBrowserContextMessage(browserSelection, browserPreview);
-      const activeSkillsForPrompt = isAgentic ? selectedSkills : selectedSkills.filter(s => s !== 'caveman');
       const prompt = buildSystemPrompt(chatMode, {
         workspace: config?.workspaceRoot,
         sessionId: activeSession.id,
-        selectedSkills: activeSkillsForPrompt,
+        selectedSkills,
         folderLabel: browserSelection?.label,
         selectedFile: workspacePreview?.path || browserPreview?.path,
         repoSummary: repoContext?.summary,
@@ -1112,6 +1179,11 @@ function HarnessApp() {
               ? { ...m, toolEvents: upsertToolEvent(m.toolEvents, event), status: m.status === 'sending' ? 'streaming' : m.status }
               : m
           )));
+          return;
+        }
+
+        if (event.type === 'approval') {
+          setApprovals(cur => mergeApprovalEvent(cur, event));
           return;
         }
 
@@ -1240,7 +1312,7 @@ function HarnessApp() {
       setStreamStatus('');
       setAttachedImages([]);
       setAttachmentNotice('');
-      await refreshDashboard();
+      await refreshDashboard('full', { includeHeavy: true });
     }
   }
 
@@ -1275,7 +1347,7 @@ function HarnessApp() {
       const rt = await fetchJson<ModelRuntimeState>(`${API}/model/runtime`);
       setModelRuntime(rt);
       setSettingsStatus(rt.lastSwitchResult?.message || 'Configuration saved.');
-      await refreshDashboard();
+      await refreshDashboard('full', { includeHeavy: true });
     } catch (err) {
       setSettingsStatus(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }
@@ -1287,7 +1359,7 @@ function HarnessApp() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ approved }),
     });
-    await refreshDashboard();
+    await refreshDashboard('full', { includeHeavy: true });
   }
 
   /* ─── Folder picker ─── */
@@ -1440,7 +1512,7 @@ function HarnessApp() {
 
         <div className="topbar-right">
           <button className="icon-btn" onClick={() => void startNewSession()} type="button" title="New Session">＋</button>
-          <button className="icon-btn" onClick={() => void refreshDashboard()} type="button" title="Refresh">↻</button>
+          <button className="icon-btn" onClick={() => void refreshDashboard('full', { includeHeavy: true })} type="button" title="Refresh">↻</button>
           <button
             className={`icon-btn ${settingsOpen ? 'icon-btn-active' : ''}`}
             onClick={() => setSettingsOpen(o => !o)}
@@ -1547,6 +1619,18 @@ function HarnessApp() {
               </div>
             </div>
           )}
+          {approvals.length > 0 && (
+            <div className="tool-execution-tracker approval-inline-panel">
+              <div className="tool-tracker-header">
+                <span>Approval Needed</span>
+                <span>{approvals.length}</span>
+              </div>
+              <div className="tool-summary-line">
+                Run paused on real approval. Approve or reject here without opening side panels.
+              </div>
+              <ApprovalCards approvals={approvals} onResolve={resolveApproval} />
+            </div>
+          )}
           <div className="composer-wrapper">
             <div className="composer">
               <div className="composer-meta">
@@ -1556,11 +1640,6 @@ function HarnessApp() {
                 <span className="composer-meta-pill" title={activeModelLabel}>
                   Model {shortenText(activeModelLabel, 20)}
                 </span>
-                {selectedSkills.includes('caveman') && isAgentic && (
-                  <span className="composer-meta-pill composer-meta-pill-accent" title="Caveman style applied to agentic output">
-                    Caveman
-                  </span>
-                )}
                 <span className="composer-meta-status">{streamStatus || plan?.currentPhase || 'Ready'}</span>
               </div>
               <textarea
@@ -1888,24 +1967,7 @@ function HarnessApp() {
                     {approvals.length === 0 ? (
                       <div className="empty-note">No pending approvals</div>
                     ) : (
-                      approvals.map(a => (
-                        <div key={a.id} className="approval-card">
-                          <div className="approval-card-head">
-                            <span className="approval-card-title">{a.changeType}</span>
-                            <span className={`approval-severity ${a.severity === 'danger' ? 'approval-severity-danger' : a.severity === 'info' ? 'approval-severity-info' : ''}`}>
-                              {a.severity}
-                            </span>
-                          </div>
-                          <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '6px' }}>{a.target}</div>
-                          {(a.diffPreview || a.warningMessage) && (
-                            <div className="approval-preview">{a.diffPreview || a.warningMessage}</div>
-                          )}
-                          <div className="approval-actions">
-                            <button className="approval-btn approval-btn-approve" onClick={() => void resolveApproval(a.id, true)} type="button">Approve</button>
-                            <button className="approval-btn approval-btn-reject" onClick={() => void resolveApproval(a.id, false)} type="button">Reject</button>
-                          </div>
-                        </div>
-                      ))
+                      <ApprovalCards approvals={approvals} onResolve={resolveApproval} />
                     )}
                   </div>
 

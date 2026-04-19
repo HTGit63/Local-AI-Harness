@@ -92,6 +92,12 @@ async function testToolRegistry() {
   assert.strictEqual(deniedResult.success, false);
   assert.ok(traces.length > 0);
 
+  const approvalsBeforeCommandEscape = approvals.length;
+  const commandEscapeResult = await registry.runCommand('cat ../outside.txt');
+  assert.strictEqual(commandEscapeResult.success, false);
+  assert.ok(commandEscapeResult.output.includes('outside the workspace root'));
+  assert.strictEqual(approvals.length, approvalsBeforeCommandEscape);
+
   await fs.mkdir(path.join(tempDir, 'nested'));
   await fs.writeFile(path.join(tempDir, 'nested', 'child.txt'), 'nested', 'utf8');
   const deleteDirectoryPromise = registry.deleteFile('nested');

@@ -8,6 +8,10 @@ import { promisify } from 'util';
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT_LINES = 200;
 const MAX_BUFFER_BYTES = 1024 * 1024;
+const MAX_WEB_RESULTS = 5;
+const MAX_WEB_FETCH_BYTES = 180_000;
+const MAX_WEB_FETCH_TEXT_CHARS = 16_000;
+const WEB_REQUEST_TIMEOUT_MS = 12_000;
 
 function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
@@ -102,6 +106,26 @@ function containsUnsupportedShellSyntax(command: string): boolean {
   return false;
 }
 
+function isUrlLikeArgument(value: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
+}
+
+function commandArgLooksLikePath(value: string): boolean {
+  if (!value || isUrlLikeArgument(value)) {
+    return false;
+  }
+
+  return (
+    path.isAbsolute(value) ||
+    value === '.' ||
+    value === '..' ||
+    value.startsWith('./') ||
+    value.startsWith('../') ||
+    value.startsWith('~/') ||
+    value.includes('/')
+  );
+}
+
 function truncateOutputResult(output: string): { text: string; truncated: boolean } {
   const lines = output.split('\n');
   if (lines.length <= MAX_OUTPUT_LINES) {
@@ -119,6 +143,145 @@ function truncateOutputResult(output: string): { text: string; truncated: boolea
 
 function truncateOutput(output: string): string {
   return truncateOutputResult(output).text;
+}
+
+function truncateChars(value: string, limit: number): { text: string; truncated: boolean } {
+  const normalized = value.trim();
+  if (normalized.length <= limit) {
+    return {
+      text: normalized,
+      truncated: false,
+    };
+  }
+
+  return {
+    text: `${normalized.slice(0, limit)}\n... output truncated ...`,
+    truncated: true,
+  };
+}
+
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
+function stripHtml(value: string): string {
+  return normalizeWhitespace(decodeHtmlEntities(value.replace(/<[^>]+>/g, ' ')));
+}
+
+function looksLikeHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function extractPageTitle(html: string): string | undefined {
+  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = match?.[1] ? stripHtml(match[1]) : '';
+  return title || undefined;
+}
+
+function extractReadableText(html: string): string {
+  const cleaned = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<\/(p|div|section|article|h[1-6]|li|tr)>/gi, '$&\n');
+  return stripHtml(cleaned);
+}
+
+function resolveDuckDuckGoResultUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  const absolute = trimmed.startsWith('//') ? `https:${trimmed}` : trimmed;
+
+  try {
+    const url = new URL(absolute, 'https://duckduckgo.com');
+    if (url.hostname.endsWith('duckduckgo.com')) {
+      const redirected = url.searchParams.get('uddg');
+      if (redirected && looksLikeHttpUrl(redirected)) {
+        return redirected;
+      }
+    }
+  } catch {
+    return absolute;
+  }
+
+  return absolute;
+}
+
+type ParsedWebSearchResult = {
+  title: string;
+  url: string;
+  snippet: string;
+};
+
+function parseDuckDuckGoResults(html: string): ParsedWebSearchResult[] {
+  const anchorPattern = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const anchors = Array.from(html.matchAll(anchorPattern));
+  const results: ParsedWebSearchResult[] = [];
+
+  for (let index = 0; index < anchors.length && results.length < MAX_WEB_RESULTS; index += 1) {
+    const match = anchors[index];
+    const rawUrl = match[1] || '';
+    const title = stripHtml(match[2] || '');
+    if (!rawUrl || !title) {
+      continue;
+    }
+
+    const start = match.index ?? 0;
+    const end = index + 1 < anchors.length ? (anchors[index + 1].index ?? html.length) : html.length;
+    const resultBlock = html.slice(start, end);
+    const snippetMatch = resultBlock.match(/result__snippet[^>]*>([\s\S]*?)<\/(?:a|div)>/i);
+    const snippet = stripHtml(snippetMatch?.[1] || '');
+    results.push({
+      title,
+      url: resolveDuckDuckGoResultUrl(rawUrl),
+      snippet,
+    });
+  }
+
+  return results;
+}
+
+async function fetchTextWithTimeout(url: string): Promise<{ text: string; contentType: string }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), WEB_REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      redirect: 'follow',
+      signal: controller.signal as AbortSignal,
+      headers: {
+        'User-Agent': 'GammaHarness/1.0 (+local agentic coding harness)',
+        'Accept': 'text/html, text/plain, application/json;q=0.9, text/markdown;q=0.8, */*;q=0.2',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Request failed: ${response.status} ${response.statusText}`);
+    }
+
+    const text = await response.text();
+    const clipped = text.length > MAX_WEB_FETCH_BYTES ? text.slice(0, MAX_WEB_FETCH_BYTES) : text;
+    return {
+      text: clipped,
+      contentType: response.headers.get('content-type') || 'text/plain',
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 function createSummaryPreview(filePath: string, before: string, after: string): string {
@@ -320,6 +483,31 @@ export class ToolRegistry {
       preview,
       metadata,
     });
+  }
+
+  private findCommandPathEscape(commandArgs: string[]): string | null {
+    for (const arg of commandArgs) {
+      if (!commandArgLooksLikePath(arg)) {
+        continue;
+      }
+
+      const normalizedArg = arg.startsWith('~/')
+        ? path.join(os.homedir(), arg.slice(2))
+        : arg;
+      const policy = this.context.checkPolicy('execute', normalizedArg);
+      if (!policy.allowed) {
+        return arg;
+      }
+    }
+
+    return null;
+  }
+
+  private internetDisabledResult(): ToolResult {
+    return {
+      success: false,
+      output: 'Denied: Internet access is disabled by harness configuration.',
+    };
   }
 
   private wrapExecution(name: string, inputSummary: string, executor: () => Promise<ToolResult>): Promise<ToolResult> {
@@ -535,6 +723,90 @@ export class ToolRegistry {
         }
         throw error;
       }
+    });
+  }
+
+  async webSearch(query: string): Promise<ToolResult> {
+    return this.wrapExecution('web_search', `Searching web for "${query}"`, async () => {
+      if (this.context.internetAccessEnabled === false) {
+        return this.internetDisabledResult();
+      }
+
+      const { text } = await fetchTextWithTimeout(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`);
+      const results = parseDuckDuckGoResults(text);
+      if (results.length === 0) {
+        return {
+          success: true,
+          output: `No web results found for "${query}".`,
+          metadata: {
+            webSearches: [{ query, engine: 'duckduckgo_html', resultCount: 0 }],
+          },
+        };
+      }
+
+      const output = [
+        `Web search results for "${query}"`,
+        ...results.map((result, index) => [
+          `${index + 1}. ${result.title}`,
+          `URL: ${result.url}`,
+          result.snippet ? `Snippet: ${result.snippet}` : null,
+        ].filter((entry): entry is string => Boolean(entry)).join('\n')),
+      ].join('\n\n');
+
+      const truncated = truncateChars(output, MAX_WEB_FETCH_TEXT_CHARS);
+      return {
+        success: true,
+        output: truncated.text,
+        metadata: {
+          webSearches: [{ query, engine: 'duckduckgo_html', resultCount: results.length }],
+          webFetches: results.map((result) => ({ url: result.url, title: result.title })),
+          truncated: truncated.truncated,
+        },
+      };
+    });
+  }
+
+  async fetchUrl(url: string): Promise<ToolResult> {
+    return this.wrapExecution('fetch_url', `Fetching ${url}`, async () => {
+      if (this.context.internetAccessEnabled === false) {
+        return this.internetDisabledResult();
+      }
+
+      if (!looksLikeHttpUrl(url)) {
+        return {
+          success: false,
+          output: 'Only http:// and https:// URLs are supported.',
+        };
+      }
+
+      const { text, contentType } = await fetchTextWithTimeout(url);
+      const normalizedType = contentType.toLowerCase();
+      if (!/(text\/|application\/json|application\/xml|application\/xhtml\+xml)/.test(normalizedType)) {
+        return {
+          success: false,
+          output: `Unsupported content type: ${contentType}`,
+        };
+      }
+
+      const isHtml = /text\/html|application\/xhtml\+xml/.test(normalizedType);
+      const title = isHtml ? extractPageTitle(text) : undefined;
+      const body = isHtml ? extractReadableText(text) : normalizeWhitespace(text);
+      const truncated = truncateChars(body, MAX_WEB_FETCH_TEXT_CHARS);
+
+      return {
+        success: true,
+        output: [
+          `Source: ${url}`,
+          title ? `Title: ${title}` : null,
+          `Content-Type: ${contentType}`,
+          '',
+          truncated.text || 'No readable text found.',
+        ].filter((entry): entry is string => entry !== null).join('\n'),
+        metadata: {
+          webFetches: [{ url, title }],
+          truncated: truncated.truncated || text.length > MAX_WEB_FETCH_BYTES,
+        },
+      };
     });
   }
 
@@ -805,13 +1077,6 @@ export class ToolRegistry {
       }
 
       const preview = `Run command: ${command}`;
-      if (policy.requiresApproval) {
-        const approved = await this.withApproval('run_command', command, preview);
-        if (!approved) {
-          return { success: false, output: 'Rejected by user.', preview };
-        }
-      }
-
       const tokens = tokenizeCommand(command);
       const [commandName, ...commandArgs] = tokens;
 
@@ -821,6 +1086,22 @@ export class ToolRegistry {
           output: 'Command is empty.',
           preview,
         };
+      }
+
+      const escapedArg = this.findCommandPathEscape(commandArgs);
+      if (escapedArg) {
+        return {
+          success: false,
+          output: `Denied: Command argument "${escapedArg}" resolves outside the workspace root.`,
+          preview,
+        };
+      }
+
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('run_command', command, preview);
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview };
+        }
       }
 
       const commandStartedAt = Date.now();

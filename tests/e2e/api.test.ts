@@ -153,6 +153,154 @@ async function stopMockModelServer(server: http.Server) {
   });
 }
 
+async function fetchNdjsonWithIntervention(
+  url: string,
+  init: RequestInit,
+  onEvent?: (event: Record<string, unknown>) => Promise<void> | void,
+): Promise<Array<Record<string, unknown>>> {
+  const response = await fetch(url, init);
+  if (!response.ok) {
+    const body = await response.text();
+    assert.fail(`Request failed for ${url}: ${response.status} ${body}`);
+  }
+  assert.ok(response.body, `No response body for ${url}`);
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  const events: Array<Record<string, unknown>> = [];
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+
+        const event = JSON.parse(trimmed) as Record<string, unknown>;
+        events.push(event);
+        await onEvent?.(event);
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const event = JSON.parse(buffer.trim()) as Record<string, unknown>;
+      events.push(event);
+      await onEvent?.(event);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return events;
+}
+
+async function startApprovalFlowMockModelServer(): Promise<{ server: http.Server; baseUrl: string; getChatRequests: () => any[] }> {
+  const chatRequests: any[] = [];
+  const server = http.createServer((req, res) => {
+    const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    const chunks: Buffer[] = [];
+
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      const body = rawBody.trim() ? JSON.parse(rawBody) : {};
+
+      if (requestUrl.pathname === '/api/tags') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ models: [{ name: 'gemma4:e4b' }] }));
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/ps') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ models: [{ name: 'gemma4:e4b', model: 'gemma4:e4b', context_length: 8192 }] }));
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/show') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ capabilities: ['completion', 'thinking'] }));
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/chat') {
+        chatRequests.push(body);
+        const hasToolResults = Array.isArray(body.messages) && body.messages.some((message: { role?: string }) => message.role === 'tool');
+
+        const firstPayload = hasToolResults
+          ? {
+              model: 'mock-native',
+              message: { role: 'assistant', content: 'Complex task finished after approval.' },
+              done: false,
+            }
+          : {
+              model: 'mock-native',
+              message: {
+                role: 'assistant',
+                tool_calls: [
+                  { function: { name: 'readFile', arguments: { filePath: 'src/index.ts' } } },
+                  { function: { name: 'writeFile', arguments: { filePath: 'notes.txt', content: 'approved complex content\n' } } },
+                ],
+              },
+              done: false,
+            };
+
+        const donePayload = {
+          model: 'mock-native',
+          message: {},
+          done: true,
+          done_reason: hasToolResults ? 'stop' : 'tool_calls',
+          prompt_eval_count: 10,
+          eval_count: hasToolResults ? 12 : 8,
+        };
+
+        if (body.stream) {
+          res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' });
+          res.write(`${JSON.stringify(firstPayload)}\n`);
+          res.write(`${JSON.stringify(donePayload)}\n`);
+          res.end();
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          model: 'mock-native',
+          message: firstPayload.message,
+          done: true,
+          done_reason: donePayload.done_reason,
+          prompt_eval_count: donePayload.prompt_eval_count,
+          eval_count: donePayload.eval_count,
+        }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    getChatRequests: () => [...chatRequests],
+  };
+}
+
 async function startApiServer(workspaceRoot: string, modelBaseUrl?: string): Promise<ChildProcessWithoutNullStreams> {
   const child = spawn('node', [API_PATH], {
     cwd: ROOT,
@@ -365,7 +513,66 @@ async function testApiWorkflow() {
   }
 }
 
-testApiWorkflow()
+async function testApiApprovalStreamResumesComplexTask() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-api-approval-'));
+  const mockModel = await startApprovalFlowMockModelServer();
+  const server = await startApiServer(workspaceRoot, mockModel.baseUrl);
+  let approvalResolved = false;
+
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
+
+  try {
+    const events = await fetchNdjsonWithIntervention(`${API_BASE}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [{
+          role: 'user',
+          content: 'Read src/index.ts, create notes.txt, wait for approval, then summarize result.',
+        }],
+      }),
+    }, async (event) => {
+      if (event.type === 'approval' && event.state === 'pending' && !approvalResolved) {
+        approvalResolved = true;
+        const approval = event.approval as { id: string };
+        const resolution = await fetchJson<{ resolved: boolean }>(`${API_BASE}/api/approvals/${approval.id}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ approved: true }),
+        });
+        assert.strictEqual(resolution.resolved, true);
+      }
+    });
+
+    const firstRequest = mockModel.getChatRequests()[0];
+    assert.ok(Array.isArray(firstRequest?.tools));
+    assert.ok(firstRequest.tools.length > 0);
+
+    const approvalPending = events.find((event) => event.type === 'approval' && event.state === 'pending');
+    assert.ok(approvalPending);
+    const approvalResolvedEvent = events.find((event) => event.type === 'approval' && event.state === 'resolved');
+    assert.ok(approvalResolvedEvent);
+
+    const statusTexts = events
+      .filter((event) => event.type === 'status')
+      .map((event) => String(event.action || ''));
+    assert.ok(statusTexts.some((text) => text.includes('Approval required for notes.txt')));
+
+    const doneEvent = events.find((event) => event.type === 'done');
+    assert.ok(String(doneEvent?.response || '').includes('Complex task finished after approval.'));
+    assert.ok(String(doneEvent?.response || '').includes('What I did:'));
+    assert.strictEqual(await fs.readFile(path.join(workspaceRoot, 'notes.txt'), 'utf8'), 'approved complex content\n');
+  } finally {
+    await stopApiServer(server);
+    await stopMockModelServer(mockModel.server);
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+Promise.resolve()
+  .then(() => testApiWorkflow())
+  .then(() => testApiApprovalStreamResumesComplexTask())
   .then(() => {
     console.log('api e2e tests passed');
   })
