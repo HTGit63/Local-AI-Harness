@@ -19,13 +19,14 @@ const MAX_IMAGE_ATTACHMENTS = 2;
 const MAX_IMAGE_BYTES = 1024 * 1024;
 const AGENTIC_STORAGE_KEY = 'gamma-harness.agentic-mode';
 const LIVE_REFRESH_MS = 6000;
+const ACTIVE_RUN_REFRESH_MS = 1500;
 const FULL_REFRESH_MS = 45000;
 
 /* ─────────── Types ─────────── */
 type ChatRole = 'user' | 'assistant';
 type ConversationMode = 'general' | 'architecture' | 'data-analysis' | 'code-review' | 'implementation';
 type BackendStatus = 'ok' | 'degraded' | 'offline';
-type SettingsTab = 'connection' | 'workspace' | 'sessions' | 'activity';
+type SettingsTab = 'connection' | 'workspace' | 'sessions' | 'activity' | 'agent';
 type ExecutionMode = 'direct' | 'agentic';
 
 interface ChatToolEvent {
@@ -69,6 +70,13 @@ interface ConfigState {
   mode: string;
   workspaceRoot: string;
   sessionDataDir: string;
+  internetAccessEnabled: boolean;
+  streamIdleTimeoutMs: number;
+  contextBudget: number;
+  toolRetryMax: number;
+  sessionMemoryEnabled: boolean;
+  sessionMemoryTurns: number;
+  selfCheckEnabled: boolean;
 }
 
 interface SessionState {
@@ -87,6 +95,13 @@ interface SessionState {
     messageCount: number;
     thinkingEnabled?: boolean;
     imageCount?: number;
+    intent?: string;
+    summary?: string;
+    runSummary?: {
+      summary?: string;
+      workspaceSource?: 'backend' | 'browser_snapshot';
+      workspaceBound?: boolean;
+    };
   }>;
 }
 
@@ -115,6 +130,34 @@ interface PlanState {
   blockers: string[];
   isComplete: boolean;
   finalOutcome?: string;
+  workspaceRoot?: string;
+  workspaceSource?: 'backend' | 'browser_snapshot';
+  workspaceBound?: boolean;
+  toolProtocol?: 'native' | 'manual';
+  internetAccessEnabled?: boolean;
+  contextBudget?: number;
+  toolRetryMax?: number;
+  sessionMemoryEnabled?: boolean;
+  sessionMemoryTurns?: number;
+  selfCheckEnabled?: boolean;
+  lastStatus?: string;
+  currentRunId?: string;
+  currentTool?: string;
+  runSteps?: Array<{
+    id: string;
+    type: string;
+    title: string;
+    status: 'running' | 'done' | 'error' | 'skipped';
+    detail?: string;
+    toolName?: string;
+  }>;
+  runSummary?: {
+    id: string;
+    summary?: string;
+    changedFiles?: number;
+    addedLines?: number;
+    removedLines?: number;
+  };
 }
 
 interface SkillMetadata {
@@ -198,6 +241,8 @@ interface AgentRunSummary {
   filesDeleted: string[];
   directoriesCreated: string[];
   searches: Array<{ query: string; pattern?: string }>;
+  webSearches: Array<{ query: string; engine: string; resultCount: number }>;
+  webFetches: Array<{ url: string; title?: string }>;
   commands: Array<{ command: string; success: boolean; durationMs?: number }>;
   approvals: Array<{ id: string; target: string; approved: boolean | null }>;
   git?: {
@@ -299,10 +344,61 @@ const CHAT_MODES: Array<{ id: ConversationMode; label: string }> = [
 ];
 
 const SETTINGS_TABS: Array<{ id: SettingsTab; label: string }> = [
-  { id: 'connection', label: 'Connection' },
+  { id: 'connection', label: 'Runtime' },
   { id: 'workspace', label: 'Workspace' },
+  { id: 'agent', label: 'Agent' },
   { id: 'sessions', label: 'Sessions' },
   { id: 'activity', label: 'Activity' },
+];
+
+const AGENT_PRESETS: Array<{
+  id: 'lean' | 'balanced' | 'autonomous';
+  title: string;
+  note: string;
+  values: Pick<ConfigState, 'contextBudget' | 'toolRetryMax' | 'sessionMemoryEnabled' | 'sessionMemoryTurns' | 'selfCheckEnabled' | 'internetAccessEnabled' | 'streamIdleTimeoutMs'>;
+}> = [
+  {
+    id: 'lean',
+    title: 'Lean Local',
+    note: 'Fast local loop. Tight context. Minimal retries.',
+    values: {
+      contextBudget: 16000,
+      toolRetryMax: 1,
+      sessionMemoryEnabled: true,
+      sessionMemoryTurns: 2,
+      selfCheckEnabled: true,
+      internetAccessEnabled: false,
+      streamIdleTimeoutMs: 30000,
+    },
+  },
+  {
+    id: 'balanced',
+    title: 'Balanced Harness',
+    note: 'Good default. Memory on. Verifies edits.',
+    values: {
+      contextBudget: 24000,
+      toolRetryMax: 2,
+      sessionMemoryEnabled: true,
+      sessionMemoryTurns: 3,
+      selfCheckEnabled: true,
+      internetAccessEnabled: true,
+      streamIdleTimeoutMs: 45000,
+    },
+  },
+  {
+    id: 'autonomous',
+    title: 'Deep Agent',
+    note: 'Bigger context and more retries for long task runs.',
+    values: {
+      contextBudget: 32000,
+      toolRetryMax: 4,
+      sessionMemoryEnabled: true,
+      sessionMemoryTurns: 5,
+      selfCheckEnabled: true,
+      internetAccessEnabled: true,
+      streamIdleTimeoutMs: 60000,
+    },
+  },
 ];
 
 /* ─────────── Utility functions ─────────── */
@@ -389,6 +485,69 @@ function shortenText(val: string, max = 44): string {
   const h = Math.max(10, Math.floor((max - 3) / 2));
   const t = Math.max(8, max - h - 3);
   return `${val.slice(0, h)}...${val.slice(-t)}`;
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function getPermissionModeSummary(mode: string | undefined): string {
+  switch (mode) {
+    case 'read-only':
+      return 'Reads only. Writes, deletes, and commands denied.';
+    case 'danger':
+      return 'No approvals inside workspace. Outside-workspace actions still denied.';
+    default:
+      return 'Writes preview + approval. Deletes and commands require approval.';
+  }
+}
+
+function summarizeTurnIntent(turn: NonNullable<SessionState['turnHistory']>[number] | undefined): string {
+  if (!turn) return 'No recent turn';
+  if (turn.runSummary?.summary) return turn.runSummary.summary;
+  if (turn.promptMode) return `${turn.executionMode} · ${turn.promptMode}`;
+  return `${turn.executionMode} turn`;
+}
+
+function formatTraceHeadline(trace: TraceEntry): string {
+  const data = trace.data as Record<string, any> | undefined;
+  switch (trace.type) {
+    case 'planner_trace':
+      return data?.state?.intendedNextAction || data?.state?.currentPhase || 'Planner updated';
+    case 'run_step_started':
+    case 'run_step_finished':
+      return data?.step?.title || data?.step?.toolName || 'Run step';
+    case 'run_summary_ready':
+      return data?.summary || 'Run summary ready';
+    case 'manual_tool_fallback':
+      return data?.reason || 'Manual fallback active';
+    case 'manual_tool_strategy_selected':
+      return data?.reason || 'Manual tool strategy selected';
+    case 'tool_simulation_detected':
+      return data?.preview || 'Tool simulation detected';
+    case 'stream_idle_timeout_retry':
+      return `Stream stalled after ${data?.timeoutMs ?? 0}ms; retrying non-stream`;
+    case 'stream_idle_timeout_partial':
+      return `Stream stalled after ${data?.timeoutMs ?? 0}ms with partial output`;
+    case 'repo_context_loaded':
+      return `${data?.fileCount ?? 0} files indexed`;
+    case 'chat_execution_plan':
+      return `Intent ${data?.intent || 'unknown'} · ${data?.toolProtocolMode || 'native'} tools`;
+    case 'model_switch_completed':
+      return data?.message || 'Model switch completed';
+    default:
+      return typeof data?.message === 'string'
+        ? data.message
+        : typeof data?.reason === 'string'
+          ? data.reason
+          : typeof data?.summary === 'string'
+            ? data.summary
+            : 'Open for payload';
+  }
 }
 
 function truncatePreview(content: string) {
@@ -823,6 +982,13 @@ function HarnessApp() {
   const [profileDraft, setProfileDraft] = useState('balanced');
   const [modeDraft, setModeDraft] = useState('workspace-write');
   const [workspaceRootDraft, setWorkspaceRootDraft] = useState('');
+  const [internetAccessDraft, setInternetAccessDraft] = useState(true);
+  const [streamIdleTimeoutDraft, setStreamIdleTimeoutDraft] = useState('45');
+  const [contextBudgetDraft, setContextBudgetDraft] = useState('24000');
+  const [toolRetryMaxDraft, setToolRetryMaxDraft] = useState('2');
+  const [sessionMemoryEnabledDraft, setSessionMemoryEnabledDraft] = useState(true);
+  const [sessionMemoryTurnsDraft, setSessionMemoryTurnsDraft] = useState('3');
+  const [selfCheckEnabledDraft, setSelfCheckEnabledDraft] = useState(true);
   const [settingsStatus, setSettingsStatus] = useState('');
 
   // Refs
@@ -859,6 +1025,43 @@ function HarnessApp() {
   }, [browserFilter, sidebarSelection]);
 
   const activeModelLabel = modelRuntime?.activeModel || config?.model || 'No model';
+  const recentTurns = useMemo(
+    () => (session?.turnHistory ? [...session.turnHistory].slice(-4).reverse() : []),
+    [session?.turnHistory],
+  );
+  const latestSessionTurn = useMemo(
+    () => (session?.turnHistory && session.turnHistory.length > 0 ? session.turnHistory[session.turnHistory.length - 1] : undefined),
+    [session?.turnHistory],
+  );
+  const activeAgentPreset = useMemo(
+    () => AGENT_PRESETS.find((preset) =>
+      preset.values.contextBudget === Number(contextBudgetDraft || 0) &&
+      preset.values.toolRetryMax === Number(toolRetryMaxDraft || 0) &&
+      preset.values.sessionMemoryEnabled === sessionMemoryEnabledDraft &&
+      preset.values.sessionMemoryTurns === Number(sessionMemoryTurnsDraft || 0) &&
+      preset.values.selfCheckEnabled === selfCheckEnabledDraft &&
+      preset.values.internetAccessEnabled === internetAccessDraft &&
+      preset.values.streamIdleTimeoutMs === Number(streamIdleTimeoutDraft || 0) * 1000,
+    )?.id || null,
+    [
+      contextBudgetDraft,
+      internetAccessDraft,
+      selfCheckEnabledDraft,
+      sessionMemoryEnabledDraft,
+      sessionMemoryTurnsDraft,
+      streamIdleTimeoutDraft,
+      toolRetryMaxDraft,
+    ],
+  );
+  const livePlanSteps = useMemo(
+    () => (plan?.runSteps ? [...plan.runSteps].slice(-6).reverse() : []),
+    [plan?.runSteps],
+  );
+  const liveTraceEntries = useMemo(
+    () => [...traces].slice(-6).reverse(),
+    [traces],
+  );
+  const liveActivityBadge = streamStatus || plan?.lastStatus || plan?.currentPhase || 'Ready';
 
   /* ─── Refresh dashboard data ─── */
   const refreshDashboard = useCallback(async (
@@ -914,6 +1117,13 @@ function HarnessApp() {
             model: cfg.model,
             profile: cfg.profile,
             mode: cfg.mode,
+            internetAccessEnabled: cfg.internetAccessEnabled,
+            streamIdleTimeoutMs: cfg.streamIdleTimeoutMs,
+            contextBudget: cfg.contextBudget,
+            toolRetryMax: cfg.toolRetryMax,
+            sessionMemoryEnabled: cfg.sessionMemoryEnabled,
+            sessionMemoryTurns: cfg.sessionMemoryTurns,
+            selfCheckEnabled: cfg.selfCheckEnabled,
           });
 
           if (sig !== lastConfigSigRef.current) {
@@ -923,6 +1133,13 @@ function HarnessApp() {
             setModelDraft(cfg.model);
             setProfileDraft(cfg.profile);
             setModeDraft(cfg.mode);
+            setInternetAccessDraft(cfg.internetAccessEnabled);
+            setStreamIdleTimeoutDraft(String(Math.round(cfg.streamIdleTimeoutMs / 1000)));
+            setContextBudgetDraft(String(cfg.contextBudget));
+            setToolRetryMaxDraft(String(cfg.toolRetryMax));
+            setSessionMemoryEnabledDraft(cfg.sessionMemoryEnabled);
+            setSessionMemoryTurnsDraft(String(cfg.sessionMemoryTurns));
+            setSelfCheckEnabledDraft(cfg.selfCheckEnabled);
           }
         }
       };
@@ -970,15 +1187,19 @@ function HarnessApp() {
   }, [repoContext, settingsOpen, settingsTab]);
 
   useEffect(() => {
-    void refreshDashboard('full', { includeHeavy: true });
-    if (isSending) {
-      return;
-    }
-    const liveId = setInterval(() => void refreshDashboard('live'), LIVE_REFRESH_MS);
-    const fullId = setInterval(() => void refreshDashboard('full'), FULL_REFRESH_MS);
+    void refreshDashboard(isSending ? 'live' : 'full', { includeHeavy: !isSending });
+    const liveId = setInterval(
+      () => void refreshDashboard('live'),
+      isSending ? ACTIVE_RUN_REFRESH_MS : LIVE_REFRESH_MS,
+    );
+    const fullId = !isSending
+      ? setInterval(() => void refreshDashboard('full'), FULL_REFRESH_MS)
+      : undefined;
     return () => {
       clearInterval(liveId);
-      clearInterval(fullId);
+      if (fullId) {
+        clearInterval(fullId);
+      }
     };
   }, [isSending, refreshDashboard]);
 
@@ -1095,6 +1316,19 @@ function HarnessApp() {
     await bindWorkspaceSelection(selection, nativeWorkspaceRoot);
   }
 
+  function applyAgentPreset(presetId: 'lean' | 'balanced' | 'autonomous') {
+    const preset = AGENT_PRESETS.find((entry) => entry.id === presetId);
+    if (!preset) return;
+    setContextBudgetDraft(String(preset.values.contextBudget));
+    setToolRetryMaxDraft(String(preset.values.toolRetryMax));
+    setSessionMemoryEnabledDraft(preset.values.sessionMemoryEnabled);
+    setSessionMemoryTurnsDraft(String(preset.values.sessionMemoryTurns));
+    setSelfCheckEnabledDraft(preset.values.selfCheckEnabled);
+    setInternetAccessDraft(preset.values.internetAccessEnabled);
+    setStreamIdleTimeoutDraft(String(Math.round(preset.values.streamIdleTimeoutMs / 1000)));
+    setSettingsStatus(`${preset.title} preset loaded. Save to apply.`);
+  }
+
   /* ─── Chat ─── */
   async function sendChat() {
     const content = draft.trim();
@@ -1204,6 +1438,8 @@ function HarnessApp() {
                     filesDeleted: [],
                     directoriesCreated: [],
                     searches: [],
+                    webSearches: [],
+                    webFetches: [],
                     commands: [],
                     approvals: [],
                     usedManualFallback: false,
@@ -1322,6 +1558,26 @@ function HarnessApp() {
       setSettingsStatus('All fields are required.');
       return;
     }
+    const contextBudget = Number(contextBudgetDraft);
+    const toolRetryMax = Number(toolRetryMaxDraft);
+    const sessionMemoryTurns = Number(sessionMemoryTurnsDraft);
+    const streamIdleTimeoutSeconds = Number(streamIdleTimeoutDraft);
+    if (!Number.isFinite(contextBudget) || contextBudget < 4000) {
+      setSettingsStatus('Context budget must be at least 4000.');
+      return;
+    }
+    if (!Number.isFinite(toolRetryMax) || toolRetryMax < 0) {
+      setSettingsStatus('Tool retry max must be 0 or greater.');
+      return;
+    }
+    if (!Number.isFinite(sessionMemoryTurns) || sessionMemoryTurns < 1) {
+      setSettingsStatus('Session memory turns must be at least 1.');
+      return;
+    }
+    if (!Number.isFinite(streamIdleTimeoutSeconds) || streamIdleTimeoutSeconds < 0) {
+      setSettingsStatus('Stream stall limit must be 0 seconds or greater.');
+      return;
+    }
     const changingModel = config?.model !== modelDraft.trim();
     const changingWorkspace = config?.workspaceRoot !== workspaceRootDraft.trim();
     const shouldActivate = changingModel || modelRuntime?.activeModel !== modelDraft.trim();
@@ -1336,6 +1592,13 @@ function HarnessApp() {
           model: modelDraft.trim(),
           profile: profileDraft,
           mode: modeDraft,
+          internetAccessEnabled: internetAccessDraft,
+          streamIdleTimeoutMs: Math.round(streamIdleTimeoutSeconds * 1000),
+          contextBudget,
+          toolRetryMax,
+          sessionMemoryEnabled: sessionMemoryEnabledDraft,
+          sessionMemoryTurns,
+          selfCheckEnabled: selfCheckEnabledDraft,
           activateModel: shouldActivate,
         }),
       });
@@ -1492,7 +1755,10 @@ function HarnessApp() {
       <header className="topbar">
         <div className="topbar-left">
           <div className="topbar-logo">G4</div>
-          <span className="topbar-title">Gamma 4 Harness</span>
+          <div className="topbar-brand">
+            <span className="topbar-kicker">Local Agent Harness</span>
+            <span className="topbar-title">Gamma 4 Command Center</span>
+          </div>
         </div>
 
         <div className="topbar-center">
@@ -1502,6 +1768,12 @@ function HarnessApp() {
           </div>
           <div className="topbar-badge">
             <strong>{activeModelLabel}</strong>
+          </div>
+          <div className="topbar-badge">
+            <strong>{isAgentic ? 'Agentic' : 'Direct'}</strong>
+          </div>
+          <div className="topbar-badge">
+            <strong>{config?.mode || 'workspace-write'}</strong>
           </div>
           {session && (
             <div className="topbar-badge">
@@ -1580,12 +1852,166 @@ function HarnessApp() {
 
         {/* ── Chat Panel ── */}
         <main className="chat-panel">
+          <section className="command-center">
+            <div className="command-center-hero">
+              <div className="command-center-copy">
+                <span className="command-center-kicker">Harness posture</span>
+                <h1>{isAgentic ? 'Agent loop armed for real work' : 'Direct pair mode for low-friction help'}</h1>
+                <p>
+                  Borrowed carefully from Osaurus and qwe-qwe: visible runtime state, compact memory, retry budget, and verification posture
+                  should stay visible while you work, not buried in logs.
+                </p>
+              </div>
+              <div className="command-center-meta">
+                <div className="command-center-meta-card">
+                  <span className="command-center-meta-label">Workspace</span>
+                  <strong>{config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 28) : 'Not bound'}</strong>
+                  <span>{plan?.workspaceBound === false ? 'Snapshot only' : 'Backend bound'}</span>
+                </div>
+                <div className="command-center-meta-card">
+                  <span className="command-center-meta-label">Current phase</span>
+                  <strong>{streamStatus || plan?.currentPhase || 'ready'}</strong>
+                  <span>{plan?.intendedNextAction || 'Awaiting input'}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="command-center-grid">
+              <div className="command-center-card command-center-card-primary">
+                <span className="command-center-card-label">Agent</span>
+                <strong>{isAgentic ? 'Agent loop' : 'Direct chat'}</strong>
+                <p>{isAgentic ? 'Inspect → act → verify → summarize.' : 'Lean answers without heavy orchestration.'}</p>
+                <div className="command-center-chip-row">
+                  <span className="command-center-chip">{thinkingEnabled ? 'Thinking on' : 'Thinking off'}</span>
+                  <span className="command-center-chip">{config?.selfCheckEnabled ? 'Self-check on' : 'Self-check off'}</span>
+                </div>
+              </div>
+              <div className="command-center-card">
+                <span className="command-center-card-label">Memory</span>
+                <strong>{config?.sessionMemoryEnabled ? `${config.sessionMemoryTurns} recent turns` : 'Disabled'}</strong>
+                <p>{config?.sessionMemoryEnabled ? 'Keeps the agent anchored to the last completed work.' : 'Each turn starts cold.'}</p>
+              </div>
+              <div className="command-center-card">
+                <span className="command-center-card-label">Context</span>
+                <strong>{config?.contextBudget ? `${Math.round(config.contextBudget / 1000)}k chars` : 'Unknown'}</strong>
+                <p>{repoContext?.summary ? shortenText(repoContext.summary, 90) : 'Repo summary loads when indexing completes.'}</p>
+              </div>
+              <div className="command-center-card">
+                <span className="command-center-card-label">Recovery</span>
+                <strong>{config?.toolRetryMax ?? 0} correction retries</strong>
+                <p>{config?.internetAccessEnabled ? 'Internet tools available when needed.' : 'Offline-first local execution.'}</p>
+              </div>
+            </div>
+
+            {recentTurns.length > 0 && (
+              <div className="command-center-timeline">
+                <div className="command-center-section-head">
+                  <span>Recent continuity memory</span>
+                  <span>{recentTurns.length}</span>
+                </div>
+                <div className="command-center-timeline-list">
+                  {recentTurns.map((turn) => (
+                    <div key={turn.timestamp} className="command-center-timeline-item">
+                      <span className="command-center-timeline-time">{formatTime(turn.timestamp)}</span>
+                      <div>
+                        <strong>{turn.intent || `${turn.executionMode} turn`}</strong>
+                        <p>{summarizeTurnIntent(turn)}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+
+          {(isAgentic || isSending || Boolean(plan?.currentRunId) || livePlanSteps.length > 0) && (
+            <section className="activity-deck">
+              <div className="activity-card activity-card-primary">
+                <div className="command-center-section-head">
+                  <span>Live Activity</span>
+                  <span>{liveActivityBadge}</span>
+                </div>
+                <div className="activity-summary-grid">
+                  <div className="activity-summary-item">
+                    <span>Phase</span>
+                    <strong>{plan?.currentPhase || streamStatus || 'ready'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Next</span>
+                    <strong>{plan?.intendedNextAction || 'Awaiting input'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Current Tool</span>
+                    <strong>{plan?.currentTool || 'None'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Tool Path</span>
+                    <strong>{plan?.toolProtocol || 'native'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Workspace</span>
+                    <strong>{plan?.workspaceBound === false ? 'Snapshot only' : 'Backend bound'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Approvals</span>
+                    <strong>{approvals.length > 0 ? `${approvals.length} pending` : 'Clear'}</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="activity-card">
+                <div className="command-center-section-head">
+                  <span>Run Steps</span>
+                  <span>{livePlanSteps.length}</span>
+                </div>
+                {livePlanSteps.length === 0 ? (
+                  <div className="empty-note">No live run steps yet</div>
+                ) : (
+                  <div className="activity-step-list">
+                    {livePlanSteps.map((step) => (
+                      <div key={step.id} className={`activity-step-card activity-step-card-${step.status}`}>
+                        <div className="activity-step-meta">
+                          <span>{step.type}</span>
+                          <span>{step.status}</span>
+                        </div>
+                        <strong>{step.title}</strong>
+                        <p>{step.detail || step.toolName || 'Running.'}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="activity-card">
+                <div className="command-center-section-head">
+                  <span>Recent Trace</span>
+                  <span>{liveTraceEntries.length}</span>
+                </div>
+                {liveTraceEntries.length === 0 ? (
+                  <div className="empty-note">No trace events yet</div>
+                ) : (
+                  <div className="activity-trace-list">
+                    {liveTraceEntries.map((trace, index) => (
+                      <div key={`${trace.timestamp}-${trace.type}-${index}`} className="activity-trace-row">
+                        <div className="activity-trace-meta">
+                          <span>{formatTime(trace.timestamp)}</span>
+                          <span>{trace.type}</span>
+                        </div>
+                        <strong>{formatTraceHeadline(trace)}</strong>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
+
           <div className="chat-messages" ref={chatScrollRef}>
             {messages.length === 0 ? (
               <div className="chat-welcome">
                 <div className="chat-welcome-logo">G4</div>
                 <h2>Gamma 4 Harness</h2>
-                <p>Open folder to move real AI workspace. If path binding fails, harness keeps picked folder as read-only browser context and avoids faking tool access.</p>
+                <p>Bind a real workspace, then drive the agent with visible memory, retry, and verification controls instead of hidden prompt luck.</p>
                 <div className="chat-welcome-hints">
                   <button className="hint-chip" onClick={() => { setDraft('Review the codebase and summarize the architecture'); }} type="button">
                     Review architecture
@@ -1639,6 +2065,12 @@ function HarnessApp() {
                 </span>
                 <span className="composer-meta-pill" title={activeModelLabel}>
                   Model {shortenText(activeModelLabel, 20)}
+                </span>
+                <span className="composer-meta-pill">
+                  Memory {config?.sessionMemoryEnabled ? `${config.sessionMemoryTurns}` : 'off'}
+                </span>
+                <span className="composer-meta-pill">
+                  Retry {config?.toolRetryMax ?? 0}
                 </span>
                 <span className="composer-meta-status">{streamStatus || plan?.currentPhase || 'Ready'}</span>
               </div>
@@ -1712,6 +2144,17 @@ function HarnessApp() {
                     type="button"
                   >
                     {thinkingEnabled ? 'Thinking on' : 'Thinking off'}
+                  </button>
+                  <button
+                    className="composer-toggle"
+                    onClick={() => {
+                      setSettingsOpen(true);
+                      setSettingsTab('agent');
+                    }}
+                    type="button"
+                    title="Open agent controls"
+                  >
+                    Agent controls
                   </button>
                 </div>
                 <div className="composer-actions-right">
@@ -1843,6 +2286,34 @@ function HarnessApp() {
                         <span>{modelRuntime?.configuredModelCapabilities?.join(', ') || 'Unknown'}</span>
                       </div>
                       <div className="settings-info-row">
+                        <span>Internet</span>
+                        <span>{config?.internetAccessEnabled ? 'Enabled' : 'Disabled'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Stream Stall Limit</span>
+                        <span>{config?.streamIdleTimeoutMs ? `${Math.round(config.streamIdleTimeoutMs / 1000)}s` : 'Off'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Context Budget</span>
+                        <span>{config?.contextBudget ? `${config.contextBudget.toLocaleString()} chars` : 'Unknown'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Retry Budget</span>
+                        <span>{config?.toolRetryMax ?? 0}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Session Memory</span>
+                        <span>{config?.sessionMemoryEnabled ? `${config.sessionMemoryTurns} turns` : 'Off'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Self-check</span>
+                        <span>{config?.selfCheckEnabled ? 'Required' : 'Disabled'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Command Policy</span>
+                        <span>{getPermissionModeSummary(config?.mode)}</span>
+                      </div>
+                      <div className="settings-info-row">
                         <span>Running</span>
                         <span>{modelRuntime?.runningModels.map(m => m.model).join(', ') || 'None'}</span>
                       </div>
@@ -1918,6 +2389,122 @@ function HarnessApp() {
                 </>
               )}
 
+              {/* Agent Tab */}
+              {settingsTab === 'agent' && (
+                <>
+                  <div className="settings-section">
+                    <div className="settings-section-title">Agent Presets</div>
+                    <div className="agent-preset-grid">
+                      {AGENT_PRESETS.map((preset) => (
+                        <button
+                          key={preset.id}
+                          className={`agent-preset-card ${activeAgentPreset === preset.id ? 'agent-preset-card-active' : ''}`}
+                          onClick={() => applyAgentPreset(preset.id)}
+                          type="button"
+                        >
+                          <strong>{preset.title}</strong>
+                          <span>{preset.note}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="settings-section">
+                    <div className="settings-section-title">Agent Controls</div>
+                    <div className="settings-row">
+                      <div className="settings-field">
+                        <label>Context Budget</label>
+                        <input
+                          className="settings-input"
+                          value={contextBudgetDraft}
+                          onChange={e => setContextBudgetDraft(e.target.value)}
+                          inputMode="numeric"
+                          placeholder="24000"
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label>Tool Retry Max</label>
+                        <input
+                          className="settings-input"
+                          value={toolRetryMaxDraft}
+                          onChange={e => setToolRetryMaxDraft(e.target.value)}
+                          inputMode="numeric"
+                          placeholder="2"
+                        />
+                      </div>
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-field">
+                        <label>Session Memory Turns</label>
+                        <input
+                          className="settings-input"
+                          value={sessionMemoryTurnsDraft}
+                          onChange={e => setSessionMemoryTurnsDraft(e.target.value)}
+                          inputMode="numeric"
+                          placeholder="3"
+                        />
+                      </div>
+                      <div className="settings-field">
+                        <label>Stream Stall Limit (seconds)</label>
+                        <input
+                          className="settings-input"
+                          value={streamIdleTimeoutDraft}
+                          onChange={e => setStreamIdleTimeoutDraft(e.target.value)}
+                          inputMode="numeric"
+                          placeholder="45"
+                        />
+                      </div>
+                    </div>
+                    <div className="agent-toggle-list">
+                      <label className="agent-toggle-row">
+                        <input
+                          type="checkbox"
+                          checked={sessionMemoryEnabledDraft}
+                          onChange={e => setSessionMemoryEnabledDraft(e.target.checked)}
+                        />
+                        <span>Enable session memory continuity</span>
+                      </label>
+                      <label className="agent-toggle-row">
+                        <input
+                          type="checkbox"
+                          checked={selfCheckEnabledDraft}
+                          onChange={e => setSelfCheckEnabledDraft(e.target.checked)}
+                        />
+                        <span>Require self-check after edits or commands</span>
+                      </label>
+                      <label className="agent-toggle-row">
+                        <input
+                          type="checkbox"
+                          checked={internetAccessDraft}
+                          onChange={e => setInternetAccessDraft(e.target.checked)}
+                        />
+                        <span>Allow internet tools during agent runs</span>
+                      </label>
+                    </div>
+                    <button className="settings-btn" onClick={() => void saveConfig()} type="button">
+                      Save Agent Controls
+                    </button>
+                    {settingsStatus && <div className="settings-status">{settingsStatus}</div>}
+                  </div>
+
+                  <div className="settings-section">
+                    <div className="settings-section-title">Stay-on-task Memory</div>
+                    {recentTurns.length === 0 ? (
+                      <div className="empty-note">No prior turns stored yet.</div>
+                    ) : (
+                      <div className="agent-memory-list">
+                        {recentTurns.map((turn) => (
+                          <div key={turn.timestamp} className="agent-memory-item">
+                            <strong>{turn.intent || `${turn.executionMode} turn`}</strong>
+                            <span>{summarizeTurnIntent(turn)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+
               {/* Sessions Tab */}
               {settingsTab === 'sessions' && (
                 <>
@@ -1931,6 +2518,7 @@ function HarnessApp() {
                         <div className="settings-info-row"><span>Last Turn</span><span>{session.turnHistory && session.turnHistory.length > 0 ? session.turnHistory[session.turnHistory.length - 1].executionMode : 'None'}</span></div>
                         <div className="settings-info-row"><span>Turns</span><span>{session.turnHistory?.length || 0}</span></div>
                         <div className="settings-info-row"><span>Skills</span><span>{session.skillsActive.length || 'None'}</span></div>
+                        <div className="settings-info-row"><span>Last Summary</span><span>{summarizeTurnIntent(latestSessionTurn)}</span></div>
                       </div>
                     ) : (
                       <div className="empty-note">No active session</div>
@@ -1963,6 +2551,34 @@ function HarnessApp() {
               {settingsTab === 'activity' && (
                 <>
                   <div className="settings-section">
+                    <div className="settings-section-title">Live Plan</div>
+                    {plan ? (
+                      <div className="settings-info">
+                        <div className="settings-info-row"><span>Task</span><span>{plan.taskSummary}</span></div>
+                        <div className="settings-info-row"><span>Phase</span><span>{plan.currentPhase}</span></div>
+                        <div className="settings-info-row"><span>Next</span><span>{plan.intendedNextAction}</span></div>
+                        <div className="settings-info-row"><span>Status</span><span>{plan.lastStatus || 'None'}</span></div>
+                        <div className="settings-info-row"><span>Workspace</span><span>{plan.workspaceRoot || config?.workspaceRoot || 'Unknown'}</span></div>
+                        <div className="settings-info-row"><span>Source</span><span>{plan.workspaceSource || 'backend'}</span></div>
+                        <div className="settings-info-row"><span>Bound</span><span>{plan.workspaceBound === false ? 'No' : 'Yes'}</span></div>
+                        <div className="settings-info-row"><span>Tool Path</span><span>{plan.toolProtocol || 'native'}</span></div>
+                        <div className="settings-info-row"><span>Internet</span><span>{plan.internetAccessEnabled ?? config?.internetAccessEnabled ? 'Enabled' : 'Disabled'}</span></div>
+                        <div className="settings-info-row"><span>Context Budget</span><span>{plan.contextBudget ?? config?.contextBudget ?? 'Unknown'}</span></div>
+                        <div className="settings-info-row"><span>Retry Budget</span><span>{plan.toolRetryMax ?? config?.toolRetryMax ?? 0}</span></div>
+                        <div className="settings-info-row"><span>Session Memory</span><span>{plan.sessionMemoryEnabled ?? config?.sessionMemoryEnabled ? `${plan.sessionMemoryTurns ?? config?.sessionMemoryTurns ?? 0} turns` : 'Off'}</span></div>
+                        <div className="settings-info-row"><span>Self-check</span><span>{plan.selfCheckEnabled ?? config?.selfCheckEnabled ? 'On' : 'Off'}</span></div>
+                        <div className="settings-info-row"><span>Current Tool</span><span>{plan.currentTool || 'None'}</span></div>
+                        <div className="settings-info-row"><span>Blockers</span><span>{plan.blockers.length > 0 ? plan.blockers.join(', ') : 'None'}</span></div>
+                        {plan.runSummary?.summary ? (
+                          <div className="settings-info-row"><span>Run Summary</span><span>{plan.runSummary.summary}</span></div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="empty-note">No live planner state yet</div>
+                    )}
+                  </div>
+
+                  <div className="settings-section">
                     <div className="settings-section-title">Pending Approvals ({approvals.length})</div>
                     {approvals.length === 0 ? (
                       <div className="empty-note">No pending approvals</div>
@@ -1977,10 +2593,14 @@ function HarnessApp() {
                       <div className="empty-note">No trace events yet</div>
                     ) : (
                       traces.slice(-30).map((t, i) => (
-                        <div key={`${t.timestamp}-${t.type}-${i}`} className="trace-row">
-                          <span className="trace-row-time">{formatTime(t.timestamp)}</span>
-                          <span className="trace-row-type">{t.type}</span>
-                        </div>
+                        <details key={`${t.timestamp}-${t.type}-${i}`} className="trace-row">
+                          <summary className="trace-row-summary">
+                            <span className="trace-row-time">{formatTime(t.timestamp)}</span>
+                            <span className="trace-row-type">{t.type}</span>
+                            <span className="trace-row-headline">{formatTraceHeadline(t)}</span>
+                          </summary>
+                          <pre className="trace-row-detail">{safeJsonStringify(t.data)}</pre>
+                        </details>
                       ))
                     )}
                   </div>

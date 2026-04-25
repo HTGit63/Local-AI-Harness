@@ -27,6 +27,11 @@ async function testConfigDefaults() {
   assert.strictEqual(config.model, 'gemma4:e4b');
   assert.strictEqual(config.mode, 'workspace-write');
   assert.strictEqual(config.profile, 'fast');
+  assert.strictEqual(config.contextBudget, 24000);
+  assert.strictEqual(config.toolRetryMax, 2);
+  assert.strictEqual(config.sessionMemoryEnabled, true);
+  assert.strictEqual(config.sessionMemoryTurns, 3);
+  assert.strictEqual(config.selfCheckEnabled, true);
 }
 
 function testPromptRecipes() {
@@ -896,6 +901,335 @@ async function testEngineRejectsSimulatedToolTranscripts() {
   }
 }
 
+async function testEngineInjectsSessionContinuityMemory() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-session-memory-'));
+
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({ name: 'session-memory-test' }), 'utf8');
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({
+      workspaceRoot,
+      sessionMemoryEnabled: true,
+      sessionMemoryTurns: 2,
+    });
+
+    await engine.chat([
+      { role: 'user', content: 'Read src/index.ts and explain how it should be documented for a teammate' },
+    ]);
+    await engine.chat([
+      { role: 'user', content: 'Update the same repo documentation plan and keep earlier work consistent with the last turn' },
+    ]);
+
+    assert.ok(chatRequests.length >= 1);
+    const latestPayload = JSON.stringify(chatRequests[chatRequests.length - 1]);
+    assert.ok(latestPayload.includes('[Session Continuity]'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'session_memory_loaded'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testEngineRequestsSelfCheckAfterWrite() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-self-check-'));
+
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({ name: 'self-check-test' }), 'utf8');
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder(body) {
+      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const toolMessages = messages.filter((message: { role?: string }) => message.role === 'tool');
+      const hasSelfCheckPrompt = messages.some((message: { role?: string; content?: string }) =>
+        message.role === 'system' && typeof message.content === 'string' && message.content.includes('[Self Check]'),
+      );
+      const hasReadBack = toolMessages.some((message: { name?: string }) => message.name === 'readFile');
+
+      if (toolMessages.length === 0) {
+        return {
+          id: 'mock-self-check-write',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{
+                function: {
+                  name: 'writeFile',
+                  arguments: JSON.stringify({ filePath: 'notes.txt', content: 'verified content\n' }),
+                },
+              }],
+            },
+            finish_reason: 'tool_calls',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+        };
+      }
+
+      if (hasReadBack) {
+        return {
+          id: 'mock-self-check-final',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: 'Verified after readback. notes.txt now contains the requested content.',
+            },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+        };
+      }
+
+      if (hasSelfCheckPrompt) {
+        return {
+          id: 'mock-self-check-read',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{
+                function: {
+                  name: 'readFile',
+                  arguments: JSON.stringify({ filePath: 'notes.txt' }),
+                },
+              }],
+            },
+            finish_reason: 'tool_calls',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+        };
+      }
+
+      return {
+        id: 'mock-self-check-too-early',
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: 'Wrote the requested file.',
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({
+      workspaceRoot,
+      selfCheckEnabled: true,
+      toolRetryMax: 2,
+    });
+    const response = await engine.chat([
+      { role: 'user', content: 'Create notes.txt with verified content and then summarize the result.' },
+    ]);
+
+    assert.ok(response.includes('Verified after readback.'));
+    assert.ok(chatRequests.some((body) => JSON.stringify(body).includes('[Self Check]')));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'self_check_requested'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testEngineContinuesTruncatedResponses() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  let requestCount = 0;
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder(body) {
+      requestCount += 1;
+      const hasContinuationPrompt = Array.isArray(body.messages) && body.messages.some((message: { content?: string }) =>
+        typeof message.content === 'string' && message.content.includes('[Continuation]'),
+      );
+
+      if (requestCount === 1) {
+        return {
+          id: 'mock-truncated-1',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: 'First half of the answer ',
+            },
+            finish_reason: 'length',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+        };
+      }
+
+      assert.ok(hasContinuationPrompt);
+      return {
+        id: 'mock-truncated-2',
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: 'continues here.',
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine();
+    const response = await engine.chat([
+      { role: 'user', content: 'Explain this harness behavior in one answer without stopping midway.' },
+    ]);
+
+    assertAgenticResponse(response, 'First half of the answer continues here.');
+    assert.ok(chatRequests.length >= 2);
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'response_continuation_requested'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testDirectChatCompactsConversationHistory() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine();
+    const repeated = 'History block '.repeat(140);
+    const longHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+    for (let index = 0; index < 12; index += 1) {
+      longHistory.push({ role: 'user', content: `User turn ${index} ${repeated}` });
+      longHistory.push({ role: 'assistant', content: `Assistant turn ${index} ${repeated}` });
+    }
+
+    await engine.directChat([
+      { role: 'system', content: 'Keep thread coherent.' },
+      ...longHistory,
+      { role: 'user', content: 'Continue same conversation with context intact.' },
+    ]);
+
+    assert.ok(chatRequests.length >= 1);
+    const payload = JSON.stringify(chatRequests[0]);
+    assert.ok(payload.includes('[Conversation Memory]'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'conversation_context_compacted'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testEngineCompactsLargeToolOutputsForModel() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-tool-compact-'));
+  const largeContent = Array.from({ length: 5000 }, (_, index) => `line ${index} alpha beta gamma`).join('\n');
+
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({ name: 'tool-compaction-test' }), 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'large.txt'), largeContent, 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder(body) {
+      const hasToolResult = Array.isArray(body.messages) && body.messages.some((message: { role?: string }) => message.role === 'tool');
+      if (!hasToolResult) {
+        return {
+          id: 'mock-large-tool-call',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{
+                function: {
+                  name: 'readFile',
+                  arguments: JSON.stringify({ filePath: 'large.txt' }),
+                },
+              }],
+            },
+            finish_reason: 'tool_calls',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+        };
+      }
+
+      return {
+        id: 'mock-large-tool-final',
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: 'Large file inspected safely.',
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({
+      workspaceRoot,
+      model: 'qwen3.5:9b-q4_K_M',
+    });
+    const response = await engine.chat([
+      { role: 'user', content: 'Read large.txt and summarize it for me.' },
+    ]);
+
+    assert.ok(response.includes('Large file inspected safely.'));
+    const toolPayload = chatRequests.find((body) =>
+      Array.isArray(body.messages) && body.messages.some((message: { role?: string }) => message.role === 'tool'),
+    );
+    assert.ok(toolPayload);
+    const toolMessage = toolPayload.messages.find((message: { role?: string }) => message.role === 'tool');
+    assert.ok(typeof toolMessage?.content === 'string');
+    assert.ok(toolMessage.content.includes('[Tool readFile result]'));
+    assert.ok(toolMessage.content.length < largeContent.length);
+    assert.ok(toolMessage.content.includes('[readFile output truncated for model context]'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function run() {
   await testConfigDefaults();
   testPromptRecipes();
@@ -927,6 +1261,11 @@ async function run() {
   await testEngineSkipsWorkspaceShortcutsWhenBrowserFolderContextIsAttached();
   await testEngineModelSwitchUpdatesSession();
   await testEngineRejectsSimulatedToolTranscripts();
+  await testEngineInjectsSessionContinuityMemory();
+  await testEngineRequestsSelfCheckAfterWrite();
+  await testEngineContinuesTruncatedResponses();
+  await testDirectChatCompactsConversationHistory();
+  await testEngineCompactsLargeToolOutputsForModel();
   console.log('unit tests passed');
 }
 

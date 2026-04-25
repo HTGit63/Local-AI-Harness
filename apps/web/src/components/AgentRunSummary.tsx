@@ -29,6 +29,8 @@ export interface AgentRunSummaryData {
   filesDeleted: string[];
   directoriesCreated: string[];
   searches: Array<{ query: string; pattern?: string }>;
+  webSearches: Array<{ query: string; engine: string; resultCount: number }>;
+  webFetches: Array<{ url: string; title?: string }>;
   commands: AgentRunCommand[];
   approvals: AgentRunApproval[];
   git?: AgentRunLineStats;
@@ -48,11 +50,26 @@ function formatDuration(totalMs?: number): string {
   return `${minutes}m ${remSeconds}s`;
 }
 
+function summarizeList(values: string[], empty = 'none', limit = 3): string {
+  if (values.length === 0) return empty;
+  if (values.length <= limit) return values.join(', ');
+  return `${values.slice(0, limit).join(', ')} +${values.length - limit} more`;
+}
+
 export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
   const changedSummary = run.git && run.git.changedFiles > 0
     ? `${run.git.changedFiles} file${run.git.changedFiles === 1 ? '' : 's'} (+${run.git.addedLines} / -${run.git.removedLines})`
     : 'none';
   const approvalsApproved = run.approvals.filter((entry) => entry.approved === true).length;
+  const searchSummary = [
+    ...run.searches.map((entry) => entry.query),
+    ...run.webSearches.map((entry) => `${entry.query} [web]`),
+  ];
+  const touchedPaths = [
+    ...run.filesWritten,
+    ...run.filesDeleted,
+    ...run.directoriesCreated,
+  ];
 
   return (
     <div className="tool-execution-tracker">
@@ -68,37 +85,42 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
             <span className="tool-call-name">Worked for</span>
             <span className="tool-call-state">{formatDuration(run.metrics?.totalMs)}</span>
           </div>
-          <div className="tool-call-input">Workspace {run.workspaceSource}</div>
+          <div className="tool-call-input">{run.workspaceBound ? `Workspace ${run.workspaceSource}` : 'Browser snapshot only'}</div>
         </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
             <span className="tool-call-name">Explored</span>
             <span className="tool-call-state">{run.filesRead.length} file{run.filesRead.length === 1 ? '' : 's'}</span>
           </div>
-          <div className="tool-call-input">{run.directoriesRead.length} director{run.directoriesRead.length === 1 ? 'y' : 'ies'} listed</div>
+          <div className="tool-call-input">{summarizeList(run.filesRead)}</div>
         </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
             <span className="tool-call-name">Searched</span>
-            <span className="tool-call-state">{run.searches.length}</span>
+            <span className="tool-call-state">{searchSummary.length}</span>
           </div>
-          <div className="tool-call-input">{run.searches.length > 0 ? run.searches.map((entry) => entry.query).join(', ') : 'none'}</div>
+          <div className="tool-call-input">{summarizeList(searchSummary)}</div>
         </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
-            <span className="tool-call-name">Ran</span>
-            <span className="tool-call-state">{run.commands.length} command{run.commands.length === 1 ? '' : 's'}</span>
+            <span className="tool-call-name">Fetched</span>
+            <span className="tool-call-state">{run.webFetches.length}</span>
           </div>
-          <div className="tool-call-input">{run.commands[0]?.command || 'none'}</div>
+          <div className="tool-call-input">{summarizeList(run.webFetches.map((entry) => entry.title || entry.url))}</div>
         </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
             <span className="tool-call-name">Changed</span>
             <span className="tool-call-state">{changedSummary}</span>
           </div>
-          <div className="tool-call-input">
-            Writes {run.filesWritten.length} · Deletes {run.filesDeleted.length} · New dirs {run.directoriesCreated.length}
+          <div className="tool-call-input">{summarizeList(touchedPaths)}</div>
+        </div>
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Commands</span>
+            <span className="tool-call-state">{run.commands.length}</span>
           </div>
+          <div className="tool-call-input">{summarizeList(run.commands.map((entry) => entry.command))}</div>
         </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">

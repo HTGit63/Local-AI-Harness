@@ -24,6 +24,17 @@ export interface AgentRunSearch {
   pattern?: string;
 }
 
+export interface AgentRunWebSearch {
+  query: string;
+  engine: string;
+  resultCount: number;
+}
+
+export interface AgentRunWebFetch {
+  url: string;
+  title?: string;
+}
+
 export interface AgentRunCommand {
   command: string;
   success: boolean;
@@ -84,6 +95,8 @@ export interface AgentRun {
   filesDeleted: string[];
   directoriesCreated: string[];
   searches: AgentRunSearch[];
+  webSearches: AgentRunWebSearch[];
+  webFetches: AgentRunWebFetch[];
   commands: AgentRunCommand[];
   approvals: AgentRunApproval[];
   git?: AgentRunLineStats;

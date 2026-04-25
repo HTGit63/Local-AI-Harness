@@ -40,6 +40,30 @@ export class Planner {
     this.emitStateChange('plan_update', { activeSkills: skills });
   }
 
+  setRuntimeContext(
+    patch: Partial<
+      Pick<
+        PlanState,
+        | 'workspaceRoot'
+        | 'workspaceSource'
+        | 'workspaceBound'
+        | 'toolProtocol'
+        | 'internetAccessEnabled'
+        | 'contextBudget'
+        | 'toolRetryMax'
+        | 'sessionMemoryEnabled'
+        | 'sessionMemoryTurns'
+        | 'selfCheckEnabled'
+      >
+    >,
+  ) {
+    this.emitStateChange('plan_update', patch);
+  }
+
+  setStatusNote(status: string) {
+    this.emitStateChange('plan_update', { lastStatus: status });
+  }
+
   startRun(runId: string) {
     this.emitStateChange('plan_update', {
       currentRunId: runId,

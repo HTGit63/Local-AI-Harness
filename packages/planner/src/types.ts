@@ -6,6 +6,17 @@ export interface PlanState {
   blockers: string[];
   isComplete: boolean;
   finalOutcome?: string;
+  workspaceRoot?: string;
+  workspaceSource?: 'backend' | 'browser_snapshot';
+  workspaceBound?: boolean;
+  toolProtocol?: 'native' | 'manual';
+  internetAccessEnabled?: boolean;
+  contextBudget?: number;
+  toolRetryMax?: number;
+  sessionMemoryEnabled?: boolean;
+  sessionMemoryTurns?: number;
+  selfCheckEnabled?: boolean;
+  lastStatus?: string;
   currentRunId?: string;
   currentTool?: string;
   runSteps?: Array<{

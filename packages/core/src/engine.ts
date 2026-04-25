@@ -31,7 +31,7 @@ const SUPPORTED_TOOLS = [
   'gitStatus',
   'gitDiff',
 ] as const;
-const AUTO_REPO_CONTEXT_ENABLED = process.env.HARNESS_AUTO_REPO_CONTEXT === '1';
+const AUTO_REPO_CONTEXT_ENABLED = process.env.HARNESS_AUTO_REPO_CONTEXT !== '0';
 const execFileAsync = promisify(execFile);
 const DISABLED_SKILL_SLUGS = new Set(['caveman']);
 
@@ -141,6 +141,11 @@ export interface EngineConfig {
   sessionDataDir: string;
   internetAccessEnabled: boolean;
   streamIdleTimeoutMs: number;
+  contextBudget: number;
+  toolRetryMax: number;
+  sessionMemoryEnabled: boolean;
+  sessionMemoryTurns: number;
+  selfCheckEnabled: boolean;
 }
 
 export interface PublicEngineConfig {
@@ -152,6 +157,11 @@ export interface PublicEngineConfig {
   sessionDataDir: string;
   internetAccessEnabled: boolean;
   streamIdleTimeoutMs: number;
+  contextBudget: number;
+  toolRetryMax: number;
+  sessionMemoryEnabled: boolean;
+  sessionMemoryTurns: number;
+  selfCheckEnabled: boolean;
 }
 
 export interface UpdateConfigOptions {
@@ -168,6 +178,11 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   sessionDataDir: '.gamma-harness/sessions',
   internetAccessEnabled: process.env.HARNESS_INTERNET_ACCESS !== '0',
   streamIdleTimeoutMs: Number(process.env.HARNESS_STREAM_IDLE_TIMEOUT_MS || 45000),
+  contextBudget: Number(process.env.HARNESS_CONTEXT_BUDGET || 24000),
+  toolRetryMax: Number(process.env.HARNESS_TOOL_RETRY_MAX || 2),
+  sessionMemoryEnabled: process.env.HARNESS_SESSION_MEMORY !== '0',
+  sessionMemoryTurns: Number(process.env.HARNESS_SESSION_MEMORY_TURNS || 3),
+  selfCheckEnabled: process.env.HARNESS_SELF_CHECK !== '0',
 };
 
 function resolveSessionDataDir(workspaceRoot: string, sessionDataDir: string): string {
@@ -182,6 +197,35 @@ function createSessionId(): string {
 
 function createRunId(): string {
   return `run_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeIntegerSetting(value: number, fallback: number, min: number, max?: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+
+  const normalized = Math.floor(numeric);
+  if (normalized < min) {
+    return min;
+  }
+  if (max !== undefined && normalized > max) {
+    return max;
+  }
+  return normalized;
+}
+
+function trimPromptBlock(content: string, maxChars: number, truncationNotice = '[Context truncated to fit budget]'): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || content.length <= maxChars) {
+    return content;
+  }
+
+  const safeBudget = Math.max(96, Math.floor(maxChars));
+  if (safeBudget <= truncationNotice.length + 2) {
+    return content.slice(0, safeBudget);
+  }
+
+  return `${content.slice(0, safeBudget - truncationNotice.length - 2)}\n${truncationNotice}`;
 }
 
 function toolActionToChangeType(action: string): ApprovalRequestPayload['changeType'] {
@@ -266,6 +310,13 @@ function extractFirstUrl(value: string): string | undefined {
 
 function isStreamIdleTimeoutError(error: unknown): error is StreamIdleTimeoutError {
   return Boolean(error && typeof error === 'object' && (error as { code?: string }).code === 'stream_idle_timeout');
+}
+
+function createStreamIdleTimeoutError(receivedContent: boolean): StreamIdleTimeoutError {
+  const error = new Error('Model stream stalled before completing the response.') as StreamIdleTimeoutError;
+  error.code = 'stream_idle_timeout';
+  error.receivedContent = receivedContent;
+  return error;
 }
 
 function looksLikeSimulatedToolCall(content: string): boolean {
@@ -398,6 +449,11 @@ function appendToolCallDeltas(target: any[], deltas: any[]) {
 
 const STREAM_TOOL_OUTPUT_MAX_LINES = 12;
 const STREAM_TOOL_OUTPUT_MAX_CHARS = 900;
+const DIRECT_HISTORY_COMPACTION_TAIL = 10;
+const AGENT_HISTORY_COMPACTION_TAIL = 8;
+const LOOP_CONTEXT_COMPACTION_TAIL = 12;
+const MESSAGE_COMPACTION_LINE_CHARS = 220;
+const MAX_RESPONSE_CONTINUATIONS = 2;
 
 function truncateStreamPreview(value: string): string {
   const normalized = value.trim();
@@ -417,6 +473,38 @@ function truncateStreamPreview(value: string): string {
   }
 
   return clipped;
+}
+
+function normalizeInlineWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function compactContextLine(value: string, maxChars = MESSAGE_COMPACTION_LINE_CHARS): string {
+  const normalized = normalizeInlineWhitespace(value);
+  if (!normalized) {
+    return '[empty]';
+  }
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxChars)}...`;
+}
+
+type EngineChatMessage = ChatMessage & {
+  name?: string;
+  thinking?: string;
+  tool_calls?: any[];
+  tool_call_id?: string;
+  finish_reason?: string | null;
+};
+
+function summarizeCompactedMessage(message: EngineChatMessage): string {
+  const role =
+    message.role === 'tool'
+      ? `tool:${message.name || 'unknown'}`
+      : message.role;
+  const content = compactContextLine(message.content || composeAssistantContent(message as unknown as Record<string, unknown>));
+  return `- ${role}: ${content}`;
 }
 
 function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown>): string {
@@ -482,6 +570,11 @@ export class CoreEngine extends EventEmitter {
     if (!Number.isFinite(this.config.streamIdleTimeoutMs) || this.config.streamIdleTimeoutMs < 0) {
       this.config.streamIdleTimeoutMs = DEFAULT_ENGINE_CONFIG.streamIdleTimeoutMs;
     }
+    this.config.contextBudget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000);
+    this.config.toolRetryMax = normalizeIntegerSetting(this.config.toolRetryMax, DEFAULT_ENGINE_CONFIG.toolRetryMax, 0, 8);
+    this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
+    this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
+    this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
 
     this.modelAdapter = new ModelAdapter(this.config);
     this.workspacePolicy = new WorkspacePolicy({
@@ -561,6 +654,11 @@ export class CoreEngine extends EventEmitter {
       sessionDataDir: this.config.sessionDataDir,
       internetAccessEnabled: this.config.internetAccessEnabled,
       streamIdleTimeoutMs: this.config.streamIdleTimeoutMs,
+      contextBudget: this.config.contextBudget,
+      toolRetryMax: this.config.toolRetryMax,
+      sessionMemoryEnabled: this.config.sessionMemoryEnabled,
+      sessionMemoryTurns: this.config.sessionMemoryTurns,
+      selfCheckEnabled: this.config.selfCheckEnabled,
     };
   }
 
@@ -622,6 +720,18 @@ export class CoreEngine extends EventEmitter {
     });
   }
 
+  private buildPlannerRuntimeContext() {
+    return {
+      workspaceRoot: this.config.workspaceRoot,
+      internetAccessEnabled: this.config.internetAccessEnabled,
+      contextBudget: this.config.contextBudget,
+      toolRetryMax: this.config.toolRetryMax,
+      sessionMemoryEnabled: this.config.sessionMemoryEnabled,
+      sessionMemoryTurns: this.config.sessionMemoryTurns,
+      selfCheckEnabled: this.config.selfCheckEnabled,
+    };
+  }
+
   startSession(skills: string[] = []): SessionMetadata {
     const sanitizedSkills = sanitizeActiveSkills(skills);
     const session: SessionMetadata = {
@@ -641,6 +751,7 @@ export class CoreEngine extends EventEmitter {
     this.planner.setPhase('ready');
     this.planner.setActiveSkills(sanitizedSkills);
     this.planner.setIntendedAction('Awaiting user input');
+    this.planner.setRuntimeContext(this.buildPlannerRuntimeContext());
     this.traceBus.emitEvent({ type: 'session_started', data: session });
     void this.persistCurrentSession();
 
@@ -662,6 +773,7 @@ export class CoreEngine extends EventEmitter {
     this.planner.setPhase('ready');
     this.planner.setActiveSkills(sanitizedSkills);
     this.planner.setIntendedAction('Awaiting user input');
+    this.planner.setRuntimeContext(this.buildPlannerRuntimeContext());
     this.traceBus.emitEvent({ type: 'session_resumed', data: { id: session.id } });
     if (sanitizedSkills.length !== (session.skillsActive || []).length) {
       await this.persistCurrentSession();
@@ -731,6 +843,11 @@ export class CoreEngine extends EventEmitter {
       ...config,
       workspaceRoot: config.workspaceRoot ? path.resolve(config.workspaceRoot) : this.config.workspaceRoot,
     };
+    this.config.contextBudget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000);
+    this.config.toolRetryMax = normalizeIntegerSetting(this.config.toolRetryMax, DEFAULT_ENGINE_CONFIG.toolRetryMax, 0, 8);
+    this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
+    this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
+    this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
 
     if (config.sessionDataDir) {
       this.sessionDataDirSetting = config.sessionDataDir;
@@ -743,6 +860,7 @@ export class CoreEngine extends EventEmitter {
       workspaceRoot: this.config.workspaceRoot,
       mode: this.config.mode,
     });
+    this.planner.setRuntimeContext(this.buildPlannerRuntimeContext());
 
     if (workspaceChanged || internetAccessChanged) {
       this.refreshWorkspaceRuntime(this.config.workspaceRoot);
@@ -849,6 +967,18 @@ export class CoreEngine extends EventEmitter {
     return /\b(benchmark|build|cargo|doctor|format|install|lint|npm|pnpm|pytest|run|script|shell|test|uv|yarn)\b/.test(latestUserMessage.toLowerCase());
   }
 
+  private shouldIncludeInternetTools(latestUserMessage: string): boolean {
+    if (!this.config.internetAccessEnabled) {
+      return false;
+    }
+
+    const normalized = latestUserMessage.toLowerCase();
+    return (
+      Boolean(extractFirstUrl(latestUserMessage)) ||
+      /\b(current|docs?|documentation|fetch|internet|latest|look up|lookup|news|online|release notes|search web|site|url|website|web)\b/.test(normalized)
+    );
+  }
+
   private isStatusOnlyWorkspaceQuestion(latestUserMessage: string): boolean {
     const normalized = latestUserMessage.toLowerCase();
     return (
@@ -915,8 +1045,16 @@ export class CoreEngine extends EventEmitter {
       return false;
     }
 
-    if (promptMode !== 'quick_inspect') {
-      return true;
+    if (promptMode === 'targeted_edit') {
+      return false;
+    }
+
+    if (promptMode === 'doc_generation') {
+      return this.isRepoOverviewQuestion(latestUserMessage);
+    }
+
+    if (promptMode === 'code_review') {
+      return false;
     }
 
     const normalized = latestUserMessage.toLowerCase();
@@ -1199,6 +1337,13 @@ export class CoreEngine extends EventEmitter {
       selected.add('runCommand');
     }
 
+    if (this.shouldIncludeInternetTools(latestUserMessage)) {
+      selected.add('webSearch');
+      if (extractFirstUrl(latestUserMessage)) {
+        selected.add('fetchUrl');
+      }
+    }
+
     return SUPPORTED_TOOLS.filter((toolName) => selected.has(toolName));
   }
 
@@ -1403,6 +1548,8 @@ export class CoreEngine extends EventEmitter {
       readFile: '{"action":"readFile","args":{"filePath":"src/index.ts"}}',
       searchText: '{"action":"searchText","args":{"query":"TODO","filePattern":"src/**/*.ts"}}',
       listDir: '{"action":"listDir","args":{"dirPath":"src"}}',
+      webSearch: '{"action":"webSearch","args":{"query":"latest ollama gemma4 tool calling docs"}}',
+      fetchUrl: '{"action":"fetchUrl","args":{"url":"https://example.com/docs"}}',
       writeFile: '{"action":"writeFile","args":{"filePath":"README.md","content":"# Title\\n"}}',
       patchFile: '{"action":"patchFile","args":{"filePath":"src/index.ts","oldContent":"before","newContent":"after"}}',
       makeDir: '{"action":"makeDir","args":{"dirPath":"src/new-folder"}}',
@@ -1480,6 +1627,15 @@ export class CoreEngine extends EventEmitter {
     promptMode: RunMode,
     toolNames: SupportedTool[],
   ): Promise<{ kind: 'tool'; name: SupportedTool; args: Record<string, unknown> } | null> {
+    const explicitUrl = extractFirstUrl(latestUserMessage);
+    if (explicitUrl && toolNames.includes('fetchUrl')) {
+      return { kind: 'tool', name: 'fetchUrl', args: { url: explicitUrl } };
+    }
+
+    if (this.shouldIncludeInternetTools(latestUserMessage) && toolNames.includes('webSearch')) {
+      return { kind: 'tool', name: 'webSearch', args: { query: latestUserMessage.trim() } };
+    }
+
     if (!toolNames.includes('readFile')) {
       return null;
     }
@@ -1584,30 +1740,45 @@ export class CoreEngine extends EventEmitter {
       return [];
     }
 
+    const latestUserMessage = this.getLatestUserMessage(chatMessages);
     const workspaceNotice = this.workspaceChangedNotice;
     if (workspaceNotice) {
       this.workspaceChangedNotice = null;
     }
 
-    const contextMessages: ChatMessage[] = [
-      {
-        role: 'system',
-        content: [
-          '[Workspace Context]',
-          `Workspace root: ${this.config.workspaceRoot}`,
-          `Session cwd: ${this.currentSession?.cwd || this.config.workspaceRoot}`,
-          `Mode: ${this.config.mode}`,
-          `Configured model: ${this.config.model}`,
-          'If the user asks which folder is open, answer from the workspace root or session cwd above.',
-          'All file and command-path targets must stay inside the workspace root, including in danger mode.',
-          workspaceNotice ? `\n${workspaceNotice}` : '',
-        ].filter(Boolean).join('\n'),
-      },
-    ];
+    const workspaceContextMessage: ChatMessage = {
+      role: 'system',
+      content: [
+        '[Workspace Context]',
+        `Workspace root: ${this.config.workspaceRoot}`,
+        `Session cwd: ${this.currentSession?.cwd || this.config.workspaceRoot}`,
+        `Mode: ${this.config.mode}`,
+        `Configured model: ${this.config.model}`,
+        'If the user asks which folder is open, answer from the workspace root or session cwd above.',
+        'All file and command-path targets must stay inside the workspace root, including in danger mode.',
+        workspaceNotice ? `\n${workspaceNotice}` : '',
+      ].filter(Boolean).join('\n'),
+    };
+    const contextMessages: ChatMessage[] = [workspaceContextMessage];
+    const totalContextBudget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000);
+    let remainingBudget = Math.max(1200, totalContextBudget - workspaceContextMessage.content.length);
+
+    const sessionMemoryBudget = includeRepoContext
+      ? Math.max(1000, Math.floor(remainingBudget * 0.35))
+      : remainingBudget;
+    const sessionMemoryMessage = this.buildSessionMemoryMessage(latestUserMessage, sessionMemoryBudget);
+    if (sessionMemoryMessage) {
+      contextMessages.push(sessionMemoryMessage);
+      remainingBudget = Math.max(1200, remainingBudget - sessionMemoryMessage.content.length);
+    }
 
     if (includeRepoContext) {
       try {
-        const repoContext = await this.getRepoContextPrompt();
+        const repoContext = trimPromptBlock(
+          await this.getRepoContextPrompt(),
+          remainingBudget,
+          '[Repo context trimmed to fit context budget]',
+        );
         contextMessages.push({ role: 'system', content: repoContext });
       } catch (error: any) {
         this.traceBus.emitEvent({
@@ -1643,6 +1814,12 @@ export class CoreEngine extends EventEmitter {
           getRequiredStringArg(args, 'query', toolName),
           getOptionalStringArg(args, 'filePattern'),
         );
+        break;
+      case 'webSearch':
+        result = await this.webSearch(getRequiredStringArg(args, 'query', toolName));
+        break;
+      case 'fetchUrl':
+        result = await this.fetchUrl(getRequiredStringArg(args, 'url', toolName));
         break;
       case 'writeFile':
         result = await this.writeFile(
@@ -1753,7 +1930,7 @@ export class CoreEngine extends EventEmitter {
       this.recordRunToolMetadata(builder, toolResult.metadata);
       currentMessages.push({
         role: 'system',
-        content: `[Bootstrap ${stepPlan.toolName}]\n${toolResult.output}`,
+        content: `[Bootstrap ${stepPlan.toolName}]\n${this.buildToolResultForModel(stepPlan.toolName, toolResult)}`,
       });
       builder.finishStep(step.id, {
         detail: toolResult.success ? toolResult.output.slice(0, 240) : `Error: ${toolResult.output.slice(0, 240)}`,
@@ -1838,6 +2015,216 @@ export class CoreEngine extends EventEmitter {
     };
   }
 
+  private buildSessionMemoryMessage(latestUserMessage: string, maxChars: number): ChatMessage | null {
+    if (!this.config.sessionMemoryEnabled || !this.currentSession?.turnHistory?.length) {
+      return null;
+    }
+
+    const recentTurns = this.currentSession.turnHistory
+      .filter((turn) => Boolean(turn.intent || turn.summary || turn.runSummary?.summary))
+      .slice(-this.config.sessionMemoryTurns);
+
+    if (recentTurns.length === 0) {
+      return null;
+    }
+
+    const content = [
+      '[Session Continuity]',
+      'Use this only to stay on task and avoid repeating finished work.',
+      `Latest user request: ${latestUserMessage.slice(0, 200)}`,
+      ...recentTurns.map((turn) => {
+        const stamp = new Date(turn.timestamp).toISOString().slice(0, 16).replace('T', ' ');
+        const intent = turn.intent || turn.executionMode;
+        const summary = turn.summary || turn.runSummary?.summary || 'Completed previous work.';
+        return `- ${stamp} · ${intent} · ${summary}`;
+      }),
+    ].join('\n');
+
+    const trimmed = trimPromptBlock(content, maxChars, '[Session continuity trimmed]');
+    this.traceBus.emitEvent({
+      type: 'session_memory_loaded',
+      data: {
+        turns: recentTurns.length,
+        maxChars,
+        latestIntent: recentTurns[recentTurns.length - 1]?.intent || null,
+      },
+    });
+    return { role: 'system', content: trimmed };
+  }
+
+  private needsPostActionSelfCheck(run: AgentRun): boolean {
+    if (!this.config.selfCheckEnabled) {
+      return false;
+    }
+
+    const mutatingTools = new Set<SupportedTool>(['writeFile', 'patchFile', 'deleteFile', 'makeDir', 'runCommand']);
+    const verificationTools = new Set<SupportedTool>(['readFile', 'gitDiff', 'gitStatus', 'listDir', 'searchText', 'runCommand']);
+    let lastMutationIndex = -1;
+
+    run.steps.forEach((step, index) => {
+      if (step.type === 'tool' && step.toolName && mutatingTools.has(step.toolName as SupportedTool)) {
+        lastMutationIndex = index;
+      }
+    });
+
+    if (lastMutationIndex === -1) {
+      return false;
+    }
+
+    return !run.steps.slice(lastMutationIndex + 1).some((step) =>
+      step.type === 'tool' &&
+      step.toolName !== undefined &&
+      verificationTools.has(step.toolName as SupportedTool),
+    );
+  }
+
+  private buildSelfCheckPrompt(run: AgentRun, manualToolProtocol: boolean): string {
+    const touchedPaths = [
+      ...run.filesWritten,
+      ...run.filesDeleted,
+      ...run.directoriesCreated,
+    ].slice(-6);
+    const recentCommands = run.commands.slice(-2).map((entry) => entry.command);
+
+    return [
+      '[Self Check]',
+      'You changed workspace state or ran commands. Verify the result before final answer.',
+      touchedPaths.length > 0 ? `Touched paths: ${touchedPaths.join(', ')}` : null,
+      recentCommands.length > 0 ? `Recent commands: ${recentCommands.join(' | ')}` : null,
+      manualToolProtocol
+        ? 'Return exactly one JSON tool action to verify the result, then return {"final":"..."} when verification is complete.'
+        : 'Use one verification tool call now (readFile, gitDiff, gitStatus, listDir, searchText, or runCommand) before the final answer.',
+    ].filter(Boolean).join('\n');
+  }
+
+  private compactConversationMessages(
+    messages: EngineChatMessage[],
+    maxChars: number,
+    executionMode: TurnExecutionMode,
+  ): EngineChatMessage[] {
+    const preserveTail = executionMode === 'direct' ? DIRECT_HISTORY_COMPACTION_TAIL : AGENT_HISTORY_COMPACTION_TAIL;
+    return this.compactMessageList(
+      messages,
+      maxChars,
+      preserveTail,
+      '[Conversation Memory]',
+      'conversation_context_compacted',
+    );
+  }
+
+  private compactLoopMessages(messages: EngineChatMessage[], maxChars: number): EngineChatMessage[] {
+    return this.compactMessageList(
+      messages,
+      maxChars,
+      LOOP_CONTEXT_COMPACTION_TAIL,
+      '[Loop Memory]',
+      'loop_context_compacted',
+    );
+  }
+
+  private compactMessageList(
+    messages: EngineChatMessage[],
+    maxChars: number,
+    preserveTail: number,
+    header: '[Conversation Memory]' | '[Loop Memory]',
+    traceType: 'conversation_context_compacted' | 'loop_context_compacted',
+  ): EngineChatMessage[] {
+    const totalChars = messages.reduce((sum, message) => sum + (message.content?.length || 0), 0);
+    if (!Number.isFinite(maxChars) || maxChars <= 0 || totalChars <= maxChars || messages.length <= preserveTail + 2) {
+      return messages;
+    }
+
+    let prefixEnd = 0;
+    while (prefixEnd < messages.length && messages[prefixEnd].role === 'system') {
+      prefixEnd += 1;
+    }
+
+    const tailStart = Math.max(prefixEnd, messages.length - preserveTail);
+    const prefix = messages.slice(0, prefixEnd);
+    const compactable = messages
+      .slice(prefixEnd, tailStart)
+      .filter((message) => !(message.role === 'system' && (message.content || '').startsWith(header)));
+    if (compactable.length === 0) {
+      return messages;
+    }
+
+    const targetSummaryChars = Math.max(900, Math.floor(maxChars * 0.35));
+    const summary = trimPromptBlock(
+      [
+        header,
+        'Earlier context compacted to keep local-model runs stable.',
+        ...compactable.map((message) => summarizeCompactedMessage(message)),
+      ].join('\n'),
+      targetSummaryChars,
+      `${header} trimmed`,
+    );
+    const nextMessages: EngineChatMessage[] = [
+      ...prefix,
+      { role: 'system', content: summary },
+      ...messages.slice(tailStart),
+    ];
+
+    this.traceBus.emitEvent({
+      type: traceType,
+      data: {
+        header,
+        originalMessages: messages.length,
+        compactedMessages: nextMessages.length,
+        originalChars: totalChars,
+        compactedChars: nextMessages.reduce((sum, message) => sum + (message.content?.length || 0), 0),
+      },
+    });
+    return nextMessages;
+  }
+
+  private replaceMessageBuffer(target: EngineChatMessage[], replacement: EngineChatMessage[]) {
+    target.splice(0, target.length, ...replacement);
+  }
+
+  private toolContextBudget(toolName: SupportedTool): number {
+    const budget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000);
+    switch (toolName) {
+      case 'readFile':
+        return Math.min(12_000, Math.max(4_500, Math.floor(budget * 0.55)));
+      case 'gitDiff':
+      case 'searchText':
+      case 'fetchUrl':
+      case 'webSearch':
+      case 'runCommand':
+        return Math.min(9_000, Math.max(3_500, Math.floor(budget * 0.4)));
+      default:
+        return Math.min(6_000, Math.max(2_500, Math.floor(budget * 0.28)));
+    }
+  }
+
+  private buildToolResultForModel(toolName: SupportedTool, result: ToolResult): string {
+    const output = result.output || 'No output';
+    const preview = result.preview ? compactContextLine(result.preview, 280) : null;
+    const body = trimPromptBlock(output, this.toolContextBudget(toolName), `[${toolName} output truncated for model context]`);
+    return [
+      `[Tool ${toolName} result]`,
+      preview ? `Preview: ${preview}` : null,
+      body,
+    ].filter((entry): entry is string => Boolean(entry)).join('\n');
+  }
+
+  private shouldContinueTruncatedResponse(
+    finishReason: string | undefined,
+    content: string,
+    continuationCount: number,
+  ): boolean {
+    return finishReason === 'length' && continuationCount < MAX_RESPONSE_CONTINUATIONS && content.trim().length > 0;
+  }
+
+  private buildContinuationPrompt(executionMode: TurnExecutionMode): string {
+    return [
+      '[Continuation]',
+      `Previous ${executionMode} reply hit output limit.`,
+      'Continue exactly from the last unfinished point.',
+      'Do not restart, reframe, or repeat earlier text unless needed for one incomplete sentence.',
+    ].join('\n');
+  }
+
   private getToolDefinitions(toolNames: SupportedTool[] = [...SUPPORTED_TOOLS]): any[] {
     return [
       {
@@ -1893,6 +2280,34 @@ export class CoreEngine extends EventEmitter {
               filePattern: { type: 'string', description: 'Optional glob pattern to limit search' }
             },
             required: ['query']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'webSearch',
+          description: 'Search the web for current information or external documentation',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'The web search query' }
+            },
+            required: ['query']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'fetchUrl',
+          description: 'Fetch readable text from a specific http or https URL',
+          parameters: {
+            type: 'object',
+            properties: {
+              url: { type: 'string', description: 'The URL to fetch' }
+            },
+            required: ['url']
           }
         }
       },
@@ -2035,28 +2450,113 @@ export class CoreEngine extends EventEmitter {
     return this.runChat(messages, handlers, options);
   }
 
+  async directChat(messages: ChatMessage[], options?: { signal?: AbortSignal; think?: boolean }): Promise<string> {
+    return this.runDirectChat(messages, undefined, options);
+  }
+
   async directChatStream(messages: ChatMessage[], handlers: ChatStreamHandlers, options?: { signal?: AbortSignal; think?: boolean }): Promise<string> {
+    return this.runDirectChat(messages, handlers, options);
+  }
+
+  private async runDirectChat(
+    messages: ChatMessage[],
+    handlers?: ChatStreamHandlers,
+    options?: { signal?: AbortSignal; think?: boolean },
+  ): Promise<string> {
+    const currentMessages = this.compactConversationMessages(
+      messages as EngineChatMessage[],
+      Math.max(6_000, Math.floor(this.config.contextBudget * 0.65)),
+      'direct',
+    );
     await this.recordTurnExecution('direct', {
       promptMode: 'general',
       messageCount: messages.length,
       thinkingEnabled: options?.think === true,
     });
+    this.planner.setTaskSummary('Intent: direct chat');
+    this.planner.setPhase('direct');
+    this.planner.setRuntimeContext({
+      ...this.buildPlannerRuntimeContext(),
+      workspaceSource: 'backend',
+      workspaceBound: true,
+      toolProtocol: 'native',
+    });
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Generating assistant response');
     this.emitChatStatus(handlers, 'mode', 'Direct chat mode', 0);
     this.emitChatStatus(handlers, 'model', 'Generating assistant response', 0);
+    let response = '';
+    let continuationCount = 0;
 
-    const message = await this.streamAssistantMessage(
-      messages,
-      handlers,
-      undefined, // tools
-      4096, // maxTokens
-      undefined, // reasoningEffort
-      options?.signal,
-      options?.think
-    );
-    return extractTextSegment(message?.content) || '';
+    while (true) {
+      let message: EngineChatMessage | undefined;
+      let finishReason: string | undefined;
+
+      if (handlers) {
+        message = await this.streamAssistantMessage(
+          currentMessages,
+          handlers,
+          undefined,
+          4096,
+          undefined,
+          options?.signal,
+          options?.think,
+        ) as EngineChatMessage | undefined;
+        finishReason = typeof message?.finish_reason === 'string' ? message.finish_reason : undefined;
+      } else {
+        const result = await this.modelAdapter.createChatCompletion({
+          messages: currentMessages,
+          stream: false,
+          max_tokens: 4096,
+          think: options?.think,
+          signal: options?.signal,
+        });
+        message = {
+          ...(result?.choices?.[0]?.message ?? {}),
+          finish_reason: result?.choices?.[0]?.finish_reason,
+        } as EngineChatMessage;
+        finishReason = typeof result?.choices?.[0]?.finish_reason === 'string' ? result.choices[0].finish_reason : undefined;
+      }
+
+      const content = composeAssistantContent((message ?? {}) as Record<string, unknown>);
+      response += content;
+
+      if (!content) {
+        break;
+      }
+
+      currentMessages.push({ role: 'assistant', content });
+      if (!this.shouldContinueTruncatedResponse(finishReason, content, continuationCount)) {
+        break;
+      }
+
+      continuationCount += 1;
+      this.traceBus.emitEvent({
+        type: 'response_continuation_requested',
+        data: {
+          executionMode: 'direct',
+          attempt: continuationCount,
+          finishReason,
+        },
+      });
+      this.planner.setPhase('continuation');
+      this.planner.setIntendedAction('Continuing truncated response');
+      this.emitChatStatus(handlers, 'continuation', 'Continuing truncated response', continuationCount);
+      currentMessages.push({ role: 'system', content: this.buildContinuationPrompt('direct') });
+      this.replaceMessageBuffer(
+        currentMessages,
+        this.compactLoopMessages(currentMessages, Math.max(this.config.contextBudget, 12_000)),
+      );
+    }
+
+    this.planner.setPhase('ready');
+    this.planner.setIntendedAction('Awaiting user input');
+    this.emitChatStatus(handlers, 'ready', 'Awaiting user input', continuationCount);
+    return response;
   }
 
   private emitChatStatus(handlers: ChatStreamHandlers | undefined, phase: string, action: string, loop: number) {
+    this.planner.setStatusNote(action);
     handlers?.onStatus?.({ phase, action, loop });
   }
 
@@ -2127,6 +2627,7 @@ export class CoreEngine extends EventEmitter {
       return {
         ...message,
         content: composeAssistantContent(message as Record<string, unknown>),
+        finish_reason: result?.choices?.[0]?.finish_reason,
       };
     }
 
@@ -2194,6 +2695,7 @@ export class CoreEngine extends EventEmitter {
       }
 
       if (choice.finish_reason) {
+        message.finish_reason = choice.finish_reason;
         closeThinking();
       }
     };
@@ -2213,13 +2715,80 @@ export class CoreEngine extends EventEmitter {
       processPayload(payload);
     };
 
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearIdleTimer = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = undefined;
+      }
+    };
+    const refreshIdleTimer = () => {
+      clearIdleTimer();
+      if (!Number.isFinite(this.config.streamIdleTimeoutMs) || this.config.streamIdleTimeoutMs <= 0) {
+        return;
+      }
+      idleTimer = setTimeout(() => {
+        reader.cancel(createStreamIdleTimeoutError(Boolean(message.content))).catch(() => {});
+      }, this.config.streamIdleTimeoutMs);
+    };
+
     try {
+      refreshIdleTimer();
       while (true) {
-        const { done, value } = await reader.read();
+        let chunk;
+        try {
+          chunk = await reader.read();
+        } catch (error) {
+          if (!isStreamIdleTimeoutError(error)) {
+            throw error;
+          }
+
+          if (!error.receivedContent) {
+            this.traceBus.emitEvent({
+              type: 'stream_idle_timeout_retry',
+              data: {
+                timeoutMs: this.config.streamIdleTimeoutMs,
+                receivedContent: false,
+              },
+            });
+            const result = await this.modelAdapter.createChatCompletion({
+              messages: currentMessages,
+              stream: false,
+              tools,
+              max_tokens: maxTokens,
+              reasoning_effort: reasoningEffort,
+              think,
+              signal,
+            });
+            const fallbackMessage = result?.choices?.[0]?.message;
+            if (!fallbackMessage) {
+              throw error;
+            }
+            const composed = composeAssistantContent(fallbackMessage as Record<string, unknown>);
+            if (composed) {
+              handlers.onDelta?.(composed);
+            }
+            return {
+              ...fallbackMessage,
+              content: composed,
+            };
+          }
+
+          this.traceBus.emitEvent({
+            type: 'stream_idle_timeout_partial',
+            data: {
+              timeoutMs: this.config.streamIdleTimeoutMs,
+              receivedContent: true,
+            },
+          });
+          break;
+        }
+        const { done, value } = chunk;
         if (done) {
           break;
         }
 
+        refreshIdleTimer();
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() ?? '';
@@ -2228,11 +2797,13 @@ export class CoreEngine extends EventEmitter {
         }
       }
 
+      clearIdleTimer();
       buffer += decoder.decode();
       if (buffer.trim()) {
         processLine(buffer);
       }
     } finally {
+      clearIdleTimer();
       closeThinking();
       reader.releaseLock();
     }
@@ -2258,6 +2829,11 @@ export class CoreEngine extends EventEmitter {
     const workspaceBound = !browserFolderContextActive;
     const workspaceSource = workspaceBound ? 'backend' as const : 'browser_snapshot' as const;
     const promptMode = this.choosePromptMode(messages);
+    const requestMessages = this.compactConversationMessages(
+      messages as EngineChatMessage[],
+      Math.max(5_000, Math.floor(this.config.contextBudget * 0.55)),
+      'agentic',
+    );
     const intentStartedAt = Date.now();
     const intentDecision = classifyIntent({
       latestUserMessage,
@@ -2292,6 +2868,8 @@ export class CoreEngine extends EventEmitter {
       filesDeleted: [],
       directoriesCreated: [],
       searches: [],
+      webSearches: [],
+      webFetches: [],
       commands: [],
       approvals: [],
       metrics: {
@@ -2302,6 +2880,11 @@ export class CoreEngine extends EventEmitter {
     this.planner.startRun(runId);
     this.planner.setTaskSummary(`Intent: ${intentDecision.intent}`);
     this.planner.setPhase('planning');
+    this.planner.setRuntimeContext({
+      ...this.buildPlannerRuntimeContext(),
+      workspaceSource,
+      workspaceBound,
+    });
     this.planner.setActiveSkills(mergeSkills(this.currentSession?.skillsActive ?? [], this.selectOperationalSkills(intentDecision.intent, promptMode)));
     this.planner.setIntendedAction('Classifying request');
 
@@ -2468,6 +3051,9 @@ export class CoreEngine extends EventEmitter {
 
       let manualToolProtocol = toolProtocol.manualToolProtocol;
       let manualProtocolPromptInjected = manualToolProtocol;
+      this.planner.setRuntimeContext({
+        toolProtocol: manualToolProtocol ? 'manual' : 'native',
+      });
       let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol
         ? this.getToolDefinitions(selectedToolNames)
         : undefined;
@@ -2562,10 +3148,10 @@ export class CoreEngine extends EventEmitter {
                 'After tool results, decide next single action or return {"final":"..."} .',
               ].join('\n'),
             },
-            ...messages,
+            ...requestMessages,
           ]
         : this.applyPromptOptimization(
-            messages,
+            requestMessages,
             promptMode,
             includeRepoContext || promptMode !== 'quick_inspect' || (selectedToolNames.length > 0 && !manualToolProtocol),
           );
@@ -2579,16 +3165,20 @@ export class CoreEngine extends EventEmitter {
           `Workspace bound: ${workspaceBound ? 'yes' : 'no'}`,
           `Available tools: ${selectedToolNames.length > 0 ? selectedToolNames.join(', ') : 'none'}`,
           `Tool protocol: ${manualToolProtocol ? 'manual' : 'native'}`,
+          `Context budget: ${this.config.contextBudget} chars`,
+          `Retry budget: ${this.config.toolRetryMax}`,
+          `Session memory: ${this.config.sessionMemoryEnabled ? `${this.config.sessionMemoryTurns} recent turns` : 'off'}`,
+          `Self-check: ${this.config.selfCheckEnabled ? 'required after edits or commands' : 'off'}`,
           'If workspace tools are available and the request is about repo behavior, inspect workspace facts before asking the user for more detail.',
           'Never simulate tool execution or file changes.',
           'Finish with concise answer, What I did, and Files changed.',
         ].join('\n'),
       };
 
-      const currentMessages: any[] = [
-        ...(await this.buildContextMessages(messages, promptMode, includeWorkspaceContext, includeRepoContext)),
+      const currentMessages: EngineChatMessage[] = [
+        ...(await this.buildContextMessages(requestMessages, promptMode, includeWorkspaceContext, includeRepoContext)) as EngineChatMessage[],
         runtimeContract,
-        ...(manualToolProtocol ? [{ role: 'system', content: this.buildManualToolProtocol(selectedToolNames) }] : []),
+        ...(manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),
         ...promptMessages,
       ];
 
@@ -2614,8 +3204,11 @@ export class CoreEngine extends EventEmitter {
       let manualProtocolCorrectionCount = 0;
       let planningOnlyNativeRetryCount = 0;
       let simulatedToolReplyCount = 0;
+      let selfCheckPromptCount = 0;
+      let responseContinuationCount = 0;
       let firstModelCallRecorded = false;
       let firstTokenRecorded = false;
+      const toolRetryMax = Math.max(1, this.config.toolRetryMax);
 
       while (loopCount < MAX_LOOPS) {
         if (manualToolProtocol && manualBootstrapTool) {
@@ -2669,7 +3262,10 @@ export class CoreEngine extends EventEmitter {
             this.recordRunToolMetadata(runBuilder, toolResult.metadata);
             currentMessages.push({
               role: 'user',
-              content: this.formatManualToolResult(bootstrapDecision.name, toolResult.output),
+              content: this.formatManualToolResult(
+                bootstrapDecision.name,
+                this.buildToolResultForModel(bootstrapDecision.name, toolResult),
+              ),
             });
             runBuilder.finishStep(toolStep.id, {
               toolName: bootstrapDecision.name,
@@ -2722,6 +3318,10 @@ export class CoreEngine extends EventEmitter {
           'model',
           loopCount === 1 ? 'Generating assistant response' : 'Processing tool results',
           loopCount,
+        );
+        this.replaceMessageBuffer(
+          currentMessages,
+          this.compactLoopMessages(currentMessages, Math.max(this.config.contextBudget, 12_000)),
         );
         this.traceBus.emitEvent({
           type: 'chat_request',
@@ -2836,9 +3436,15 @@ export class CoreEngine extends EventEmitter {
         }
 
         message.content = composeAssistantContent(message as Record<string, unknown>);
+        const finishReason = typeof (message as { finish_reason?: unknown }).finish_reason === 'string'
+          ? (message as { finish_reason: string }).finish_reason
+          : typeof result?.choices?.[0]?.finish_reason === 'string'
+            ? result.choices[0].finish_reason
+            : undefined;
         currentMessages.push(message);
 
         if (nativeToolDefinitions && message.tool_calls && message.tool_calls.length > 0) {
+          responseContinuationCount = 0;
           runBuilder.markNativeToolsUsed();
           runBuilder.finishStep(modelStep.id, { detail: `Requested ${message.tool_calls.length} tool call(s).` }, 'done');
           const finishedModelStep = runBuilder.snapshot().steps.find((entry) => entry.id === modelStep.id);
@@ -2919,7 +3525,7 @@ export class CoreEngine extends EventEmitter {
                 role: 'tool',
                 tool_call_id: toolCall.id,
                 name,
-                content: toolResult.output,
+                content: this.buildToolResultForModel(name, toolResult),
               });
               runBuilder.finishStep(toolStep.id, {
                 toolName: name,
@@ -2993,7 +3599,7 @@ export class CoreEngine extends EventEmitter {
             this.emitRunStep(streamHandlers, runId, finishedPlanningOnlyStep);
           }
 
-          if (planningOnlyNativeRetryCount < 1) {
+          if (planningOnlyNativeRetryCount < toolRetryMax) {
             planningOnlyNativeRetryCount += 1;
             this.traceBus.emitEvent({
               type: 'native_tool_retry_requested',
@@ -3051,6 +3657,29 @@ export class CoreEngine extends EventEmitter {
           this.emitRunStep(streamHandlers, runId, finishedModelStep);
         }
 
+        if (this.shouldContinueTruncatedResponse(finishReason, response, responseContinuationCount)) {
+          responseContinuationCount += 1;
+          this.traceBus.emitEvent({
+            type: 'response_continuation_requested',
+            data: {
+              runId,
+              executionMode: 'agentic',
+              attempt: responseContinuationCount,
+              finishReason,
+            },
+          });
+          this.planner.setPhase('continuation');
+          this.planner.setCurrentTool(undefined);
+          this.planner.setIntendedAction('Continuing truncated response');
+          this.emitChatStatus(streamHandlers, 'continuation', 'Continuing truncated response', loopCount);
+          currentMessages.push({
+            role: 'system',
+            content: this.buildContinuationPrompt('agentic'),
+          });
+          continue;
+        }
+        responseContinuationCount = 0;
+
         if (manualToolProtocol) {
           if (looksLikeSimulatedToolCall(response)) {
             simulatedToolReplyCount += 1;
@@ -3064,7 +3693,7 @@ export class CoreEngine extends EventEmitter {
               },
             });
 
-            if (simulatedToolReplyCount < 2) {
+            if (simulatedToolReplyCount < toolRetryMax) {
               currentMessages.push({
                 role: 'system',
                 content: RECIPES.manualToolCorrection(),
@@ -3122,7 +3751,10 @@ export class CoreEngine extends EventEmitter {
               this.recordRunToolMetadata(runBuilder, toolResult.metadata);
               currentMessages.push({
                 role: 'user',
-                content: this.formatManualToolResult(manualDecision.name, toolResult.output),
+                content: this.formatManualToolResult(
+                  manualDecision.name,
+                  this.buildToolResultForModel(manualDecision.name, toolResult),
+                ),
               });
               runBuilder.finishStep(toolStep.id, {
                 toolName: manualDecision.name,
@@ -3165,6 +3797,26 @@ export class CoreEngine extends EventEmitter {
           }
 
           if (manualDecision?.kind === 'final') {
+            if (selfCheckPromptCount < toolRetryMax && this.needsPostActionSelfCheck(runBuilder.snapshot())) {
+              selfCheckPromptCount += 1;
+              this.traceBus.emitEvent({
+                type: 'self_check_requested',
+                data: {
+                  runId,
+                  manualToolProtocol: true,
+                  touchedPaths: [...runBuilder.snapshot().filesWritten, ...runBuilder.snapshot().filesDeleted, ...runBuilder.snapshot().directoriesCreated],
+                },
+              });
+              this.planner.setPhase('verification');
+              this.planner.setIntendedAction('Verifying changes before final answer');
+              this.emitChatStatus(streamHandlers, 'verification', 'Verifying changes before final answer', loopCount);
+              currentMessages.push({
+                role: 'system',
+                content: this.buildSelfCheckPrompt(runBuilder.snapshot(), true),
+              });
+              continue;
+            }
+
             this.planner.setPhase('ready');
             this.planner.setCurrentTool(undefined);
             this.planner.setIntendedAction('Awaiting user input');
@@ -3176,7 +3828,7 @@ export class CoreEngine extends EventEmitter {
             return await finalizeRun(manualDecision.content);
           }
 
-          if (selectedToolNames.length > 0 && manualProtocolCorrectionCount < 2) {
+          if (selectedToolNames.length > 0 && manualProtocolCorrectionCount < toolRetryMax) {
             manualProtocolCorrectionCount += 1;
             currentMessages.push({
               role: 'system',
@@ -3197,7 +3849,7 @@ export class CoreEngine extends EventEmitter {
             },
           });
 
-          if (simulatedToolReplyCount < 2) {
+          if (simulatedToolReplyCount < toolRetryMax) {
             currentMessages.push({
               role: 'system',
               content: RECIPES.toolCorrection(),
@@ -3225,6 +3877,27 @@ export class CoreEngine extends EventEmitter {
               reason: 'Model response appears too broad for a tool-driven workflow.',
             },
           });
+        }
+
+        if (selfCheckPromptCount < toolRetryMax && this.needsPostActionSelfCheck(runBuilder.snapshot())) {
+          selfCheckPromptCount += 1;
+          this.traceBus.emitEvent({
+            type: 'self_check_requested',
+            data: {
+              runId,
+              manualToolProtocol: false,
+              touchedPaths: [...runBuilder.snapshot().filesWritten, ...runBuilder.snapshot().filesDeleted, ...runBuilder.snapshot().directoriesCreated],
+            },
+          });
+          this.planner.setPhase('verification');
+          this.planner.setCurrentTool(undefined);
+          this.planner.setIntendedAction('Verifying changes before final answer');
+          this.emitChatStatus(streamHandlers, 'verification', 'Verifying changes before final answer', loopCount);
+          currentMessages.push({
+            role: 'system',
+            content: this.buildSelfCheckPrompt(runBuilder.snapshot(), false),
+          });
+          continue;
         }
 
         this.planner.setPhase('ready');
@@ -3282,6 +3955,14 @@ export class CoreEngine extends EventEmitter {
 
   async searchText(query: string, filePattern?: string) {
     return this.runTool('searchText', query, filePattern || '');
+  }
+
+  async webSearch(query: string) {
+    return this.runTool('webSearch', query);
+  }
+
+  async fetchUrl(url: string) {
+    return this.runTool('fetchUrl', url);
   }
 
   async writeFile(filePath: string, content: string) {

@@ -57,6 +57,23 @@ function pushStepStatus(stepHistory: string[], nextStatus: string) {
   console.log(`\n[step ${stepHistory.length}] ${step}`);
 }
 
+function renderToolProgress(event: { name: string; state: 'start' | 'done'; inputSummary: string; success?: boolean }) {
+  if (event.state === 'start') {
+    console.log(`\n[tool] ${event.name} · ${event.inputSummary}`);
+    return;
+  }
+
+  console.log(`\n[tool ${event.success === false ? 'error' : 'done'}] ${event.name}`);
+}
+
+function renderRunSummary(summary: { summary?: string }) {
+  if (!summary.summary) {
+    return;
+  }
+
+  console.log(`\n[run] ${summary.summary}`);
+}
+
 function supportsThinking(capabilities: string[] | undefined): boolean {
   return Array.isArray(capabilities) && capabilities.includes('thinking');
 }
@@ -95,6 +112,8 @@ async function handlePrompt() {
     { role: 'user', content: promptText },
   ], {
     onStatus: (event) => pushStepStatus(stepHistory, event.action || event.phase),
+    onTool: (event) => renderToolProgress(event),
+    onRunSummary: (event) => renderRunSummary(event.summary),
   }, thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
 
   renderAssistantOutput(response);
@@ -259,10 +278,13 @@ function startRepl() {
   const history: { role: 'user' | 'assistant'; content: string }[] = [];
   const session = engine.startSession();
   let thinkingEnabled = false;
+  const initialConfig = engine.getPublicConfig();
 
   console.log('Gamma Harness CLI');
-  console.log(`Session: ${session.id}  Model: ${session.model}  Mode: ${session.mode}  Execution: agentic  Thinking: ${thinkingEnabled ? 'on' : 'off'}`);
-  console.log("Commands: /help /exit /status /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>");
+  console.log(
+    `Session: ${session.id}  Model: ${session.model}  Mode: ${session.mode}  Execution: agentic  Thinking: ${thinkingEnabled ? 'on' : 'off'}  Memory: ${initialConfig.sessionMemoryEnabled ? `${initialConfig.sessionMemoryTurns} turns` : 'off'}  Retries: ${initialConfig.toolRetryMax}`,
+  );
+  console.log("Commands: /help /exit /status /agent /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>");
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -298,7 +320,7 @@ function startRepl() {
       }
 
       if (input === '/help') {
-        console.log('Slash commands: /exit /quit /bye /clear /help /status /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>');
+        console.log('Slash commands: /exit /quit /bye /clear /help /status /agent /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>');
         rl.prompt();
         return;
       }
@@ -329,6 +351,21 @@ function startRepl() {
           config: engine.getPublicConfig(),
           executionMode: 'agentic',
           thinkingEnabled,
+        }, null, 2));
+        rl.prompt();
+        return;
+      }
+
+      if (input === '/agent') {
+        const config = engine.getPublicConfig();
+        console.log(JSON.stringify({
+          contextBudget: config.contextBudget,
+          toolRetryMax: config.toolRetryMax,
+          sessionMemoryEnabled: config.sessionMemoryEnabled,
+          sessionMemoryTurns: config.sessionMemoryTurns,
+          selfCheckEnabled: config.selfCheckEnabled,
+          internetAccessEnabled: config.internetAccessEnabled,
+          streamIdleTimeoutMs: config.streamIdleTimeoutMs,
         }, null, 2));
         rl.prompt();
         return;
@@ -464,6 +501,12 @@ function startRepl() {
       ], {
         onStatus: (event: { action: string; phase: string }) => {
           pushStepStatus(stepHistory, event.action || event.phase);
+        },
+        onTool: (event: { name: string; state: 'start' | 'done'; inputSummary: string; success?: boolean }) => {
+          renderToolProgress(event);
+        },
+        onRunSummary: (event: { summary: { summary?: string } }) => {
+          renderRunSummary(event.summary);
         },
       }, {
         think: thinkingEnabled,

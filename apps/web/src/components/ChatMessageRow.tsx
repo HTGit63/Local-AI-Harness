@@ -154,10 +154,10 @@ function ChatMessageRowComponent({ message }: { message: ChatMessageRowData }) {
                 assistantParts.map((part, index) => {
                   if (part.kind === 'thought') {
                     return (
-                      <details key={index} className="ai-thought-block" open={isStreaming || part.value.length < 500}>
+                      <details key={index} className="ai-thought-block" open={isStreaming}>
                         <summary className="ai-thought-header">
-                          <span className="ai-thought-icon">[ ]</span>
-                          <span>Reasoning Process</span>
+                          <span className="ai-thought-icon">..</span>
+                          <span>Model Thinking</span>
                         </summary>
                         <StreamingMarkdown content={part.value} isStreaming={isStreaming} className="markdown-body ai-thought-content" />
                       </details>

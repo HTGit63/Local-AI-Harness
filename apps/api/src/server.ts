@@ -7,7 +7,8 @@ import { ModelAdapter } from '@local-harness/model-adapter';
 const PORT = parseInt(process.env.API_PORT || '3001', 10);
 const HOST = process.env.API_HOST || '127.0.0.1';
 const WORKSPACE_ROOT = process.env.HARNESS_WORKSPACE_ROOT || process.cwd();
-const SKILLS_PATH = path.resolve(WORKSPACE_ROOT, 'packages/skills/dist/curated_pack.json');
+const REPO_ROOT = path.resolve(__dirname, '../../..');
+const SKILLS_PATH = path.resolve(REPO_ROOT, 'packages/skills/dist/curated_pack.json');
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_CHAT_IMAGE_ATTACHMENTS = 2;
 const MAX_CHAT_IMAGE_BYTES = 1024 * 1024;
@@ -470,6 +471,47 @@ const server = http.createServer(async (req, res) => {
         sendBadRequest(req, res, 'profile must be one of fast, balanced, or deep.');
         return;
       }
+      if (body.internetAccessEnabled !== undefined && typeof body.internetAccessEnabled !== 'boolean') {
+        sendBadRequest(req, res, 'internetAccessEnabled must be a boolean.');
+        return;
+      }
+      if (
+        body.contextBudget !== undefined &&
+        (typeof body.contextBudget !== 'number' || !Number.isFinite(body.contextBudget) || body.contextBudget < 4000)
+      ) {
+        sendBadRequest(req, res, 'contextBudget must be a number greater than or equal to 4000.');
+        return;
+      }
+      if (
+        body.toolRetryMax !== undefined &&
+        (typeof body.toolRetryMax !== 'number' || !Number.isFinite(body.toolRetryMax) || body.toolRetryMax < 0)
+      ) {
+        sendBadRequest(req, res, 'toolRetryMax must be a non-negative number.');
+        return;
+      }
+      if (body.sessionMemoryEnabled !== undefined && typeof body.sessionMemoryEnabled !== 'boolean') {
+        sendBadRequest(req, res, 'sessionMemoryEnabled must be a boolean.');
+        return;
+      }
+      if (
+        body.sessionMemoryTurns !== undefined &&
+        (typeof body.sessionMemoryTurns !== 'number' || !Number.isFinite(body.sessionMemoryTurns) || body.sessionMemoryTurns < 1)
+      ) {
+        sendBadRequest(req, res, 'sessionMemoryTurns must be a number greater than or equal to 1.');
+        return;
+      }
+      if (body.selfCheckEnabled !== undefined && typeof body.selfCheckEnabled !== 'boolean') {
+        sendBadRequest(req, res, 'selfCheckEnabled must be a boolean.');
+        return;
+      }
+      const streamIdleTimeoutMs = body.streamIdleTimeoutMs;
+      if (
+        streamIdleTimeoutMs !== undefined &&
+        (typeof streamIdleTimeoutMs !== 'number' || !Number.isFinite(streamIdleTimeoutMs) || streamIdleTimeoutMs < 0)
+      ) {
+        sendBadRequest(req, res, 'streamIdleTimeoutMs must be a non-negative number.');
+        return;
+      }
       await engine.updateConfig(body as any, {
         activateModel: body.activateModel === true,
       });
@@ -574,23 +616,10 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (!isAgentic) {
-          await engine.recordTurnExecution('direct', {
-            messageCount: messages.length,
-            thinkingEnabled,
-            imageCount: images.length,
-          });
-
-          const adapter = new ModelAdapter(engine.getPublicConfig() as any);
-          const response = await adapter.createChatCompletion({
-            messages: messages as any,
-            stream: false,
-            think: thinkingEnabled,
-            signal: abortController.signal,
-          }) as any;
-          
-          let content = response?.choices?.[0]?.message?.content || '';
-          const thinking = response?.choices?.[0]?.message?.thinking;
-          if (thinking) content = `<think>${thinking}</think>${content}`;
+          const content = await engine.directChat(
+            messages as { role: 'system' | 'user' | 'assistant' | 'tool'; content: string }[],
+            { signal: abortController.signal, think: thinkingEnabled },
+          );
           sendJson(req, res, 200, { response: content, executionMode: 'direct', ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
           return;
         }

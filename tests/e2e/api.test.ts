@@ -352,15 +352,30 @@ async function testApiWorkflow() {
       mode: string;
       model: string;
       baseUrl: string;
+      contextBudget: number;
+      toolRetryMax: number;
+      sessionMemoryEnabled: boolean;
+      sessionMemoryTurns: number;
+      selfCheckEnabled: boolean;
     }>(`${API_BASE}/api/config`);
     assert.strictEqual(initialConfig.workspaceRoot, workspaceRoot);
     assert.strictEqual(initialConfig.baseUrl, mockModel.baseUrl);
+    assert.strictEqual(initialConfig.contextBudget, 24000);
+    assert.strictEqual(initialConfig.toolRetryMax, 2);
+    assert.strictEqual(initialConfig.sessionMemoryEnabled, true);
+    assert.strictEqual(initialConfig.sessionMemoryTurns, 3);
+    assert.strictEqual(initialConfig.selfCheckEnabled, true);
 
     const updatedConfig = await fetchJson<{
       profile: string;
       mode: string;
       model: string;
       baseUrl: string;
+      contextBudget: number;
+      toolRetryMax: number;
+      sessionMemoryEnabled: boolean;
+      sessionMemoryTurns: number;
+      selfCheckEnabled: boolean;
     }>(`${API_BASE}/api/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -369,10 +384,20 @@ async function testApiWorkflow() {
         mode: 'workspace-write',
         model: 'gemma4:e4b',
         baseUrl: mockModel.baseUrl,
+        contextBudget: 32000,
+        toolRetryMax: 4,
+        sessionMemoryEnabled: true,
+        sessionMemoryTurns: 5,
+        selfCheckEnabled: false,
       }),
     });
     assert.strictEqual(updatedConfig.profile, 'fast');
     assert.strictEqual(updatedConfig.mode, 'workspace-write');
+    assert.strictEqual(updatedConfig.contextBudget, 32000);
+    assert.strictEqual(updatedConfig.toolRetryMax, 4);
+    assert.strictEqual(updatedConfig.sessionMemoryEnabled, true);
+    assert.strictEqual(updatedConfig.sessionMemoryTurns, 5);
+    assert.strictEqual(updatedConfig.selfCheckEnabled, false);
 
     const session = await fetchJson<{ id: string; skillsActive: string[] }>(`${API_BASE}/api/session`, {
       method: 'POST',

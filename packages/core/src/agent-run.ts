@@ -8,6 +8,8 @@ import {
   AgentRunStep,
   AgentRunStepStatus,
   AgentRunStepType,
+  AgentRunWebFetch,
+  AgentRunWebSearch,
 } from '@local-harness/session-store';
 import { ToolResultMetadata } from '@local-harness/tool-runtime';
 
@@ -30,6 +32,22 @@ function mergeSearches(target: AgentRunSearch[], values: AgentRunSearch[] | unde
 function mergeCommands(target: AgentRunCommand[], command?: AgentRunCommand) {
   if (command) {
     target.push(command);
+  }
+}
+
+function mergeWebSearches(target: AgentRunWebSearch[], values: AgentRunWebSearch[] | undefined) {
+  for (const value of values ?? []) {
+    if (!target.some((entry) => entry.query === value.query && entry.engine === value.engine)) {
+      target.push(value);
+    }
+  }
+}
+
+function mergeWebFetches(target: AgentRunWebFetch[], values: AgentRunWebFetch[] | undefined) {
+  for (const value of values ?? []) {
+    if (!target.some((entry) => entry.url === value.url)) {
+      target.push(value);
+    }
   }
 }
 
@@ -59,6 +77,12 @@ export function summarizeRun(run: AgentRun): string {
   }
   if (run.searches.length > 0) {
     facts.push(`ran ${run.searches.length} search${run.searches.length === 1 ? '' : 'es'}`);
+  }
+  if (run.webSearches.length > 0) {
+    facts.push(`searched web ${run.webSearches.length} time${run.webSearches.length === 1 ? '' : 's'}`);
+  }
+  if (run.webFetches.length > 0) {
+    facts.push(`fetched ${run.webFetches.length} web page${run.webFetches.length === 1 ? '' : 's'}`);
   }
   if (run.commands.length > 0) {
     facts.push(`ran ${run.commands.length} command${run.commands.length === 1 ? '' : 's'}`);
@@ -100,6 +124,8 @@ export class AgentRunBuilder {
       filesDeleted: [...run.filesDeleted],
       directoriesCreated: [...run.directoriesCreated],
       searches: [...run.searches],
+      webSearches: [...run.webSearches],
+      webFetches: [...run.webFetches],
       commands: [...run.commands],
       approvals: [...run.approvals],
       metrics: run.metrics ? { ...run.metrics } : undefined,
@@ -117,6 +143,8 @@ export class AgentRunBuilder {
       filesDeleted: [...this.run.filesDeleted],
       directoriesCreated: [...this.run.directoriesCreated],
       searches: this.run.searches.map((entry) => ({ ...entry })),
+      webSearches: this.run.webSearches.map((entry) => ({ ...entry })),
+      webFetches: this.run.webFetches.map((entry) => ({ ...entry })),
       commands: this.run.commands.map((entry) => ({ ...entry })),
       approvals: this.run.approvals.map((entry) => ({ ...entry })),
       metrics: this.run.metrics ? { ...this.run.metrics } : undefined,
@@ -205,6 +233,8 @@ export class AgentRunBuilder {
     uniquePush(this.run.filesDeleted, metadata.fileDeletes);
     uniquePush(this.run.directoriesCreated, metadata.directoriesCreated);
     mergeSearches(this.run.searches, metadata.searches);
+    mergeWebSearches(this.run.webSearches, metadata.webSearches);
+    mergeWebFetches(this.run.webFetches, metadata.webFetches);
     mergeCommands(this.run.commands, metadata.command);
     this.run.git = mergeLineStats(this.run.git, metadata.lineStats);
   }
