@@ -1409,6 +1409,93 @@ export class CoreEngine extends EventEmitter {
     };
   }
 
+  private isProjectHealthInspectionQuestion(latestUserMessage: string): boolean {
+    const normalized = latestUserMessage.toLowerCase();
+    const projectTarget = /\b(app|application|codebase|project|repo|repository|site|website|workspace)\b/.test(normalized);
+    const asksProjectType = /\b(what kind|what type|kind of project|type of project|what is this project|what kind of app)\b/.test(normalized);
+    const asksBugReview = /\b(any bugs?|bugs?|broken|issues?|problems?|working at (its )?best)\b/.test(normalized);
+    return projectTarget && (asksProjectType || asksBugReview);
+  }
+
+  private async tryAnswerFromLocalProjectInspection(latestUserMessage: string): Promise<ImmediateChatAnswer | null> {
+    if (!this.isProjectHealthInspectionQuestion(latestUserMessage)) {
+      return null;
+    }
+
+    const readText = async (relativePath: string): Promise<string | null> => {
+      try {
+        return await fs.readFile(path.join(this.config.workspaceRoot, relativePath), 'utf8');
+      } catch {
+        return null;
+      }
+    };
+
+    const packageRaw = await readText('package.json');
+    let manifest: { name?: unknown; scripts?: Record<string, unknown>; dependencies?: Record<string, unknown>; devDependencies?: Record<string, unknown> } = {};
+    if (packageRaw) {
+      try {
+        manifest = JSON.parse(packageRaw) as typeof manifest;
+      } catch {
+        manifest = {};
+      }
+    }
+    const deps = new Set([
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.devDependencies ?? {}),
+    ]);
+    const scripts = manifest.scripts ?? {};
+    const entryCandidates = ['server.js', 'app.js', 'index.js', 'main.js', 'src/index.js', 'src/main.js'];
+    const entryReads = await Promise.all(entryCandidates.map(async (entry) => [entry, await readText(entry)] as const));
+    const entry = entryReads.find(([, content]) => Boolean(content));
+    const viewFiles = await fs.readdir(path.join(this.config.workspaceRoot, 'views')).catch(() => [] as string[]);
+    const publicFiles = await fs.readdir(path.join(this.config.workspaceRoot, 'public')).catch(() => [] as string[]);
+
+    const typeSignals: string[] = [];
+    if (deps.has('express')) typeSignals.push('Express server');
+    if (deps.has('ejs')) typeSignals.push('EJS server-rendered views');
+    if (deps.has('bootstrap')) typeSignals.push('Bootstrap styling');
+    if (deps.has('axios')) typeSignals.push('Axios HTTP fetches');
+    if (!typeSignals.length && packageRaw) typeSignals.push('Node.js package');
+
+    const findings: string[] = [];
+    const testScript = typeof scripts.test === 'string' ? scripts.test : '';
+    if (!testScript || /no test specified/i.test(testScript)) {
+      findings.push('No real test script is configured.');
+    }
+    if (!entry) {
+      findings.push('No common server/client entry file found at root.');
+    }
+    if (entry?.[1] && deps.has('axios') && /https?:\/\//.test(entry[1]) && !/process\.env/.test(entry[1])) {
+      findings.push('External API URL appears hard-coded instead of env-configured.');
+    }
+    if (entry?.[1] && /app\.listen\((?:3000|["']3000["'])/.test(entry[1]) && !/process\.env\.PORT/.test(entry[1])) {
+      findings.push('Server port appears hard-coded instead of using process.env.PORT.');
+    }
+    if (!findings.length) {
+      findings.push('No obvious static bug found from manifest and entry-file inspection.');
+    }
+
+    const projectName = typeof manifest.name === 'string' && manifest.name.trim() ? manifest.name.trim() : 'this workspace';
+    const inspected = [
+      packageRaw ? 'package.json' : null,
+      entry ? entry[0] : null,
+      viewFiles.length ? `views (${viewFiles.slice(0, 4).join(', ')})` : null,
+      publicFiles.length ? 'public assets' : null,
+    ].filter((value): value is string => Boolean(value));
+    const answer = [
+      `${projectName} looks like this kind of web app: ${typeSignals.join(' + ')}.`,
+      `Inspected: ${inspected.join(', ') || 'workspace metadata only'}.`,
+      `Potential issues: ${findings.join(' ')}`,
+      'Runtime bugs still need app start/test verification.',
+    ].join('\n');
+
+    return {
+      content: answer,
+      action: 'Summarizing project type and static bug risks',
+      source: 'local_project_inspection',
+    };
+  }
+
   private async tryAnswerFromRootManifest(latestUserMessage: string): Promise<ImmediateChatAnswer | null> {
     const normalized = latestUserMessage.toLowerCase();
     const writeIntent = /\b(create|write|add|update|modify|change|edit|fix|implement|generate|save|insert|replace|append|remove|delete)\b/.test(normalized);
@@ -1650,6 +1737,60 @@ export class CoreEngine extends EventEmitter {
     }
 
     return [];
+  }
+
+  private buildTaskBootstrapPlan(
+    taskPlan: TaskPlan,
+    taskContext: TaskContext | null,
+    toolNames: SupportedTool[],
+  ): BootstrapPlanStep[] {
+    if (taskPlan.complexity !== 'repo_wide_audit' || !taskContext) {
+      return [];
+    }
+
+    const plan: BootstrapPlanStep[] = [];
+    if (toolNames.includes('listDir')) {
+      plan.push({ type: 'tool', title: 'List workspace root', toolName: 'listDir', args: { dirPath: '.' } });
+    }
+
+    if (!toolNames.includes('readFile')) {
+      return plan;
+    }
+
+    const candidateFiles = Array.from(new Set([
+      ...taskContext.relevantFiles,
+      ...taskContext.likelyEntryPoints,
+      ...taskContext.likelyTests,
+    ])).slice(0, 4);
+
+    for (const filePath of candidateFiles) {
+      plan.push({
+        type: 'tool',
+        title: `Inspect ${filePath}`,
+        toolName: 'readFile',
+        args: { filePath },
+      });
+    }
+
+    return plan;
+  }
+
+  private mergeBootstrapPlans(...plans: BootstrapPlanStep[][]): BootstrapPlanStep[] {
+    const seen = new Set<string>();
+    const merged: BootstrapPlanStep[] = [];
+
+    for (const step of plans.flat()) {
+      const key = step.type === 'inventory'
+        ? `inventory:${step.title}`
+        : `tool:${step.toolName}:${JSON.stringify(step.args)}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(step);
+    }
+
+    return merged;
   }
 
   private emitRunStarted(handlers: ChatStreamHandlers | undefined, event: RunStartedEvent) {
@@ -3397,6 +3538,9 @@ export class CoreEngine extends EventEmitter {
 	    };
 
 	    const startTaskStep = async (preferredStep?: TaskStep | null): Promise<TaskStep | null> => {
+	      if (!preferredStep && currentTaskStep) {
+	        return currentTaskStep;
+	      }
 	      const nextStep = preferredStep ?? this.taskOrchestrator.getNextStep(taskPlan);
 	      if (!nextStep || nextStep.status !== 'pending') {
 	        return currentTaskStep;
@@ -3459,7 +3603,7 @@ export class CoreEngine extends EventEmitter {
 	      : null;
 		    await persistCheckpoint();
 	    const initialTaskStep = await startTaskStep();
-	    if (initialTaskStep && (initialTaskStep.type === 'intake' || initialTaskStep.type === 'inspect')) {
+	    if (initialTaskStep && initialTaskStep.type === 'intake') {
 	      await completeCurrentTaskStep(taskContext ? `Task context selected: ${taskContext.taskArea}` : 'No backend task context available');
 	    }
 
@@ -3682,12 +3826,31 @@ export class CoreEngine extends EventEmitter {
       ];
 
       if (workspaceBound) {
-        await this.executeBootstrapPlan(
+        const bootstrapPlan = this.mergeBootstrapPlans(
           this.buildBootstrapPlan(intentDecision, promptMode, selectedToolNames),
+          this.buildTaskBootstrapPlan(taskPlan, taskContext, selectedToolNames),
+        );
+        await this.executeBootstrapPlan(
+          bootstrapPlan,
           currentMessages,
           streamHandlers,
           runBuilder,
         );
+        const completedBootstrapWork = runBuilder.snapshot().steps.some((step) =>
+          ['inventory', 'tool'].includes(step.type) && step.status === 'done',
+        );
+        const runningTaskStep = currentTaskStep as TaskStep | null;
+        if (completedBootstrapWork && runningTaskStep?.type === 'inspect') {
+          await completeCurrentTaskStep('Bootstrap inspection completed');
+        }
+      }
+
+      const localProjectInspection = workspaceBound
+        ? await this.tryAnswerFromLocalProjectInspection(latestUserMessage)
+        : null;
+      if (localProjectInspection !== null) {
+        this.completeImmediateResponse(streamHandlers, localProjectInspection);
+        return await finalizeRun(localProjectInspection.content);
       }
 
       let streamedToolEventCounter = 0;

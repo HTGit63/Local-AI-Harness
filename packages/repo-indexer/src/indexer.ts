@@ -315,7 +315,7 @@ export class RepoIndexer {
       else if (file.toLowerCase().endsWith('readme.md') && Object.keys(readmes).length < MAX_README_PREVIEW) {
         try { readmes[file] = (await fs.readFile(path.join(this.cwd, file), 'utf8')).slice(0, 1000); } catch {}
       }
-      else if ((entryRegex.test(file) || file === 'index.js' || file === 'main.py' || file.endsWith('App.tsx')) && entryPoints.length < MAX_ENTRY_POINT_PREVIEW) {
+      else if ((entryRegex.test(file) || file === 'index.js' || file === 'main.js' || file === 'server.js' || file === 'app.js' || file === 'main.py' || file.endsWith('App.tsx')) && entryPoints.length < MAX_ENTRY_POINT_PREVIEW) {
         entryPoints.push(file);
       }
     }
@@ -493,6 +493,14 @@ export class RepoIndexer {
       unknown: [
         'package.json',
         'README.md',
+        'server.js',
+        'app.js',
+        'index.js',
+        'main.js',
+        'src/index.js',
+        'src/main.js',
+        'public/index.html',
+        'views/index.ejs',
         'packages/core/src/engine.ts',
         'apps/api/src/server.ts',
         'apps/web/src/HarnessApp.tsx',
@@ -516,10 +524,14 @@ export class RepoIndexer {
     const entryPoints = Array.from(expanded).filter((entry) =>
       entry.endsWith('engine.ts') ||
       entry.endsWith('server.ts') ||
+      entry.endsWith('server.js') ||
+      entry.endsWith('app.js') ||
+      entry.endsWith('main.js') ||
       entry.endsWith('HarnessApp.tsx') ||
       entry.endsWith('registry.ts') ||
       entry.endsWith('indexer.ts') ||
-      entry.endsWith('index.ts'),
+      entry.endsWith('index.ts') ||
+      entry.endsWith('index.js'),
     );
     const tests = area === 'web_ui'
       ? ['tests/e2e/api.test.ts', 'tests/unit/core.test.ts']

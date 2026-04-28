@@ -254,6 +254,15 @@ function isUiRefactorRequest(normalized: string): boolean {
   return /\b(ui|web ui|frontend|redesign|layout|component|sidebar|right panel|run console|cockpit)\b/.test(normalized);
 }
 
+function isProjectInspectionRequest(normalized: string): boolean {
+  const projectTarget = /\b(app|application|codebase|project|repo|repository|site|website|workspace)\b/.test(normalized);
+  const asksToInspect = /\b(analy[sz]e|check|inspect|look at|review|scan)\b/.test(normalized);
+  const asksProjectType = /\b(what kind|what type|kind of project|type of project|what is this project|what kind of app)\b/.test(normalized);
+  const asksBugReview = /\b(any bugs?|bugs?|broken|issues?|problems?|working at (its )?best)\b/.test(normalized);
+
+  return projectTarget && (asksProjectType || asksBugReview || (asksToInspect && /\b(files?|source|structure)\b/.test(normalized)));
+}
+
 export class TaskOrchestrator {
   classifyComplexity(input: ClassifyInput): TaskComplexity {
     const normalized = normalizeText(input.userRequest);
@@ -283,8 +292,12 @@ export class TaskOrchestrator {
       return 'multi_file';
     }
 
-    if (WRITE_INTENTS.has(input.intent) || /\b(fix|add|patch|bug|route|settings|drawer|missing|broken)\b/.test(normalized)) {
+    if (WRITE_INTENTS.has(input.intent) || /\b(fix|add|patch|route|settings|drawer|missing|broken)\b/.test(normalized)) {
       return 'small_patch';
+    }
+
+    if (isProjectInspectionRequest(normalized)) {
+      return 'repo_wide_audit';
     }
 
     if (DIRECT_INTENTS.has(input.intent) || /\b(what is|explain|which|current|active|status)\b/.test(normalized)) {

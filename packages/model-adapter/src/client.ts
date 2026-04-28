@@ -496,7 +496,7 @@ export class ModelAdapter {
 
   private async createOllamaChatCompletion(request: ChatCompletionRequest) {
     const profile = PROFILES[this.profileName] || PROFILES['balanced'];
-    const chatTimeout = Math.max(this.timeoutMs, 60_000);
+    const chatTimeout = Math.max(this.timeoutMs * 4, 180_000);
     const response = await this.fetchWithRetry(`${this.nativeBaseUrl}/api/chat`, {
       method: 'POST',
       headers: this.headers,
@@ -772,12 +772,19 @@ export class ModelAdapter {
     const effectiveTimeout = timeoutMs ?? this.timeoutMs;
     let lastError: any;
     for (let attempt = 0; attempt <= this.retries; attempt++) {
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      let abortFromCaller: (() => void) | undefined;
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, effectiveTimeout);
         
         if (options.signal) {
-          options.signal.addEventListener('abort', () => controller.abort());
+          abortFromCaller = () => controller.abort();
+          options.signal.addEventListener('abort', abortFromCaller, { once: true });
           if (options.signal.aborted) {
             controller.abort();
           }
@@ -787,8 +794,6 @@ export class ModelAdapter {
           ...options,
           signal: controller.signal as any
         });
-        
-        clearTimeout(timeoutId);
 
         if (response.ok) {
           return response;
@@ -802,9 +807,18 @@ export class ModelAdapter {
         return response;
 
       } catch (error) {
-        lastError = error;
+        lastError = timedOut && (error as { name?: string })?.name === 'AbortError'
+          ? new Error(`Model request timed out after ${Math.round(effectiveTimeout / 1000)}s before response.`)
+          : error;
         if (attempt < this.retries) {
           await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt))); // Exponential backoff
+        }
+      } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        if (options.signal && abortFromCaller) {
+          options.signal.removeEventListener('abort', abortFromCaller);
         }
       }
     }
@@ -851,7 +865,7 @@ export class ModelAdapter {
       tools: request.tools
     };
 
-    const chatTimeout = Math.max(this.timeoutMs, 60_000);
+    const chatTimeout = Math.max(this.timeoutMs * 4, 180_000);
     const response = await this.fetchWithRetry(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: this.headers,

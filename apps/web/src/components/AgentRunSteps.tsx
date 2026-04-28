@@ -24,7 +24,7 @@ export function AgentRunSteps({ steps }: { steps: AgentRunStepData[] }) {
         {steps.map((step) => (
           <div
             key={step.id}
-            className={`tool-tracker-step ${step.status === 'running' ? 'active' : ''} ${step.status === 'done' ? 'done' : ''}`}
+            className={`tool-tracker-step tool-tracker-step-${step.status} ${step.status === 'running' ? 'active' : ''} ${step.status === 'done' ? 'done' : ''}`}
           >
             <span className={`tool-badge ${
               step.status === 'error'

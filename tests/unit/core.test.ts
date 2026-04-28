@@ -104,6 +104,11 @@ function testTaskOrchestratorClassifiesComplexity() {
   }), 'repo_wide_audit');
 
   assert.strictEqual(orchestrator.classifyComplexity({
+    userRequest: 'Look at the art gallery website and tell me what kind of project it is and if there are any bugs',
+    intent: 'general_chat',
+  }), 'repo_wide_audit');
+
+  assert.strictEqual(orchestrator.classifyComplexity({
     userRequest: 'Rewrite the whole project from scratch',
     intent: 'edit_code',
   }), 'unsafe_or_too_broad');

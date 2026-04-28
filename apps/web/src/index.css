@@ -2264,6 +2264,15 @@ a {
   color: var(--text-tertiary);
 }
 
+.tool-tracker-step-error {
+  color: var(--danger);
+  border-left: 2px solid var(--danger);
+}
+
+.tool-tracker-step-skipped {
+  opacity: 0.62;
+}
+
 .tool-tracker-result {
   max-height: 120px;
   overflow-y: auto;
