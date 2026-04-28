@@ -1,3 +1,5 @@
+import type { TaskComplexity, TaskPlan } from '@local-harness/task-orchestrator';
+
 export interface PlanState {
   taskSummary: string;
   currentPhase: string;
@@ -19,6 +21,15 @@ export interface PlanState {
   lastStatus?: string;
   currentRunId?: string;
   currentTool?: string;
+  taskPlan?: TaskPlan;
+  currentStepId?: string;
+  complexity?: TaskComplexity;
+  stepProgress?: {
+    total: number;
+    completed: number;
+    failed: number;
+    blocked: number;
+  };
   runSteps?: Array<{
     id: string;
     type: string;
@@ -37,6 +48,6 @@ export interface PlanState {
 }
 
 export interface PlannerTraceEvent {
-  type: 'plan_update' | 'phase_change' | 'action_intent' | 'blocker_added' | 'task_complete';
+  type: 'plan_update' | 'phase_change' | 'action_intent' | 'blocker_added' | 'task_complete' | 'task_plan_update';
   payload: Partial<PlanState>;
 }

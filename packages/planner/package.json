@@ -6,6 +6,9 @@
   "scripts": {
     "build": "tsc"
   },
+  "dependencies": {
+    "@local-harness/task-orchestrator": "file:../task-orchestrator"
+  },
   "devDependencies": {
     "@types/node": "^25.6.0",
     "typescript": "^5.0.0"

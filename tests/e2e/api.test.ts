@@ -357,6 +357,8 @@ async function testApiWorkflow() {
       sessionMemoryEnabled: boolean;
       sessionMemoryTurns: number;
       selfCheckEnabled: boolean;
+      localModelBudgetProfile?: string;
+      localModelBudget?: { maxModelCallsPerRun: number; maxToolCallsPerRun: number };
     }>(`${API_BASE}/api/config`);
     assert.strictEqual(initialConfig.workspaceRoot, workspaceRoot);
     assert.strictEqual(initialConfig.baseUrl, mockModel.baseUrl);
@@ -365,6 +367,8 @@ async function testApiWorkflow() {
     assert.strictEqual(initialConfig.sessionMemoryEnabled, true);
     assert.strictEqual(initialConfig.sessionMemoryTurns, 3);
     assert.strictEqual(initialConfig.selfCheckEnabled, true);
+    assert.strictEqual(initialConfig.localModelBudgetProfile, 'balanced');
+    assert.strictEqual(initialConfig.localModelBudget?.maxModelCallsPerRun, 10);
 
     const updatedConfig = await fetchJson<{
       profile: string;
@@ -376,6 +380,7 @@ async function testApiWorkflow() {
       sessionMemoryEnabled: boolean;
       sessionMemoryTurns: number;
       selfCheckEnabled: boolean;
+      localModelBudgetProfile?: string;
     }>(`${API_BASE}/api/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -389,6 +394,7 @@ async function testApiWorkflow() {
         sessionMemoryEnabled: true,
         sessionMemoryTurns: 5,
         selfCheckEnabled: false,
+        localModelBudgetProfile: 'lean',
       }),
     });
     assert.strictEqual(updatedConfig.profile, 'fast');
@@ -398,6 +404,7 @@ async function testApiWorkflow() {
     assert.strictEqual(updatedConfig.sessionMemoryEnabled, true);
     assert.strictEqual(updatedConfig.sessionMemoryTurns, 5);
     assert.strictEqual(updatedConfig.selfCheckEnabled, false);
+    assert.strictEqual(updatedConfig.localModelBudgetProfile, 'lean');
 
     const session = await fetchJson<{ id: string; skillsActive: string[] }>(`${API_BASE}/api/session`, {
       method: 'POST',
@@ -477,11 +484,27 @@ async function testApiWorkflow() {
     const agenticDone = agenticEvents.find((event) => event.type === 'done');
     assert.ok(String(agenticDone?.response || '').includes('Direct stream works.'));
     assert.ok(String(agenticDone?.response || '').includes('What I did:'));
+    assert.ok(agenticEvents.some((event) => event.type === 'task_plan_created'));
+    assert.ok(agenticEvents.some((event) => event.type === 'task_step_started'));
+    assert.ok(agenticEvents.some((event) => event.type === 'task_step_completed'));
+    assert.ok(agenticEvents.some((event) => event.type === 'task_checkpoint_saved'));
     const agenticRunSummary = agenticEvents.find((event) => event.type === 'run_summary');
     assert.ok(agenticRunSummary);
     assert.strictEqual(agenticRunSummary?.summary?.workspaceSource, 'backend');
     assert.strictEqual(agenticRunSummary?.summary?.workspaceBound, true);
     assert.ok(mockModel.getChatRequests().length > chatRequestsBeforeAgentic);
+
+    const planState = await fetchJson<{ taskPlan?: { complexity?: string; steps?: unknown[] } }>(`${API_BASE}/api/plan`);
+    assert.ok(planState.taskPlan);
+    assert.ok(Array.isArray(planState.taskPlan?.steps));
+
+    const runs = await fetchJson<Array<{ runId: string; taskPlan: { id: string; complexity: string } }>>(`${API_BASE}/api/runs`);
+    assert.ok(runs.length >= 1);
+    const firstRun = await fetchJson<{ runId: string; taskPlan: { id: string } }>(`${API_BASE}/api/runs/${runs[0].runId}`);
+    assert.strictEqual(firstRun.runId, runs[0].runId);
+    const checkpoint = await fetchJson<{ runId: string; taskPlan: { id: string }; completedSteps: string[] }>(`${API_BASE}/api/runs/${runs[0].runId}/checkpoint`);
+    assert.strictEqual(checkpoint.runId, runs[0].runId);
+    assert.ok(Array.isArray(checkpoint.completedSteps));
 
     const sessionAfterAgentic = await fetchJson<SessionState>(`${API_BASE}/api/session`);
     const latestAgenticTurn = [...(sessionAfterAgentic.turnHistory || [])]

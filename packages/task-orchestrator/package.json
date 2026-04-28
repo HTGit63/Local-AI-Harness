@@ -1,13 +1,10 @@
 {
-  "name": "@local-harness/repo-indexer",
+  "name": "@local-harness/task-orchestrator",
   "version": "0.1.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc"
-  },
-  "dependencies": {
-    "@local-harness/task-orchestrator": "file:../task-orchestrator"
   },
   "devDependencies": {
     "typescript": "^5.0.0",

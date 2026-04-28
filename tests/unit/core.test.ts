@@ -6,6 +6,7 @@ import { CoreEngine, PromptAnalyzer } from '@local-harness/core';
 import { ModelAdapter, PROFILES, type ChatMessage as AdapterChatMessage } from '@local-harness/model-adapter';
 import { PromptOptimizer, RECIPES } from '@local-harness/prompt-recipes';
 import { RepoIndexer } from '@local-harness/repo-indexer';
+import { TaskOrchestrator } from '@local-harness/task-orchestrator';
 import { WorkspacePolicy } from '@local-harness/workspace-policy';
 import { createMockFetch, MOCK_CHAT_RESPONSE, MOCK_MODEL_CAPABILITIES, MOCK_MODEL_LIST } from '../mocks/model-responses';
 
@@ -72,6 +73,73 @@ function testWorkspacePolicy() {
   assert.deepStrictEqual(dangerPolicy.checkAction('write', 'src/index.ts').allowed, true);
   assert.deepStrictEqual(dangerPolicy.checkAction('write', 'src/index.ts').requiresApproval, false);
   assert.deepStrictEqual(dangerPolicy.checkAction('write', '/etc/passwd').allowed, false);
+}
+
+function testTaskOrchestratorClassifiesComplexity() {
+  const orchestrator = new TaskOrchestrator();
+
+  assert.strictEqual(orchestrator.classifyComplexity({
+    userRequest: 'Which model is active?',
+    intent: 'model_status',
+  }), 'direct_answer');
+
+  assert.strictEqual(orchestrator.classifyComplexity({
+    userRequest: 'Fix apps/web/src/HarnessApp.tsx',
+    intent: 'edit_code',
+  }), 'single_file');
+
+  assert.strictEqual(orchestrator.classifyComplexity({
+    userRequest: 'Refactor the web UI into components and add a run console',
+    intent: 'edit_code',
+  }), 'multi_file');
+
+  assert.strictEqual(orchestrator.classifyComplexity({
+    userRequest: 'Add a task orchestrator and fix complex agent execution architecture',
+    intent: 'edit_code',
+  }), 'architecture_change');
+
+  assert.strictEqual(orchestrator.classifyComplexity({
+    userRequest: 'Audit the whole codebase and find all bottlenecks',
+    intent: 'read_repo',
+  }), 'repo_wide_audit');
+
+  assert.strictEqual(orchestrator.classifyComplexity({
+    userRequest: 'Rewrite the whole project from scratch',
+    intent: 'edit_code',
+  }), 'unsafe_or_too_broad');
+}
+
+function testTaskOrchestratorPlanAndStepTransitions() {
+  const orchestrator = new TaskOrchestrator();
+  const plan = orchestrator.createPlan({
+    userRequest: 'Fix apps/web/src/HarnessApp.tsx',
+    intent: 'edit_code',
+    workspaceRoot: '/repo',
+  });
+
+  assert.strictEqual(plan.complexity, 'single_file');
+  assert.deepStrictEqual(plan.steps.map((step) => step.type), ['inspect', 'edit', 'verify', 'summarize']);
+
+  const first = orchestrator.getNextStep(plan);
+  assert.ok(first);
+  assert.strictEqual(first?.id, 'inspect_target');
+
+  const running = orchestrator.markStepRunning(plan, first!.id);
+  assert.strictEqual(running.steps[0].status, 'running');
+
+  const done = orchestrator.markStepDone(running, first!.id, 'Read target file');
+  assert.strictEqual(done.steps[0].status, 'done');
+  assert.strictEqual(done.steps[0].detail, 'Read target file');
+  assert.strictEqual(orchestrator.getNextStep(done)?.id, 'focused_action');
+
+  const failed = orchestrator.markStepFailed(done, 'focused_action', 'Patch rejected');
+  assert.strictEqual(failed.steps[1].status, 'failed');
+  assert.ok(failed.failedAt);
+
+  const blocked = orchestrator.markStepBlocked(done, 'focused_action', 'Approval pending');
+  assert.strictEqual(blocked.steps[1].status, 'blocked');
+  assert.strictEqual(orchestrator.isComplete(blocked), false);
+  assert.ok(orchestrator.summarizeProgress(blocked).includes('1/4 steps done'));
 }
 
 async function testModelAdapter() {
@@ -334,6 +402,78 @@ async function testEnginePrioritizesEditsWithoutAutoRepoContext() {
   }
 }
 
+async function testDirectChatDoesNotCreateTaskPlan() {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = createMockFetch() as typeof fetch;
+
+  try {
+    const engine = new CoreEngine();
+    await engine.directChat([
+      { role: 'user', content: 'Say PING in direct mode' },
+    ]);
+
+    assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'task_plan_created'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testEngineCreatesTaskPlanTraceAndCheckpoint() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-orchestrated-run-'));
+  await fs.mkdir(path.join(workspaceRoot, 'packages', 'core', 'src'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'packages', 'planner', 'src'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'apps', 'api', 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({ name: 'orchestrated-run' }), 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'packages', 'core', 'src', 'engine.ts'), 'export const engine = true;\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'packages', 'planner', 'src', 'planner.ts'), 'export const planner = true;\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'apps', 'api', 'src', 'server.ts'), 'export const server = true;\n', 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Architecture pass scoped into visible steps.' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, model: 'gemma4:e4b', localModelBudgetProfile: 'lean' });
+    const response = await engine.chat([
+      { role: 'user', content: 'Add a task orchestrator and fix complex agent execution architecture' },
+    ]);
+
+    assertAgenticResponse(response, 'Architecture pass scoped into visible steps.');
+    assert.ok(chatRequests.length >= 1);
+    const promptPayload = JSON.stringify(chatRequests[0].messages);
+    assert.ok(promptPayload.includes('[Current Task Plan]'));
+    assert.ok(promptPayload.includes('[Current Step]'));
+    assert.ok(promptPayload.includes('[Task Relevant Context]'));
+    assert.ok(promptPayload.includes('Task complexity: architecture_change'));
+
+    const traceTypes = engine.getTraceLog().map((entry) => entry.type);
+    assert.ok(traceTypes.includes('task_plan_created'));
+    assert.ok(traceTypes.includes('task_step_started'));
+    assert.ok(traceTypes.includes('task_step_completed'));
+    assert.ok(traceTypes.includes('task_checkpoint_saved'));
+
+    const taskPlanTrace = engine.getTraceLog().find((entry) => entry.type === 'task_plan_created');
+    assert.strictEqual((taskPlanTrace?.data as { plan?: { complexity?: string } } | undefined)?.plan?.complexity, 'architecture_change');
+
+    const runFiles = await fs.readdir(path.join(workspaceRoot, '.gamma-harness', 'runs'));
+    assert.ok(runFiles.some((file) => file.endsWith('.json')));
+    const runs = await engine.listRuns();
+    assert.ok(runs.length >= 1);
+    assert.strictEqual(runs[0].taskPlan.complexity, 'architecture_change');
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testRepoIndexerExcludesVendoredAndSessionDirs() {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-indexer-'));
   await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
@@ -387,6 +527,43 @@ async function testRepoIndexerBuildsWorkspaceInventory() {
     assert.deepStrictEqual(inventory.packages.map((entry) => entry.name), ['@local-harness/core']);
     assert.ok(inventory.references.some((entry) => entry.area === 'base_repos' && entry.entries.includes('claw-code')));
     assert.ok(inventory.references.some((entry) => entry.area === 'third_party' && entry.entries.includes('openclaw')));
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testRepoIndexerBuildsTaskContext() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-task-context-'));
+  await fs.mkdir(path.join(workspaceRoot, 'apps', 'web', 'src'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'packages', 'core', 'src'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'packages', 'planner', 'src'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'tests', 'unit'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'apps', 'web', 'src', 'HarnessApp.tsx'), 'export default function App() { return null; }\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'apps', 'web', 'src', 'index.css'), ':root {}\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'packages', 'core', 'src', 'engine.ts'), 'export const engine = true;\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'packages', 'planner', 'src', 'planner.ts'), 'export const planner = true;\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'tests', 'unit', 'core.test.ts'), 'export {};\n', 'utf8');
+
+  try {
+    const indexer = new RepoIndexer(workspaceRoot);
+    const webContext = await indexer.buildTaskContext({
+      userRequest: 'Redesign the messy web UI and add a right run console',
+      intent: 'edit_code',
+      complexity: 'multi_file',
+    });
+    assert.strictEqual(webContext.taskArea, 'web_ui');
+    assert.ok(webContext.relevantFiles.includes('apps/web/src/HarnessApp.tsx'));
+    assert.ok(webContext.relevantFiles.includes('apps/web/src/index.css'));
+
+    const architectureContext = await indexer.buildTaskContext({
+      userRequest: 'Add task orchestration to the agent loop architecture',
+      intent: 'edit_code',
+      complexity: 'architecture_change',
+    });
+    assert.strictEqual(architectureContext.taskArea, 'task_orchestration');
+    assert.ok(architectureContext.relevantFiles.includes('packages/core/src/engine.ts'));
+    assert.ok(architectureContext.relevantFiles.includes('packages/planner/src/planner.ts'));
+    assert.ok(architectureContext.likelyTests.includes('tests/unit/core.test.ts'));
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
@@ -1235,6 +1412,8 @@ async function run() {
   testPromptRecipes();
   await testPromptAnalyzerIsPassThrough();
   testWorkspacePolicy();
+  testTaskOrchestratorClassifiesComplexity();
+  testTaskOrchestratorPlanAndStepTransitions();
   await testModelAdapter();
   await testModelAdapterPrefersNativeOllamaChat();
   await testEnginePromptRecipeSelection();
@@ -1243,8 +1422,11 @@ async function run() {
   await testEngineChatStreamEmitsToolEvents();
   await testEngineRecordsExecutionModes();
   await testEnginePrioritizesEditsWithoutAutoRepoContext();
+  await testDirectChatDoesNotCreateTaskPlan();
+  await testEngineCreatesTaskPlanTraceAndCheckpoint();
   await testRepoIndexerExcludesVendoredAndSessionDirs();
   await testRepoIndexerBuildsWorkspaceInventory();
+  await testRepoIndexerBuildsTaskContext();
   await testEngineKeepsSimplePromptsLean();
   await testEnginePrefersNativeToolsForGemmaTargetedEdits();
   await testEngineKeepsNativeToolsWhenCapabilitiesOmitTools();

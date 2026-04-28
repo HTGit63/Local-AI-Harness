@@ -100,6 +100,15 @@ function writeNdjson(res: http.ServerResponse, event: unknown) {
   }
 }
 
+function writeTraceNdjson(res: http.ServerResponse, event: { type: string; id?: string; timestamp?: number; data?: unknown }) {
+  writeNdjson(res, {
+    type: event.type,
+    id: event.id,
+    timestamp: event.timestamp,
+    data: event.data,
+  });
+}
+
 async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -447,6 +456,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const validModes = new Set(['read-only', 'workspace-write', 'danger']);
       const validProfiles = new Set(['fast', 'balanced', 'deep']);
+      const validBudgetProfiles = new Set(['lean', 'balanced', 'deep']);
       if (body.baseUrl !== undefined && typeof body.baseUrl !== 'string') {
         sendBadRequest(req, res, 'baseUrl must be a string.');
         return;
@@ -469,6 +479,10 @@ const server = http.createServer(async (req, res) => {
       }
       if (body.profile !== undefined && (typeof body.profile !== 'string' || !validProfiles.has(body.profile))) {
         sendBadRequest(req, res, 'profile must be one of fast, balanced, or deep.');
+        return;
+      }
+      if (body.localModelBudgetProfile !== undefined && (typeof body.localModelBudgetProfile !== 'string' || !validBudgetProfiles.has(body.localModelBudgetProfile))) {
+        sendBadRequest(req, res, 'localModelBudgetProfile must be one of lean, balanced, or deep.');
         return;
       }
       if (body.internetAccessEnabled !== undefined && typeof body.internetAccessEnabled !== 'boolean') {
@@ -685,6 +699,7 @@ const server = http.createServer(async (req, res) => {
               onRunStep: (event) => writeNdjson(res, event),
               onRunMetric: (event) => writeNdjson(res, event),
               onRunSummary: (event) => writeNdjson(res, event),
+              onTrace: (event) => writeTraceNdjson(res, event),
             },
             { signal: abortController.signal, think: thinkingEnabled }
           );
@@ -705,6 +720,7 @@ const server = http.createServer(async (req, res) => {
             onRunStep: (event) => writeNdjson(res, event),
             onRunMetric: (event) => writeNdjson(res, event),
             onRunSummary: (event) => writeNdjson(res, event),
+            onTrace: (event) => writeTraceNdjson(res, event),
           },
           { signal: abortController.signal, think: thinkingEnabled },
         );
@@ -724,6 +740,32 @@ const server = http.createServer(async (req, res) => {
         req.off('aborted', onAbort);
         res.off('close', onAbort);
       }
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/runs' && method === 'GET') {
+      sendJson(req, res, 200, await engine.listRuns());
+      return;
+    }
+
+    if (requestUrl.pathname.startsWith('/api/runs/') && requestUrl.pathname.endsWith('/checkpoint') && method === 'GET') {
+      const runId = requestUrl.pathname.split('/')[3];
+      const checkpoint = await engine.getRunCheckpoint(runId);
+      sendJson(req, res, checkpoint ? 200 : 404, checkpoint || { error: 'Run checkpoint not found.' });
+      return;
+    }
+
+    if (requestUrl.pathname.startsWith('/api/runs/') && requestUrl.pathname.endsWith('/resume') && method === 'POST') {
+      const runId = requestUrl.pathname.split('/')[3];
+      const checkpoint = await engine.resumeRun(runId);
+      sendJson(req, res, checkpoint ? 200 : 404, checkpoint || { error: 'Run checkpoint not found.' });
+      return;
+    }
+
+    if (requestUrl.pathname.startsWith('/api/runs/') && method === 'GET') {
+      const runId = requestUrl.pathname.split('/')[3];
+      const checkpoint = await engine.getRun(runId);
+      sendJson(req, res, checkpoint ? 200 : 404, checkpoint || { error: 'Run not found.' });
       return;
     }
 

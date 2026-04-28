@@ -1,5 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import type { TaskComplexity } from '@local-harness/task-orchestrator';
 
 const IGNORED_DIR_NAMES = new Set([
   '.git',
@@ -44,6 +45,28 @@ export interface WorkspaceInventory {
   packages: WorkspaceModuleInfo[];
   references: WorkspaceReferenceInfo[];
   topLevelAreas: string[];
+}
+
+export type TaskArea =
+  | 'web_ui'
+  | 'core_engine'
+  | 'task_orchestration'
+  | 'model_adapter'
+  | 'tool_runtime'
+  | 'repo_indexing'
+  | 'api_streaming'
+  | 'cli'
+  | 'tests'
+  | 'docs'
+  | 'unknown';
+
+export interface TaskContext {
+  taskArea: TaskArea;
+  relevantFiles: string[];
+  likelyEntryPoints: string[];
+  likelyTests: string[];
+  ignoredFiles: string[];
+  reason: string;
 }
 
 interface CacheEntry<T> {
@@ -323,6 +346,36 @@ export class RepoIndexer {
     return { context, cached: false };
   }
 
+  async buildTaskContext(input: {
+    userRequest: string;
+    intent: string;
+    complexity: TaskComplexity;
+  }): Promise<TaskContext> {
+    const normalized = input.userRequest.toLowerCase();
+    const area = this.classifyTaskArea(normalized, input.intent);
+    const candidates = this.getTaskAreaCandidates(area, input.complexity);
+    const [relevantFiles, likelyTests] = await Promise.all([
+      this.filterExistingPaths(candidates.files),
+      this.filterExistingPaths(candidates.tests),
+    ]);
+
+    const likelyEntryPoints = await this.filterExistingPaths(candidates.entryPoints);
+    const ignoredFiles = candidates.files.filter((entry) => !relevantFiles.includes(entry));
+    const reason = [
+      `Matched task area ${area} from intent ${input.intent}.`,
+      `Complexity ${input.complexity} limits context to likely entry points and tests.`,
+    ].join(' ');
+
+    return {
+      taskArea: area,
+      relevantFiles,
+      likelyEntryPoints,
+      likelyTests,
+      ignoredFiles,
+      reason,
+    };
+  }
+
   generatePromptInjection(ctx: ProjectContext): string {
     const manifestPaths = Object.keys(ctx.manifests);
     const readmePaths = Object.keys(ctx.readmes);
@@ -335,5 +388,163 @@ export class RepoIndexer {
       `Ignored from auto-context: base_repos, third_party, .gamma-harness, .playwright-cli, and build outputs.`,
       `Note: Do not read every file blindly. Start at entry points or manifests.`
     ].join('\n');
+  }
+
+  private classifyTaskArea(normalizedRequest: string, intent: string): TaskArea {
+    if (/\b(web ui|frontend|ui|layout|chat panel|settings|sidebar|right panel|run console|component|css|cockpit)\b/.test(normalizedRequest)) {
+      return 'web_ui';
+    }
+    if (/\b(orchestrator|orchestration|task plan|taskplan|complex task|decomposition|checkpoint|agent loop)\b/.test(normalizedRequest)) {
+      return 'task_orchestration';
+    }
+    if (/\b(core|engine|agentic|planner|session|trace|approval queue|workspace policy)\b/.test(normalizedRequest)) {
+      return 'core_engine';
+    }
+    if (/\b(tool|patch|edit tool|file edit|shell|command|replace range|unified patch)\b/.test(normalizedRequest)) {
+      return 'tool_runtime';
+    }
+    if (/\b(model|ollama|gemma|qwen|thinking|tool calling|adapter|budget|token)\b/.test(normalizedRequest)) {
+      return 'model_adapter';
+    }
+    if (/\b(repo index|indexer|retrieval|context|relevant files|rag)\b/.test(normalizedRequest)) {
+      return 'repo_indexing';
+    }
+    if (/\b(api|stream|ndjson|endpoint|http|approval route|runs route)\b/.test(normalizedRequest)) {
+      return 'api_streaming';
+    }
+    if (/\b(cli|terminal|command line|heartbeat)\b/.test(normalizedRequest)) {
+      return 'cli';
+    }
+    if (/\b(test|unit|integration|e2e|build)\b/.test(normalizedRequest) || intent === 'run_command') {
+      return 'tests';
+    }
+    if (/\b(doc|readme|architecture|audit)\b/.test(normalizedRequest)) {
+      return 'docs';
+    }
+    return 'unknown';
+  }
+
+  private getTaskAreaCandidates(area: TaskArea, complexity: TaskComplexity): { files: string[]; entryPoints: string[]; tests: string[] } {
+    const sharedTests = ['tests/unit/core.test.ts', 'tests/integration/workflow.test.ts', 'tests/e2e/api.test.ts'];
+    const areaFiles: Record<TaskArea, string[]> = {
+      web_ui: [
+        'apps/web/src/HarnessApp.tsx',
+        'apps/web/src/App.tsx',
+        'apps/web/src/main.tsx',
+        'apps/web/src/index.css',
+        'apps/web/src/components',
+        'apps/web/src/hooks',
+      ],
+      core_engine: [
+        'packages/core/src/engine.ts',
+        'packages/core/src/agent-run.ts',
+        'packages/core/src/intent-classifier.ts',
+        'packages/planner/src/planner.ts',
+        'packages/planner/src/types.ts',
+        'packages/session-store/src/types.ts',
+        'packages/trace-bus/src/types.ts',
+        'packages/prompt-recipes/src/recipes.ts',
+      ],
+      task_orchestration: [
+        'packages/task-orchestrator/src/index.ts',
+        'packages/core/src/engine.ts',
+        'packages/planner/src/planner.ts',
+        'packages/planner/src/types.ts',
+        'packages/session-store/src/types.ts',
+        'packages/trace-bus/src/types.ts',
+        'packages/prompt-recipes/src/recipes.ts',
+      ],
+      model_adapter: [
+        'packages/model-adapter/src/client.ts',
+        'packages/model-adapter/src/config.ts',
+        'packages/model-adapter/src/types.ts',
+        'packages/prompt-recipes/src/recipes.ts',
+        'packages/core/src/engine.ts',
+      ],
+      tool_runtime: [
+        'packages/tool-runtime/src/registry.ts',
+        'packages/tool-runtime/src/types.ts',
+        'packages/workspace-policy/src/policy.ts',
+        'packages/approval-workflow/src/queue.ts',
+      ],
+      repo_indexing: [
+        'packages/repo-indexer/src/indexer.ts',
+        'packages/repo-indexer/src/index.ts',
+        'packages/core/src/engine.ts',
+      ],
+      api_streaming: [
+        'apps/api/src/server.ts',
+        'packages/core/src/engine.ts',
+        'packages/planner/src/types.ts',
+        'packages/trace-bus/src/types.ts',
+      ],
+      cli: [
+        'apps/cli/src/cli.ts',
+        'packages/core/src/engine.ts',
+      ],
+      tests: sharedTests,
+      docs: [
+        'README.md',
+        'gamma4.readme',
+        'docs/architecture.md',
+        'docs/stage-audit.md',
+        'AGENTS.md',
+      ],
+      unknown: [
+        'package.json',
+        'README.md',
+        'packages/core/src/engine.ts',
+        'apps/api/src/server.ts',
+        'apps/web/src/HarnessApp.tsx',
+      ],
+    };
+
+    const expanded = new Set<string>(areaFiles[area]);
+    if (complexity === 'architecture_change' || complexity === 'multi_file') {
+      for (const file of [
+        'package.json',
+        'packages/core/src/engine.ts',
+        'apps/api/src/server.ts',
+        'apps/web/src/HarnessApp.tsx',
+        'apps/web/src/index.css',
+        'tests/unit/core.test.ts',
+      ]) {
+        expanded.add(file);
+      }
+    }
+
+    const entryPoints = Array.from(expanded).filter((entry) =>
+      entry.endsWith('engine.ts') ||
+      entry.endsWith('server.ts') ||
+      entry.endsWith('HarnessApp.tsx') ||
+      entry.endsWith('registry.ts') ||
+      entry.endsWith('indexer.ts') ||
+      entry.endsWith('index.ts'),
+    );
+    const tests = area === 'web_ui'
+      ? ['tests/e2e/api.test.ts', 'tests/unit/core.test.ts']
+      : area === 'tool_runtime'
+        ? ['tests/integration/workflow.test.ts']
+        : sharedTests;
+
+    return {
+      files: Array.from(expanded),
+      entryPoints,
+      tests,
+    };
+  }
+
+  private async filterExistingPaths(candidates: string[]): Promise<string[]> {
+    const existing: string[] = [];
+    for (const candidate of candidates) {
+      const absolutePath = path.join(this.cwd, candidate);
+      try {
+        await fs.access(absolutePath);
+        existing.push(candidate);
+      } catch {
+        // Missing expected files remain visible through ignoredFiles.
+      }
+    }
+    return existing;
   }
 }

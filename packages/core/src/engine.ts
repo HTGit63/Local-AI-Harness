@@ -7,8 +7,9 @@ import { ApprovalQueueManager, ApprovalRequestPayload } from '@local-harness/app
 import { ModelAdapter, ModelRuntimeState } from '@local-harness/model-adapter';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
-import { RepoIndexer, ProjectContext } from '@local-harness/repo-indexer';
+import { RepoIndexer, ProjectContext, TaskContext } from '@local-harness/repo-indexer';
 import { AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
+import { LOCAL_MODEL_BUDGET_PROFILES, LocalModelBudgetProfile, TaskOrchestrator, TaskPlan, TaskStep } from '@local-harness/task-orchestrator';
 import { ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
@@ -25,6 +26,12 @@ const SUPPORTED_TOOLS = [
   'fetchUrl',
   'writeFile',
   'patchFile',
+  'replaceRange',
+  'insertAfter',
+  'insertBefore',
+  'replaceBlock',
+  'applyUnifiedPatch',
+  'previewPatch',
   'makeDir',
   'deleteFile',
   'runCommand',
@@ -38,6 +45,7 @@ const DISABLED_SKILL_SLUGS = new Set(['caveman']);
 type SupportedTool = (typeof SUPPORTED_TOOLS)[number];
 type TurnExecutionMode = 'direct' | 'agentic';
 type ReasoningEffort = 'high' | 'medium' | 'low' | 'none';
+type LocalModelBudgetProfileName = keyof typeof LOCAL_MODEL_BUDGET_PROFILES;
 type StreamIdleTimeoutError = Error & {
   code: 'stream_idle_timeout';
   receivedContent: boolean;
@@ -120,6 +128,33 @@ export interface RunSummaryEvent {
   summary: AgentRun;
 }
 
+export interface RunCheckpoint {
+  runId: string;
+  sessionId: string;
+  taskPlan: TaskPlan;
+  currentStepId?: string;
+  completedSteps: string[];
+  failedSteps: string[];
+  blockedSteps: string[];
+  filesRead: string[];
+  filesWritten: string[];
+  filesDeleted: string[];
+  commandsRun: string[];
+  approvals: Array<{
+    id: string;
+    target: string;
+    approved: boolean | null;
+  }>;
+  summarySoFar: string;
+  lastToolResults: Array<{
+    tool: string;
+    success: boolean;
+    outputPreview: string;
+  }>;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ChatStreamHandlers {
   onStatus?: (event: ChatStatusEvent) => void;
   onDelta?: (chunk: string) => void;
@@ -129,6 +164,7 @@ export interface ChatStreamHandlers {
   onRunStep?: (event: RunStepEvent) => void;
   onRunMetric?: (event: RunMetricEvent) => void;
   onRunSummary?: (event: RunSummaryEvent) => void;
+  onTrace?: (event: TraceEvent) => void;
 }
 
 export interface EngineConfig {
@@ -146,6 +182,7 @@ export interface EngineConfig {
   sessionMemoryEnabled: boolean;
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
+  localModelBudgetProfile: LocalModelBudgetProfileName;
 }
 
 export interface PublicEngineConfig {
@@ -162,6 +199,8 @@ export interface PublicEngineConfig {
   sessionMemoryEnabled: boolean;
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
+  localModelBudgetProfile: LocalModelBudgetProfileName;
+  localModelBudget: LocalModelBudgetProfile;
 }
 
 export interface UpdateConfigOptions {
@@ -183,6 +222,7 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   sessionMemoryEnabled: process.env.HARNESS_SESSION_MEMORY !== '0',
   sessionMemoryTurns: Number(process.env.HARNESS_SESSION_MEMORY_TURNS || 3),
   selfCheckEnabled: process.env.HARNESS_SELF_CHECK !== '0',
+  localModelBudgetProfile: (process.env.HARNESS_LOCAL_MODEL_BUDGET_PROFILE as LocalModelBudgetProfileName) || 'balanced',
 };
 
 function resolveSessionDataDir(workspaceRoot: string, sessionDataDir: string): string {
@@ -302,6 +342,18 @@ function getRequiredStringArg(args: Record<string, unknown>, key: string, toolNa
 function getOptionalStringArg(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function getRequiredNumberArg(args: Record<string, unknown>, key: string, toolName: SupportedTool): number {
+  const value = args[key];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+
+  throw new Error(`Missing required ${key} numeric argument for ${toolName}.`);
 }
 
 function extractFirstUrl(value: string): string | undefined {
@@ -454,6 +506,20 @@ const AGENT_HISTORY_COMPACTION_TAIL = 8;
 const LOOP_CONTEXT_COMPACTION_TAIL = 12;
 const MESSAGE_COMPACTION_LINE_CHARS = 220;
 const MAX_RESPONSE_CONTINUATIONS = 2;
+const STREAM_TASK_TRACE_TYPES = new Set([
+  'task_plan_created',
+  'task_step_started',
+  'task_step_completed',
+  'task_step_failed',
+  'task_step_blocked',
+  'task_checkpoint_saved',
+  'task_budget_exceeded',
+  'task_plan_completed',
+  'tool_call_started',
+  'tool_call_completed',
+  'verification_started',
+  'verification_completed',
+]);
 
 function truncateStreamPreview(value: string): string {
   const normalized = value.trim();
@@ -512,8 +578,16 @@ function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown
     case 'readFile':
     case 'writeFile':
     case 'patchFile':
+    case 'replaceRange':
+    case 'insertAfter':
+    case 'insertBefore':
+    case 'replaceBlock':
     case 'deleteFile':
       return `Path: ${getRequiredStringArg(args, 'filePath', toolName)}`;
+    case 'applyUnifiedPatch':
+      return 'Unified patch';
+    case 'previewPatch':
+      return `Preview: ${getRequiredStringArg(args, 'filePath', toolName)}`;
     case 'listDir':
       return `Path: ${getOptionalStringArg(args, 'dirPath') || '.'}`;
     case 'glob':
@@ -539,6 +613,41 @@ function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown
   }
 }
 
+function buildTaskContextPrompt(taskContext: TaskContext | null): string {
+  if (!taskContext) {
+    return '[Task Relevant Context]\nUnavailable. Use targeted tools only.';
+  }
+  return [
+    '[Task Relevant Context]',
+    `Area: ${taskContext.taskArea}`,
+    `Reason: ${taskContext.reason}`,
+    `Relevant files: ${taskContext.relevantFiles.length > 0 ? taskContext.relevantFiles.join(', ') : 'none detected'}`,
+    `Entry points: ${taskContext.likelyEntryPoints.length > 0 ? taskContext.likelyEntryPoints.join(', ') : 'none detected'}`,
+    `Likely tests: ${taskContext.likelyTests.length > 0 ? taskContext.likelyTests.join(', ') : 'none detected'}`,
+    taskContext.ignoredFiles.length > 0 ? `Expected but missing: ${taskContext.ignoredFiles.slice(0, 8).join(', ')}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function buildStepScopedPrompt(taskPlan: TaskPlan, currentStep: TaskStep | null, taskContext: TaskContext | null): string {
+  return [
+    '[Current Task Plan]',
+    `Plan: ${taskPlan.title}`,
+    `Complexity: ${taskPlan.complexity}`,
+    `Progress: ${taskPlan.steps.map((stepEntry) => `[${stepEntry.status}] ${stepEntry.title}`).join(' | ')}`,
+    currentStep ? [
+      '[Current Step]',
+      `ID: ${currentStep.id}`,
+      `Type: ${currentStep.type}`,
+      `Title: ${currentStep.title}`,
+      `Allowed tools: ${currentStep.toolsAllowed.length > 0 ? currentStep.toolsAllowed.join(', ') : 'none'}`,
+      `Success: ${currentStep.successCriteria.join('; ')}`,
+      `Budget: model=${currentStep.budget.maxModelCalls}, tools=${currentStep.budget.maxToolCalls}, read=${currentStep.budget.maxFilesToRead}, write=${currentStep.budget.maxFilesToWrite}, output=${currentStep.budget.maxOutputTokens}`,
+    ].join('\n') : '[Current Step]\nNone.',
+    buildTaskContextPrompt(taskContext),
+    'Rule: execute only the current step. Use one tool call at a time. Do not solve later steps in this model call.',
+  ].join('\n\n');
+}
+
 export class CoreEngine extends EventEmitter {
   public config: EngineConfig;
 
@@ -549,6 +658,7 @@ export class CoreEngine extends EventEmitter {
   private readonly approvalQueue: ApprovalQueueManager;
   private readonly planner: Planner;
   private readonly repoIndexer: RepoIndexer;
+  private readonly taskOrchestrator: TaskOrchestrator;
   private readonly toolRegistry: ToolRegistry;
   private sessionDataDirSetting: string;
   private readonly traceLog: TraceEvent[] = [];
@@ -575,6 +685,12 @@ export class CoreEngine extends EventEmitter {
     this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
     this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
     this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
+    if (!LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]) {
+      this.config.localModelBudgetProfile = DEFAULT_ENGINE_CONFIG.localModelBudgetProfile;
+    }
+    if (!LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]) {
+      this.config.localModelBudgetProfile = DEFAULT_ENGINE_CONFIG.localModelBudgetProfile;
+    }
 
     this.modelAdapter = new ModelAdapter(this.config);
     this.workspacePolicy = new WorkspacePolicy({
@@ -586,6 +702,7 @@ export class CoreEngine extends EventEmitter {
     this.approvalQueue = new ApprovalQueueManager(this.traceBus);
     this.planner = new Planner(this.traceBus);
     this.repoIndexer = new RepoIndexer(this.config.workspaceRoot);
+    this.taskOrchestrator = new TaskOrchestrator();
     this.toolRegistry = new ToolRegistry({
       cwd: this.config.workspaceRoot,
       internetAccessEnabled: this.config.internetAccessEnabled,
@@ -659,6 +776,8 @@ export class CoreEngine extends EventEmitter {
       sessionMemoryEnabled: this.config.sessionMemoryEnabled,
       sessionMemoryTurns: this.config.sessionMemoryTurns,
       selfCheckEnabled: this.config.selfCheckEnabled,
+      localModelBudgetProfile: this.config.localModelBudgetProfile,
+      localModelBudget: LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile],
     };
   }
 
@@ -669,6 +788,80 @@ export class CoreEngine extends EventEmitter {
 
     this.currentSession.updatedAt = Date.now();
     await this.sessionStore.saveSession(this.currentSession);
+  }
+
+  private getRunDataDir(): string {
+    return path.resolve(this.config.workspaceRoot, '.gamma-harness', 'runs');
+  }
+
+  private getRunCheckpointPath(runId: string): string {
+    return path.join(this.getRunDataDir(), `${runId}.json`);
+  }
+
+  private async readRunCheckpointFile(runId: string): Promise<RunCheckpoint | null> {
+    try {
+      return JSON.parse(await fs.readFile(this.getRunCheckpointPath(runId), 'utf8')) as RunCheckpoint;
+    } catch {
+      return null;
+    }
+  }
+
+  private async saveRunCheckpoint(checkpoint: RunCheckpoint): Promise<string> {
+    const checkpointPath = this.getRunCheckpointPath(checkpoint.runId);
+    await fs.mkdir(path.dirname(checkpointPath), { recursive: true });
+    const previous = await this.readRunCheckpointFile(checkpoint.runId);
+    const createdAt = previous?.createdAt ?? checkpoint.createdAt;
+    const nextCheckpoint = {
+      ...checkpoint,
+      createdAt,
+      updatedAt: Date.now(),
+    };
+    await fs.writeFile(checkpointPath, `${JSON.stringify(nextCheckpoint, null, 2)}\n`, 'utf8');
+    return checkpointPath;
+  }
+
+  async listRuns(): Promise<RunCheckpoint[]> {
+    const runDataDir = this.getRunDataDir();
+    try {
+      const entries = await fs.readdir(runDataDir, { withFileTypes: true });
+      const checkpoints = await Promise.all(
+        entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+          .map(async (entry) => {
+            try {
+              return JSON.parse(await fs.readFile(path.join(runDataDir, entry.name), 'utf8')) as RunCheckpoint;
+            } catch {
+              return null;
+            }
+          }),
+      );
+      return checkpoints
+        .filter((entry): entry is RunCheckpoint => entry !== null)
+        .sort((left, right) => right.updatedAt - left.updatedAt);
+    } catch {
+      return [];
+    }
+  }
+
+  async getRun(runId: string): Promise<RunCheckpoint | null> {
+    return this.readRunCheckpointFile(runId);
+  }
+
+  async getRunCheckpoint(runId: string): Promise<RunCheckpoint | null> {
+    return this.readRunCheckpointFile(runId);
+  }
+
+  async resumeRun(runId: string): Promise<RunCheckpoint | null> {
+    const checkpoint = await this.readRunCheckpointFile(runId);
+    if (!checkpoint) {
+      return null;
+    }
+    this.planner.setTaskPlan(runId, checkpoint.taskPlan);
+    this.traceBus.emitEvent({
+      type: 'task_run_resumed',
+      data: { runId, checkpoint },
+    });
+    return checkpoint;
   }
 
   async recordTurnExecution(
@@ -1323,6 +1516,12 @@ export class CoreEngine extends EventEmitter {
     if (this.shouldIncludeWriteTools(latestUserMessage, promptMode)) {
       selected.add('writeFile');
       selected.add('patchFile');
+      selected.add('replaceRange');
+      selected.add('insertAfter');
+      selected.add('insertBefore');
+      selected.add('replaceBlock');
+      selected.add('applyUnifiedPatch');
+      selected.add('previewPatch');
       selected.add('makeDir');
       selected.add('deleteFile');
       selected.add('searchText');
@@ -1493,6 +1692,7 @@ export class CoreEngine extends EventEmitter {
   }
 
   private selectMaxTokens(latestUserMessage: string, promptMode: RunMode, usingTools: boolean): number {
+    const budget = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile] ?? LOCAL_MODEL_BUDGET_PROFILES.lean;
     const normalized = latestUserMessage.toLowerCase();
     const terseReplyRequested =
       /\b(exactly|just|only|one line|single sentence|yes or no)\b/.test(normalized) ||
@@ -1503,15 +1703,15 @@ export class CoreEngine extends EventEmitter {
 
     switch (promptMode) {
       case 'quick_inspect':
-        return usingTools ? 320 : 192;
+        return usingTools ? Math.min(768, budget.outputBudgetInspect) : Math.min(384, budget.outputBudgetDirect);
       case 'code_review':
-        return usingTools ? 512 : 320;
+        return usingTools ? Math.min(1024, budget.outputBudgetInspect) : Math.min(640, budget.outputBudgetDirect);
       case 'targeted_edit':
-        return usingTools ? 640 : 384;
+        return usingTools ? budget.outputBudgetEdit : Math.min(768, budget.outputBudgetDirect);
       case 'doc_generation':
-        return usingTools ? 768 : 512;
+        return usingTools ? budget.outputBudgetFinalReport : Math.min(900, budget.outputBudgetFinalReport);
       default:
-        return usingTools ? 512 : 256;
+        return usingTools ? Math.min(1024, budget.outputBudgetInspect) : budget.outputBudgetDirect;
     }
   }
 
@@ -1552,6 +1752,12 @@ export class CoreEngine extends EventEmitter {
       fetchUrl: '{"action":"fetchUrl","args":{"url":"https://example.com/docs"}}',
       writeFile: '{"action":"writeFile","args":{"filePath":"README.md","content":"# Title\\n"}}',
       patchFile: '{"action":"patchFile","args":{"filePath":"src/index.ts","oldContent":"before","newContent":"after"}}',
+      replaceRange: '{"action":"replaceRange","args":{"filePath":"src/index.ts","startLine":10,"endLine":12,"newContent":"replacement\\n"}}',
+      insertAfter: '{"action":"insertAfter","args":{"filePath":"src/index.ts","anchorText":"export {};","newContent":"\\nconst x = 1;\\n"}}',
+      insertBefore: '{"action":"insertBefore","args":{"filePath":"src/index.ts","anchorText":"export {};","newContent":"const x = 1;\\n"}}',
+      replaceBlock: '{"action":"replaceBlock","args":{"filePath":"src/index.ts","anchorStart":"// start","anchorEnd":"// end","newContent":"// start\\nupdated\\n// end"}}',
+      applyUnifiedPatch: '{"action":"applyUnifiedPatch","args":{"patchText":"--- a/file.txt\\n+++ b/file.txt\\n@@ -1 +1 @@\\n-old\\n+new\\n"}}',
+      previewPatch: '{"action":"previewPatch","args":{"filePath":"src/index.ts","before":"old","after":"new"}}',
       makeDir: '{"action":"makeDir","args":{"dirPath":"src/new-folder"}}',
       deleteFile: '{"action":"deleteFile","args":{"filePath":"old.txt"}}',
       runCommand: '{"action":"runCommand","args":{"command":"npm test"}}',
@@ -1794,69 +2000,137 @@ export class CoreEngine extends EventEmitter {
   }
 
   private static readonly WORKSPACE_MUTATING_TOOLS: ReadonlySet<string> = new Set([
-    'writeFile', 'patchFile', 'makeDir', 'deleteFile',
+    'writeFile', 'patchFile', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'makeDir', 'deleteFile',
   ]);
 
-  private async executeToolCall(toolName: SupportedTool, args: Record<string, unknown>): Promise<any> {
+  private async executeToolCall(toolName: SupportedTool, args: Record<string, unknown>, runId?: string): Promise<any> {
+    const inputSummary = summarizeToolArgs(toolName, args);
+    this.traceBus.emitEvent({
+      type: 'tool_call_started',
+      data: { runId, tool: toolName, inputSummary },
+    });
     let result: any;
-    switch (toolName) {
-      case 'readFile':
-        result = await this.readFile(getRequiredStringArg(args, 'filePath', toolName));
-        break;
-      case 'listDir':
-        result = await this.listDir(getOptionalStringArg(args, 'dirPath') || '.');
-        break;
-      case 'glob':
-        result = await this.glob(getRequiredStringArg(args, 'pattern', toolName));
-        break;
-      case 'searchText':
-        result = await this.searchText(
-          getRequiredStringArg(args, 'query', toolName),
-          getOptionalStringArg(args, 'filePattern'),
-        );
-        break;
-      case 'webSearch':
-        result = await this.webSearch(getRequiredStringArg(args, 'query', toolName));
-        break;
-      case 'fetchUrl':
-        result = await this.fetchUrl(getRequiredStringArg(args, 'url', toolName));
-        break;
-      case 'writeFile':
-        result = await this.writeFile(
-          getRequiredStringArg(args, 'filePath', toolName),
-          getRequiredStringArg(args, 'content', toolName),
-        );
-        break;
-      case 'patchFile':
-        result = await this.patchFile(
-          getRequiredStringArg(args, 'filePath', toolName),
-          getRequiredStringArg(args, 'oldContent', toolName),
-          getRequiredStringArg(args, 'newContent', toolName),
-        );
-        break;
-      case 'makeDir':
-        result = await this.makeDir(getRequiredStringArg(args, 'dirPath', toolName));
-        break;
-      case 'deleteFile':
-        result = await this.deleteFile(getRequiredStringArg(args, 'filePath', toolName));
-        break;
-      case 'gitStatus':
-        result = await this.gitStatus();
-        break;
-      case 'gitDiff':
-        result = await this.gitDiff();
-        break;
-      case 'runCommand':
-        result = await this.runCommand(getRequiredStringArg(args, 'command', toolName));
-        break;
-      default:
-        throw new Error(`Tool ${toolName} is not supported.`);
+    try {
+      switch (toolName) {
+        case 'readFile':
+          result = await this.readFile(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'listDir':
+          result = await this.listDir(getOptionalStringArg(args, 'dirPath') || '.');
+          break;
+        case 'glob':
+          result = await this.glob(getRequiredStringArg(args, 'pattern', toolName));
+          break;
+        case 'searchText':
+          result = await this.searchText(
+            getRequiredStringArg(args, 'query', toolName),
+            getOptionalStringArg(args, 'filePattern'),
+          );
+          break;
+        case 'webSearch':
+          result = await this.webSearch(getRequiredStringArg(args, 'query', toolName));
+          break;
+        case 'fetchUrl':
+          result = await this.fetchUrl(getRequiredStringArg(args, 'url', toolName));
+          break;
+        case 'writeFile':
+          result = await this.writeFile(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'content', toolName),
+          );
+          break;
+        case 'patchFile':
+          result = await this.patchFile(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'oldContent', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'replaceRange':
+          result = await this.replaceRange(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredNumberArg(args, 'startLine', toolName),
+            getRequiredNumberArg(args, 'endLine', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'insertAfter':
+          result = await this.insertAfter(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'anchorText', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'insertBefore':
+          result = await this.insertBefore(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'anchorText', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'replaceBlock':
+          result = await this.replaceBlock(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'anchorStart', toolName),
+            getRequiredStringArg(args, 'anchorEnd', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'applyUnifiedPatch':
+          result = await this.applyUnifiedPatch(getRequiredStringArg(args, 'patchText', toolName));
+          break;
+        case 'previewPatch':
+          result = await this.previewPatch(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'before', toolName),
+            getRequiredStringArg(args, 'after', toolName),
+          );
+          break;
+        case 'makeDir':
+          result = await this.makeDir(getRequiredStringArg(args, 'dirPath', toolName));
+          break;
+        case 'deleteFile':
+          result = await this.deleteFile(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'gitStatus':
+          result = await this.gitStatus();
+          break;
+        case 'gitDiff':
+          result = await this.gitDiff();
+          break;
+        case 'runCommand':
+          result = await this.runCommand(getRequiredStringArg(args, 'command', toolName));
+          break;
+        default:
+          throw new Error(`Tool ${toolName} is not supported.`);
+      }
+    } catch (error: any) {
+      this.traceBus.emitEvent({
+        type: 'tool_call_completed',
+        data: {
+          runId,
+          tool: toolName,
+          success: false,
+          outputPreview: error?.message || 'Tool failed.',
+        },
+      });
+      throw error;
     }
 
     // Invalidate repo context cache after workspace-modifying tools so next turn gets fresh context
     if (CoreEngine.WORKSPACE_MUTATING_TOOLS.has(toolName)) {
       this.invalidateRepoContextCache();
     }
+
+    this.traceBus.emitEvent({
+      type: 'tool_call_completed',
+      data: {
+        runId,
+        tool: toolName,
+        success: result?.success === true,
+        outputPreview: truncateStreamPreview(result?.output || ''),
+      },
+    });
 
     return result;
   }
@@ -1917,7 +2191,7 @@ export class CoreEngine extends EventEmitter {
       });
       this.planner.setCurrentTool(stepPlan.toolName);
 
-      const toolResult = await this.executeToolCall(stepPlan.toolName, stepPlan.args);
+      const toolResult = await this.executeToolCall(stepPlan.toolName, stepPlan.args, builder.snapshot().id);
       const toolOutput = toolResult.preview ? `${toolResult.output}\n\n${toolResult.preview}` : toolResult.output;
       this.emitChatToolEvent(handlers, {
         id: toolEventId,
@@ -2345,6 +2619,102 @@ export class CoreEngine extends EventEmitter {
       {
         type: 'function',
         function: {
+          name: 'replaceRange',
+          description: 'Replace inclusive 1-based line range in a file. Prefer this when exact oldContent replacement is fragile.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path to the file' },
+              startLine: { type: 'number', description: '1-based start line' },
+              endLine: { type: 'number', description: '1-based inclusive end line' },
+              newContent: { type: 'string', description: 'Replacement text for the line range' }
+            },
+            required: ['filePath', 'startLine', 'endLine', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'insertAfter',
+          description: 'Insert text after the first matching anchor text in a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path to the file' },
+              anchorText: { type: 'string', description: 'Anchor text to insert after' },
+              newContent: { type: 'string', description: 'Text to insert' }
+            },
+            required: ['filePath', 'anchorText', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'insertBefore',
+          description: 'Insert text before the first matching anchor text in a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path to the file' },
+              anchorText: { type: 'string', description: 'Anchor text to insert before' },
+              newContent: { type: 'string', description: 'Text to insert' }
+            },
+            required: ['filePath', 'anchorText', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'replaceBlock',
+          description: 'Replace text from anchorStart through anchorEnd in a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path to the file' },
+              anchorStart: { type: 'string', description: 'Start anchor included in replacement' },
+              anchorEnd: { type: 'string', description: 'End anchor included in replacement' },
+              newContent: { type: 'string', description: 'Replacement text' }
+            },
+            required: ['filePath', 'anchorStart', 'anchorEnd', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'applyUnifiedPatch',
+          description: 'Apply a unified diff patch after approval. Prefer small patches.',
+          parameters: {
+            type: 'object',
+            properties: {
+              patchText: { type: 'string', description: 'Unified diff text' }
+            },
+            required: ['patchText']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'previewPatch',
+          description: 'Preview a diff from before/after text without writing.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path used in the diff label' },
+              before: { type: 'string', description: 'Original content' },
+              after: { type: 'string', description: 'Proposed content' }
+            },
+            required: ['filePath', 'before', 'after']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'makeDir',
           description: 'Create a directory',
           parameters: {
@@ -2487,6 +2857,8 @@ export class CoreEngine extends EventEmitter {
     this.emitChatStatus(handlers, 'model', 'Generating assistant response', 0);
     let response = '';
     let continuationCount = 0;
+    const directOutputBudget = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]?.outputBudgetDirect
+      ?? LOCAL_MODEL_BUDGET_PROFILES.lean.outputBudgetDirect;
 
     while (true) {
       let message: EngineChatMessage | undefined;
@@ -2497,7 +2869,7 @@ export class CoreEngine extends EventEmitter {
           currentMessages,
           handlers,
           undefined,
-          4096,
+          directOutputBudget,
           undefined,
           options?.signal,
           options?.think,
@@ -2507,7 +2879,7 @@ export class CoreEngine extends EventEmitter {
         const result = await this.modelAdapter.createChatCompletion({
           messages: currentMessages,
           stream: false,
-          max_tokens: 4096,
+          max_tokens: directOutputBudget,
           think: options?.think,
           signal: options?.signal,
         });
@@ -2950,9 +3322,9 @@ export class CoreEngine extends EventEmitter {
             diffPreview: approval.preview,
           },
         });
-      } else if (event.type === 'approval_resolved') {
-        const approval = event.data as { id: string; response?: { approved?: boolean } };
-        const approved = approval.response?.approved ?? null;
+	      } else if (event.type === 'approval_resolved') {
+	        const approval = event.data as { id: string; response?: { approved?: boolean } };
+	        const approved = approval.response?.approved ?? null;
         runBuilder.recordApprovalResolved(approval.id, approved);
         this.emitChatApprovalEvent(streamHandlers, {
           type: 'approval',
@@ -2967,14 +3339,133 @@ export class CoreEngine extends EventEmitter {
           'approval',
           approved === true ? `Approval granted for ${approval.id}` : `Approval rejected for ${approval.id}`,
           loopCount,
-        );
-        this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
-      }
-    };
-    this.traceBus.on('trace', traceListener);
+	        );
+	        this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+	      }
+	      if (STREAM_TASK_TRACE_TYPES.has(event.type)) {
+	        streamHandlers?.onTrace?.(event);
+	      }
+	    };
+	    this.traceBus.on('trace', traceListener);
 
-    const finalizeRun = async (baseAnswer: string, error?: string): Promise<string> => {
-      const gitStats = await this.computeGitDiffStats(runBuilder.snapshot().git);
+	    let taskContext: TaskContext | null = null;
+	    let taskPlan = this.taskOrchestrator.createPlan({
+	      userRequest: latestUserMessage,
+	      intent: intentDecision.intent,
+	      workspaceRoot: this.config.workspaceRoot,
+	      knownFiles: [],
+	    });
+	    let currentTaskStep: TaskStep | null = null;
+	    const lastToolResults: RunCheckpoint['lastToolResults'] = [];
+
+	    const rememberToolResult = (tool: string, result: ToolResult) => {
+	      lastToolResults.push({
+	        tool,
+	        success: result.success,
+	        outputPreview: truncateStreamPreview(result.output || ''),
+	      });
+	      while (lastToolResults.length > 8) {
+	        lastToolResults.shift();
+	      }
+	    };
+
+	    const buildCheckpoint = (): RunCheckpoint => {
+	      const run = runBuilder.snapshot();
+	      return {
+	        runId,
+	        sessionId: this.currentSession!.id,
+	        taskPlan,
+	        currentStepId: currentTaskStep?.id,
+	        completedSteps: taskPlan.steps.filter((entry) => entry.status === 'done' || entry.status === 'skipped').map((entry) => entry.id),
+	        failedSteps: taskPlan.steps.filter((entry) => entry.status === 'failed').map((entry) => entry.id),
+	        blockedSteps: taskPlan.steps.filter((entry) => entry.status === 'blocked').map((entry) => entry.id),
+	        filesRead: run.filesRead,
+	        filesWritten: run.filesWritten,
+	        filesDeleted: run.filesDeleted,
+	        commandsRun: run.commands.map((entry) => entry.command),
+	        approvals: run.approvals,
+	        summarySoFar: this.taskOrchestrator.summarizeProgress(taskPlan),
+	        lastToolResults: [...lastToolResults],
+	        createdAt: run.startedAt,
+	        updatedAt: Date.now(),
+	      };
+	    };
+
+	    const persistCheckpoint = async () => {
+	      const checkpointPath = await this.saveRunCheckpoint(buildCheckpoint());
+	      this.planner.emitTaskCheckpoint(runId, checkpointPath);
+	    };
+
+	    const startTaskStep = async (preferredStep?: TaskStep | null): Promise<TaskStep | null> => {
+	      const nextStep = preferredStep ?? this.taskOrchestrator.getNextStep(taskPlan);
+	      if (!nextStep || nextStep.status !== 'pending') {
+	        return currentTaskStep;
+	      }
+	      taskPlan = this.taskOrchestrator.markStepRunning(taskPlan, nextStep.id);
+	      currentTaskStep = taskPlan.steps.find((entry) => entry.id === nextStep.id) ?? null;
+	      if (currentTaskStep) {
+	        this.planner.markTaskStepStarted(runId, taskPlan, currentTaskStep);
+	        this.emitChatStatus(streamHandlers, currentTaskStep.type, currentTaskStep.title, loopCount);
+	        await persistCheckpoint();
+	      }
+	      return currentTaskStep;
+	    };
+
+	    const completeCurrentTaskStep = async (detail?: string) => {
+	      if (!currentTaskStep) {
+	        return;
+	      }
+	      const stepId = currentTaskStep.id;
+	      taskPlan = this.taskOrchestrator.markStepDone(taskPlan, stepId, detail);
+	      const completedStep = taskPlan.steps.find((entry) => entry.id === stepId);
+	      if (completedStep) {
+	        this.planner.markTaskStepCompleted(runId, taskPlan, completedStep);
+	      }
+	      currentTaskStep = null;
+	      await persistCheckpoint();
+	    };
+
+	    const failCurrentTaskStep = async (error: string) => {
+	      if (!currentTaskStep) {
+	        return;
+	      }
+	      const stepId = currentTaskStep.id;
+	      taskPlan = this.taskOrchestrator.markStepFailed(taskPlan, stepId, error);
+	      const failedStep = taskPlan.steps.find((entry) => entry.id === stepId);
+	      if (failedStep) {
+	        this.planner.markTaskStepFailed(runId, taskPlan, failedStep, error);
+	      }
+	      await persistCheckpoint();
+	    };
+
+	    const finishTaskPlan = async (reason: string) => {
+	      if (currentTaskStep) {
+	        await completeCurrentTaskStep(reason);
+	      }
+	      for (const pendingStep of taskPlan.steps.filter((entry) => entry.status === 'pending')) {
+	        taskPlan = this.taskOrchestrator.markStepSkipped(taskPlan, pendingStep.id, `Skipped: ${reason}`);
+	      }
+	      this.planner.updateTaskPlan(runId, taskPlan);
+	      await persistCheckpoint();
+	    };
+
+	    this.planner.setTaskPlan(runId, taskPlan);
+	    taskContext = workspaceBound
+	      ? await this.repoIndexer.buildTaskContext({
+	          userRequest: latestUserMessage,
+	          intent: intentDecision.intent,
+	          complexity: taskPlan.complexity,
+	        }).catch(() => null)
+	      : null;
+		    await persistCheckpoint();
+	    const initialTaskStep = await startTaskStep();
+	    if (initialTaskStep && (initialTaskStep.type === 'intake' || initialTaskStep.type === 'inspect')) {
+	      await completeCurrentTaskStep(taskContext ? `Task context selected: ${taskContext.taskArea}` : 'No backend task context available');
+	    }
+
+	    const finalizeRun = async (baseAnswer: string, error?: string): Promise<string> => {
+	      await finishTaskPlan(error ? `Run ended with error: ${error}` : 'Run finalized');
+	      const gitStats = await this.computeGitDiffStats(runBuilder.snapshot().git);
       runBuilder.setGitStats(gitStats);
       const summary = summarizeRun(runBuilder.snapshot());
       runBuilder.finalize({
@@ -3036,8 +3527,9 @@ export class CoreEngine extends EventEmitter {
         return await finalizeRun(localRepoOverviewAnswer.content);
       }
 
+      const useStepScopedContext = ['multi_file', 'architecture_change', 'repo_wide_audit'].includes(taskPlan.complexity);
       const includeWorkspaceContext = workspaceBound && this.isWorkspaceQuestion(latestUserMessage, promptMode);
-      const includeRepoContext = workspaceBound && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
+      const includeRepoContext = workspaceBound && !useStepScopedContext && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
       const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
       const modelCapabilities = await this.modelAdapter.getModelCapabilities(this.config.model);
       const toolProtocol = await this.selectToolProtocol(selectedToolNames, modelCapabilities);
@@ -3057,9 +3549,11 @@ export class CoreEngine extends EventEmitter {
       let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol
         ? this.getToolDefinitions(selectedToolNames)
         : undefined;
+      const activeTaskStepForModel = await startTaskStep();
+      const stepOutputBudget = activeTaskStepForModel?.budget.maxOutputTokens;
       const maxTokens = manualToolProtocol
-        ? Math.min(256, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
-        : this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0);
+        ? Math.min(256, stepOutputBudget ?? this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
+        : Math.min(stepOutputBudget ?? Number.MAX_SAFE_INTEGER, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0));
       const reasoningEffort = manualToolProtocol
         ? 'none'
         : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
@@ -3165,11 +3659,15 @@ export class CoreEngine extends EventEmitter {
           `Workspace bound: ${workspaceBound ? 'yes' : 'no'}`,
           `Available tools: ${selectedToolNames.length > 0 ? selectedToolNames.join(', ') : 'none'}`,
           `Tool protocol: ${manualToolProtocol ? 'manual' : 'native'}`,
-          `Context budget: ${this.config.contextBudget} chars`,
+          `Task complexity: ${taskPlan.complexity}`,
+          `Local budget profile: ${this.config.localModelBudgetProfile}`,
+          `Context budget: ${LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile].contextBudget} tokens target`,
+          `Output budget for this step: ${maxTokens}`,
           `Retry budget: ${this.config.toolRetryMax}`,
           `Session memory: ${this.config.sessionMemoryEnabled ? `${this.config.sessionMemoryTurns} recent turns` : 'off'}`,
           `Self-check: ${this.config.selfCheckEnabled ? 'required after edits or commands' : 'off'}`,
           'If workspace tools are available and the request is about repo behavior, inspect workspace facts before asking the user for more detail.',
+          'For complex tasks, do not solve the whole project in one response. Work only the current task step.',
           'Never simulate tool execution or file changes.',
           'Finish with concise answer, What I did, and Files changed.',
         ].join('\n'),
@@ -3178,6 +3676,7 @@ export class CoreEngine extends EventEmitter {
       const currentMessages: EngineChatMessage[] = [
         ...(await this.buildContextMessages(requestMessages, promptMode, includeWorkspaceContext, includeRepoContext)) as EngineChatMessage[],
         runtimeContract,
+        { role: 'system' as const, content: buildStepScopedPrompt(taskPlan, currentTaskStep, taskContext) },
         ...(manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),
         ...promptMessages,
       ];
@@ -3196,11 +3695,13 @@ export class CoreEngine extends EventEmitter {
       let manualBootstrapTool = manualToolProtocol && workspaceBound
         ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, selectedToolNames)
         : null;
-      const MAX_LOOPS = intentDecision.intent === 'edit_code'
+      const budgetProfile = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile] ?? LOCAL_MODEL_BUDGET_PROFILES.lean;
+      const maxLoopTarget = intentDecision.intent === 'edit_code'
         ? 5
         : intentDecision.intent === 'run_command'
           ? 4
           : 3;
+      const MAX_LOOPS = Math.min(budgetProfile.maxModelCallsPerRun, taskPlan.complexity === 'architecture_change' ? Math.max(maxLoopTarget, 6) : maxLoopTarget);
       let manualProtocolCorrectionCount = 0;
       let planningOnlyNativeRetryCount = 0;
       let simulatedToolReplyCount = 0;
@@ -3216,6 +3717,7 @@ export class CoreEngine extends EventEmitter {
           manualBootstrapTool = null;
           loopCount += 1;
           runBuilder.setLoopCount(loopCount);
+          await startTaskStep();
           const toolStep = runBuilder.startNamedStep('tool', `Bootstrap ${bootstrapDecision.name}`);
           this.planner.upsertRunStep({
             id: toolStep.id,
@@ -3247,7 +3749,7 @@ export class CoreEngine extends EventEmitter {
             inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
           });
           try {
-            const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args);
+            const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args, runId);
             const streamedOutput = toolResult.preview
               ? `${toolResult.output}\n\n${toolResult.preview}`
               : toolResult.output;
@@ -3260,6 +3762,7 @@ export class CoreEngine extends EventEmitter {
               success: toolResult.success,
             });
             this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+            rememberToolResult(bootstrapDecision.name, toolResult);
             currentMessages.push({
               role: 'user',
               content: this.formatManualToolResult(
@@ -3273,6 +3776,9 @@ export class CoreEngine extends EventEmitter {
               toolOutputPreview: truncateStreamPreview(streamedOutput),
               command: toolResult.metadata?.command?.command,
             }, toolResult.success ? 'done' : 'error');
+            if (toolResult.success) {
+              await completeCurrentTaskStep(`${bootstrapDecision.name} completed`);
+            }
           } catch (error: any) {
             this.emitChatToolEvent(streamHandlers, {
               id: toolEventId,
@@ -3310,6 +3816,11 @@ export class CoreEngine extends EventEmitter {
 
         loopCount += 1;
         runBuilder.setLoopCount(loopCount);
+        await startTaskStep();
+        currentMessages.push({
+          role: 'system',
+          content: buildStepScopedPrompt(taskPlan, currentTaskStep, taskContext),
+        });
         this.planner.setPhase('model');
         this.planner.setCurrentTool(undefined);
         this.planner.setIntendedAction(loopCount === 1 ? 'Generating assistant response' : 'Processing tool results');
@@ -3462,6 +3973,7 @@ export class CoreEngine extends EventEmitter {
           this.emitChatStatus(streamHandlers, 'execution', 'Executing tool calls', loopCount);
 
           for (const toolCall of message.tool_calls) {
+            await startTaskStep();
             const name = toolCall.function.name as SupportedTool;
             const toolStep = runBuilder.startNamedStep('tool', `Execute ${name}`);
             const toolEventId = nextStreamToolEventId();
@@ -3508,7 +4020,7 @@ export class CoreEngine extends EventEmitter {
             });
 
             try {
-              const toolResult = await this.executeToolCall(name, args);
+              const toolResult = await this.executeToolCall(name, args, runId);
               const streamedOutput = toolResult.preview
                 ? `${toolResult.output}\n\n${toolResult.preview}`
                 : toolResult.output;
@@ -3521,6 +4033,7 @@ export class CoreEngine extends EventEmitter {
                 success: toolResult.success,
               });
               this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+              rememberToolResult(name, toolResult);
               currentMessages.push({
                 role: 'tool',
                 tool_call_id: toolCall.id,
@@ -3538,6 +4051,9 @@ export class CoreEngine extends EventEmitter {
                 ],
                 command: toolResult.metadata?.command?.command,
               }, toolResult.success ? 'done' : 'error');
+              if (toolResult.success) {
+                await completeCurrentTaskStep(`${name} completed`);
+              }
             } catch (error: any) {
               this.emitChatToolEvent(streamHandlers, {
                 id: toolEventId,
@@ -3656,6 +4172,7 @@ export class CoreEngine extends EventEmitter {
           });
           this.emitRunStep(streamHandlers, runId, finishedModelStep);
         }
+        await completeCurrentTaskStep('Model step completed');
 
         if (this.shouldContinueTruncatedResponse(finishReason, response, responseContinuationCount)) {
           responseContinuationCount += 1;
@@ -3714,6 +4231,7 @@ export class CoreEngine extends EventEmitter {
 
           const manualDecision = this.parseManualToolResponse(response, selectedToolNames);
           if (manualDecision?.kind === 'tool') {
+            await startTaskStep();
             const toolStep = runBuilder.startNamedStep('tool', `Execute ${manualDecision.name}`);
             this.planner.setPhase('execution');
             this.planner.setCurrentTool(manualDecision.name);
@@ -3736,7 +4254,7 @@ export class CoreEngine extends EventEmitter {
               inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
             });
             try {
-              const toolResult = await this.executeToolCall(manualDecision.name, manualDecision.args);
+              const toolResult = await this.executeToolCall(manualDecision.name, manualDecision.args, runId);
               const streamedOutput = toolResult.preview
                 ? `${toolResult.output}\n\n${toolResult.preview}`
                 : toolResult.output;
@@ -3749,6 +4267,7 @@ export class CoreEngine extends EventEmitter {
                 success: toolResult.success,
               });
               this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+              rememberToolResult(manualDecision.name, toolResult);
               currentMessages.push({
                 role: 'user',
                 content: this.formatManualToolResult(
@@ -3762,6 +4281,9 @@ export class CoreEngine extends EventEmitter {
                 toolOutputPreview: truncateStreamPreview(streamedOutput),
                 command: toolResult.metadata?.command?.command,
               }, toolResult.success ? 'done' : 'error');
+              if (toolResult.success) {
+                await completeCurrentTaskStep(`${manualDecision.name} completed`);
+              }
             } catch (error: any) {
               this.emitChatToolEvent(streamHandlers, {
                 id: toolEventId,
@@ -3913,9 +4435,11 @@ export class CoreEngine extends EventEmitter {
       }
 
       const limitWarning = 'Maximum tool execution loops reached or no response from model.';
+      this.planner.emitTaskBudgetExceeded(runId, 'maxModelCallsPerRun');
       this.planner.failRun(limitWarning);
       return await finalizeRun(limitWarning, limitWarning);
     } catch (error: any) {
+      await failCurrentTaskStep(error?.message || 'Agentic run failed.');
       this.planner.failRun(error?.message || 'Agentic run failed.');
       throw error;
     } finally {
@@ -3971,6 +4495,33 @@ export class CoreEngine extends EventEmitter {
 
   async patchFile(filePath: string, oldContent: string, newContent: string) {
     return this.runTool('patchFile', filePath, oldContent, newContent);
+  }
+
+  async replaceRange(filePath: string, startLine: number, endLine: number, newContent: string) {
+    this.ensureToolAllowed('replaceRange');
+    const result = await this.toolRegistry.replaceRange(filePath, startLine, endLine, newContent);
+    await this.persistCurrentSession();
+    return result;
+  }
+
+  async insertAfter(filePath: string, anchorText: string, newContent: string) {
+    return this.runTool('insertAfter', filePath, anchorText, newContent);
+  }
+
+  async insertBefore(filePath: string, anchorText: string, newContent: string) {
+    return this.runTool('insertBefore', filePath, anchorText, newContent);
+  }
+
+  async replaceBlock(filePath: string, anchorStart: string, anchorEnd: string, newContent: string) {
+    return this.runTool('replaceBlock', filePath, anchorStart, anchorEnd, newContent);
+  }
+
+  async applyUnifiedPatch(patchText: string) {
+    return this.runTool('applyUnifiedPatch', patchText);
+  }
+
+  async previewPatch(filePath: string, before: string, after: string) {
+    return this.runTool('previewPatch', filePath, before, after);
   }
 
   async makeDir(dirPath: string) {

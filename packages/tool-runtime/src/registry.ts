@@ -402,6 +402,27 @@ function parseUnifiedDiffStats(diff: string): ToolDiffStats {
   };
 }
 
+function parseUnifiedPatchFiles(patchText: string): string[] {
+  const files = new Set<string>();
+  for (const line of patchText.split('\n')) {
+    if (!line.startsWith('+++ ')) {
+      continue;
+    }
+    const raw = line.slice(4).trim().split(/\s+/)[0];
+    if (!raw || raw === '/dev/null') {
+      continue;
+    }
+    files.add(raw.replace(/^b\//, '').replace(/^a\//, ''));
+  }
+  return Array.from(files);
+}
+
+function normalizeInsertedContent(content: string): string[] {
+  return content.endsWith('\n')
+    ? content.slice(0, -1).split('\n')
+    : content.split('\n');
+}
+
 async function buildDiffPreview(filePath: string, before: string, after: string): Promise<{ preview: string; lineStats: ToolDiffStats }> {
   if (before === after) {
     return {
@@ -513,6 +534,7 @@ export class ToolRegistry {
   private wrapExecution(name: string, inputSummary: string, executor: () => Promise<ToolResult>): Promise<ToolResult> {
     const startedAt = Date.now();
     this.context.emitTrace('tool_call', { name, inputSummary });
+    this.context.emitTrace('tool_call_started', { tool: name, inputSummary });
     return executor()
       .then((result) => {
         const durationMs = Date.now() - startedAt;
@@ -520,6 +542,12 @@ export class ToolRegistry {
           name,
           resultSummary: result.success ? 'Success' : 'Failed',
           output: truncateOutput(result.output),
+          durationMs,
+        });
+        this.context.emitTrace('tool_call_completed', {
+          tool: name,
+          success: result.success,
+          outputPreview: truncateOutput(result.output),
           durationMs,
         });
         return {
@@ -536,6 +564,12 @@ export class ToolRegistry {
           name,
           resultSummary: 'Error',
           output: error.message,
+          durationMs,
+        });
+        this.context.emitTrace('tool_call_completed', {
+          tool: name,
+          success: false,
+          outputPreview: error.message,
           durationMs,
         });
         return {
@@ -850,6 +884,226 @@ export class ToolRegistry {
           fileWrites: [filePath],
           lineStats: diff.lineStats,
         },
+      };
+    });
+  }
+
+  async replaceRange(filePath: string, startLine: number, endLine: number, newContent: string): Promise<ToolResult> {
+    return this.wrapExecution('replace_range', `Replacing ${filePath}:${startLine}-${endLine}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
+        return { success: false, output: 'Line range must use 1-based integers with endLine >= startLine.' };
+      }
+
+      const absolutePath = this.resolveTarget(filePath);
+      const before = await fs.readFile(absolutePath, 'utf8');
+      const lines = before.split('\n');
+      if (endLine > lines.length) {
+        return { success: false, output: `Line range exceeds file length (${lines.length}).` };
+      }
+
+      const replacement = normalizeInsertedContent(newContent);
+      const nextLines = [
+        ...lines.slice(0, startLine - 1),
+        ...replacement,
+        ...lines.slice(endLine),
+      ];
+      const after = nextLines.join('\n');
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('replace_range', filePath, diff.preview);
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
+          };
+        }
+      }
+
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `Replaced ${filePath}:${startLine}-${endLine}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
+      };
+    });
+  }
+
+  async insertAfter(filePath: string, anchorText: string, newContent: string): Promise<ToolResult> {
+    return this.insertNearAnchor('insert_after', filePath, anchorText, newContent, 'after');
+  }
+
+  async insertBefore(filePath: string, anchorText: string, newContent: string): Promise<ToolResult> {
+    return this.insertNearAnchor('insert_before', filePath, anchorText, newContent, 'before');
+  }
+
+  async replaceBlock(filePath: string, anchorStart: string, anchorEnd: string, newContent: string): Promise<ToolResult> {
+    return this.wrapExecution('replace_block', `Replacing block in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      if (!anchorStart || !anchorEnd) {
+        return { success: false, output: 'anchorStart and anchorEnd are required.' };
+      }
+
+      const absolutePath = this.resolveTarget(filePath);
+      const before = await fs.readFile(absolutePath, 'utf8');
+      const startIndex = before.indexOf(anchorStart);
+      if (startIndex === -1) {
+        return { success: false, output: 'anchorStart not found.' };
+      }
+      const endIndex = before.indexOf(anchorEnd, startIndex + anchorStart.length);
+      if (endIndex === -1) {
+        return { success: false, output: 'anchorEnd not found after anchorStart.' };
+      }
+      const afterEnd = endIndex + anchorEnd.length;
+      const after = `${before.slice(0, startIndex)}${newContent}${before.slice(afterEnd)}`;
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('replace_block', filePath, diff.preview);
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
+          };
+        }
+      }
+
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `Replaced block in ${filePath}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
+      };
+    });
+  }
+
+  async previewPatch(filePath: string, before: string, after: string): Promise<ToolResult> {
+    return this.wrapExecution('preview_patch', `Previewing patch for ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('read', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const diff = await buildDiffPreview(filePath, before, after);
+      return {
+        success: true,
+        output: diff.preview,
+        preview: diff.preview,
+        metadata: { lineStats: diff.lineStats },
+      };
+    });
+  }
+
+  async applyUnifiedPatch(patchText: string): Promise<ToolResult> {
+    return this.wrapExecution('apply_unified_patch', 'Applying unified patch', async () => {
+      if (!patchText.trim()) {
+        return { success: false, output: 'patchText is required.' };
+      }
+      const files = parseUnifiedPatchFiles(patchText);
+      const policyTargets = files.length > 0 ? files : ['.'];
+      for (const target of policyTargets) {
+        const policy = this.context.checkPolicy('write', target);
+        if (!policy.allowed) {
+          return { success: false, output: `Denied: ${policy.reason}` };
+        }
+      }
+
+      const approvalRequired = policyTargets.some((target) => this.context.checkPolicy('write', target).requiresApproval);
+      const preview = truncateOutput(patchText);
+      const lineStats = parseUnifiedDiffStats(patchText);
+      if (approvalRequired) {
+        const approved = await this.withApproval('apply_unified_patch', files.join(', ') || '.', preview);
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview,
+            metadata: { fileWrites: files, lineStats },
+          };
+        }
+      }
+
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-patch-'));
+      const patchPath = path.join(tempDir, 'change.patch');
+      try {
+        await fs.writeFile(patchPath, patchText, 'utf8');
+        const { stdout, stderr } = await execFileAsync('patch', ['-p0', '--forward', '--batch', '-i', patchPath], {
+          cwd: this.context.cwd,
+          maxBuffer: MAX_BUFFER_BYTES,
+        });
+        const output = truncateOutput(stdout || stderr || 'Patch applied.');
+        return {
+          success: true,
+          output,
+          preview,
+          metadata: { fileWrites: files, lineStats },
+        };
+      } catch (error: any) {
+        return {
+          success: false,
+          output: truncateOutput(error?.stdout || error?.stderr || error?.message || 'Patch failed.'),
+          preview,
+          metadata: { fileWrites: files, lineStats },
+        };
+      } finally {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  private async insertNearAnchor(
+    action: 'insert_after' | 'insert_before',
+    filePath: string,
+    anchorText: string,
+    newContent: string,
+    position: 'after' | 'before',
+  ): Promise<ToolResult> {
+    return this.wrapExecution(action, `${position === 'after' ? 'Inserting after' : 'Inserting before'} anchor in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      if (!anchorText) {
+        return { success: false, output: 'anchorText is required.' };
+      }
+
+      const absolutePath = this.resolveTarget(filePath);
+      const before = await fs.readFile(absolutePath, 'utf8');
+      const anchorIndex = before.indexOf(anchorText);
+      if (anchorIndex === -1) {
+        return { success: false, output: 'anchorText not found.' };
+      }
+      const insertionIndex = position === 'after' ? anchorIndex + anchorText.length : anchorIndex;
+      const after = `${before.slice(0, insertionIndex)}${newContent}${before.slice(insertionIndex)}`;
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval(action, filePath, diff.preview);
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
+          };
+        }
+      }
+
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `${position === 'after' ? 'Inserted after' : 'Inserted before'} anchor in ${filePath}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
       };
     });
   }

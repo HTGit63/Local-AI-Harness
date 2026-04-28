@@ -19,4 +19,10 @@ export const RECIPES = {
   manualToolProtocol: (examples: string[]) => `Manual fallback active. Reply with EXACTLY one JSON object and nothing else.\nAllowed JSON shapes:\n${examples.join('\n')}\n{"final":"short answer"}\nRules: one action at a time, wait after each tool result, never invent tool output, stop early if tool path cannot solve task.`,
   manualToolCorrection: () => `Manual fallback active. Reply with exactly one valid JSON object only. Use {"action":"toolName","args":{...}} for one tool step or {"final":"..."} for final answer. No prose, markdown fences, or raw tool tokens.`,
   directChatInstruction: () => `Reply directly. Do not invent tools. Keep output low-latency and concise.`,
+  taskIntake: (userRequest: string) => `Classify this local-harness request. Keep short. Do not solve it yet.\nRequest: ${userRequest}`,
+  complexityClassification: (userRequest: string) => `Pick one complexity: direct_answer, single_file, small_patch, multi_file, architecture_change, repo_wide_audit, unsafe_or_too_broad.\nRequest: ${userRequest}\nReturn only the label plus one short reason.`,
+  stepExecution: (currentStep: string, compactContext: string) => `Execute only current step. Use one tool call at a time. Do not solve later steps. Never invent tool output.\nCurrent step:\n${currentStep}\nContext:\n${compactContext}`,
+  stepVerification: (currentStep: string, result: string) => `Verify current step result only. If command needed, use one tool call. Otherwise say PASS or FAIL with short reason.\nStep:\n${currentStep}\nResult:\n${result}`,
+  complexTaskPlanning: (userRequest: string, taskContext: string) => `Create bounded task plan for local CPU model. Small visible steps. No broad repo dump. No implementation yet.\nRequest:\n${userRequest}\nTask context:\n${taskContext}`,
+  finalRunSummary: (taskPlan: string, runCheckpoint: string) => `Write final verified summary. Include completed steps, files touched, verification, and remaining blockers. Do not claim unverified work.\nTask plan:\n${taskPlan}\nCheckpoint:\n${runCheckpoint}`,
 };

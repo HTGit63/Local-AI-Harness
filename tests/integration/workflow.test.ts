@@ -110,10 +110,82 @@ async function testToolRegistry() {
   await fs.rm(tempDir, { recursive: true, force: true });
 }
 
+async function testSaferEditTools() {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-safe-edits-'));
+  const policy = new WorkspacePolicy({ workspaceRoot: tempDir, mode: 'danger' });
+  const traces: Array<{ type: string; data: any }> = [];
+
+  await fs.writeFile(path.join(tempDir, 'app.ts'), [
+    'export function demo() {',
+    '  const value = 1;',
+    '  return value;',
+    '}',
+    '',
+  ].join('\n'), 'utf8');
+  await fs.writeFile(path.join(tempDir, 'patch-target.txt'), 'old\n', 'utf8');
+
+  const registry = new ToolRegistry({
+    cwd: tempDir,
+    emitTrace(type, data) {
+      traces.push({ type, data });
+    },
+    checkPolicy(action, target) {
+      return policy.checkAction(action, target);
+    },
+    requestApproval: async () => {
+      throw new Error('Danger mode should not request approval.');
+    },
+  });
+
+  const replaceRange = await registry.replaceRange('app.ts', 2, 2, '  const value = 2;');
+  assert.strictEqual(replaceRange.success, true);
+  assert.ok((replaceRange.preview || '').includes('-  const value = 1;'));
+  assert.ok((replaceRange.preview || '').includes('+  const value = 2;'));
+  assert.ok(replaceRange.metadata?.lineStats?.added >= 1);
+
+  const insertAfter = await registry.insertAfter('app.ts', '  const value = 2;', '  const doubled = value * 2;');
+  assert.strictEqual(insertAfter.success, true);
+
+  const insertBefore = await registry.insertBefore('app.ts', '  return value;', '  void doubled;');
+  assert.strictEqual(insertBefore.success, true);
+
+  const replaceBlock = await registry.replaceBlock('app.ts', '  const value = 2;', '  return value;', [
+    '  const value = 3;',
+    '  const doubled = value * 2;',
+    '  return doubled;',
+  ].join('\n'));
+  assert.strictEqual(replaceBlock.success, true);
+  const appContent = await fs.readFile(path.join(tempDir, 'app.ts'), 'utf8');
+  assert.ok(appContent.includes('const value = 3;'));
+  assert.ok(appContent.includes('return doubled;'));
+
+  const preview = await registry.previewPatch('app.ts', 'before\n', 'after\n');
+  assert.strictEqual(preview.success, true);
+  assert.ok((preview.preview || '').includes('-before'));
+  assert.ok((preview.preview || '').includes('+after'));
+
+  const patchResult = await registry.applyUnifiedPatch([
+    '--- patch-target.txt',
+    '+++ patch-target.txt',
+    '@@ -1 +1 @@',
+    '-old',
+    '+new',
+    '',
+  ].join('\n'));
+  assert.strictEqual(patchResult.success, true);
+  assert.strictEqual(await fs.readFile(path.join(tempDir, 'patch-target.txt'), 'utf8'), 'new\n');
+  assert.ok(patchResult.metadata?.filesWritten?.includes('patch-target.txt'));
+  assert.ok(traces.some((entry) => entry.type === 'tool_call_started' && entry.data.tool === 'replaceRange'));
+  assert.ok(traces.some((entry) => entry.type === 'tool_call_completed' && entry.data.tool === 'applyUnifiedPatch'));
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+}
+
 async function run() {
   await testSessionStore();
   await testApprovalQueue();
   await testToolRegistry();
+  await testSaferEditTools();
   console.log('integration tests passed');
 }
 

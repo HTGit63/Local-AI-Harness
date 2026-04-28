@@ -1,29 +1,35 @@
 import { useEffect, useState } from 'react';
+import type { ComponentType } from 'react';
+import type { Components, Options } from 'react-markdown';
+
+type MarkdownPlugin = NonNullable<Options['remarkPlugins']>[number];
 
 interface LoadedMarkdownRenderer {
-  ReactMarkdown: any;
-  rehypeKatex: any;
-  remarkGfm: any;
-  remarkMath: any;
+  ReactMarkdown: ComponentType<Options>;
+  rehypeKatex: MarkdownPlugin;
+  remarkGfm: MarkdownPlugin;
+  remarkMath: MarkdownPlugin;
 }
 
 let rendererPromise: Promise<LoadedMarkdownRenderer> | null = null;
 
 function loadMarkdownRenderer(): Promise<LoadedMarkdownRenderer> {
-  if (!rendererPromise) {
-    rendererPromise = Promise.all([
-      import('react-markdown'),
-      import('remark-gfm'),
-      import('remark-math'),
-      import('rehype-katex'),
-      import('katex/dist/katex.min.css'),
-    ]).then(([reactMarkdown, remarkGfm, remarkMath, rehypeKatex]) => ({
-      ReactMarkdown: reactMarkdown.default,
-      remarkGfm: remarkGfm.default,
-      remarkMath: remarkMath.default,
-      rehypeKatex: rehypeKatex.default,
-    }));
+  if (rendererPromise) {
+    return rendererPromise;
   }
+
+  rendererPromise = Promise.all([
+    import('react-markdown'),
+    import('remark-gfm'),
+    import('remark-math'),
+    import('rehype-katex'),
+    import('katex/dist/katex.min.css'),
+  ]).then(([reactMarkdown, remarkGfm, remarkMath, rehypeKatex]) => ({
+    ReactMarkdown: reactMarkdown.default,
+    remarkGfm: remarkGfm.default,
+    remarkMath: remarkMath.default,
+    rehypeKatex: rehypeKatex.default,
+  }));
 
   return rendererPromise;
 }
@@ -61,15 +67,16 @@ export function StreamingMarkdown({
   }
 
   const { ReactMarkdown, remarkGfm, remarkMath, rehypeKatex } = renderer;
+  const components: Components = {
+    a: (props) => <a {...props} target="_blank" rel="noreferrer" />,
+  };
 
   return (
     <div className={className || 'markdown-body'}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
-        components={{
-          a: (props: Record<string, unknown>) => <a {...props} target="_blank" rel="noreferrer" />,
-        }}
+        components={components}
       >
         {content}
       </ReactMarkdown>

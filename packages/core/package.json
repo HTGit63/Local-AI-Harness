@@ -12,6 +12,7 @@
     "@local-harness/session-store": "file:../session-store",
     "@local-harness/trace-bus": "file:../trace-bus",
     "@local-harness/tool-runtime": "file:../tool-runtime",
+    "@local-harness/task-orchestrator": "file:../task-orchestrator",
     "@local-harness/planner": "file:../planner",
     "@local-harness/approval-workflow": "file:../approval-workflow",
     "@local-harness/prompt-recipes": "file:../prompt-recipes",
