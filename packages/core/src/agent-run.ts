@@ -130,6 +130,10 @@ export class AgentRunBuilder {
       approvals: [...run.approvals],
       metrics: run.metrics ? { ...run.metrics } : undefined,
       git: run.git ? { ...run.git } : undefined,
+      structuredDiff: run.structuredDiff ? { files: run.structuredDiff.files.map((file) => ({ ...file, hunks: file.hunks.map((hunk) => ({ ...hunk, lines: hunk.lines.map((line) => ({ ...line })) })) })) } : undefined,
+      fileChanges: run.fileChanges ? run.fileChanges.map((file) => ({ ...file, hunks: file.hunks.map((hunk) => ({ ...hunk, lines: hunk.lines.map((line) => ({ ...line })) })) })) : undefined,
+      selectedTests: run.selectedTests ? [...run.selectedTests] : undefined,
+      checkpointIds: run.checkpointIds ? [...run.checkpointIds] : undefined,
     };
   }
 
@@ -149,6 +153,10 @@ export class AgentRunBuilder {
       approvals: this.run.approvals.map((entry) => ({ ...entry })),
       metrics: this.run.metrics ? { ...this.run.metrics } : undefined,
       git: this.run.git ? { ...this.run.git } : undefined,
+      structuredDiff: this.run.structuredDiff ? { files: this.run.structuredDiff.files.map((file) => ({ ...file, hunks: file.hunks.map((hunk) => ({ ...hunk, lines: hunk.lines.map((line) => ({ ...line })) })) })) } : undefined,
+      fileChanges: this.run.fileChanges ? this.run.fileChanges.map((file) => ({ ...file, hunks: file.hunks.map((hunk) => ({ ...hunk, lines: hunk.lines.map((line) => ({ ...line })) })) })) : undefined,
+      selectedTests: this.run.selectedTests ? [...this.run.selectedTests] : undefined,
+      checkpointIds: this.run.checkpointIds ? [...this.run.checkpointIds] : undefined,
     };
   }
 
@@ -237,6 +245,20 @@ export class AgentRunBuilder {
     mergeWebFetches(this.run.webFetches, metadata.webFetches);
     mergeCommands(this.run.commands, metadata.command);
     this.run.git = mergeLineStats(this.run.git, metadata.lineStats);
+    if (metadata.structuredDiff) {
+      this.run.structuredDiff = metadata.structuredDiff;
+      this.run.fileChanges = metadata.structuredDiff.files;
+    }
+    uniquePush(this.run.selectedTests ??= [], metadata.selectedTests);
+    if (metadata.checkpointId) {
+      uniquePush(this.run.checkpointIds ??= [], [metadata.checkpointId]);
+    }
+    if (metadata.contextBudgetUsed || metadata.contextBudgetLimit) {
+      this.setMetric({
+        contextBudgetUsed: metadata.contextBudgetUsed,
+        contextBudgetLimit: metadata.contextBudgetLimit,
+      });
+    }
   }
 
   setGitStats(git: AgentRunLineStats | undefined) {

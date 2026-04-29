@@ -457,6 +457,9 @@ const server = http.createServer(async (req, res) => {
       const validModes = new Set(['read-only', 'workspace-write', 'danger']);
       const validProfiles = new Set(['fast', 'balanced', 'deep']);
       const validBudgetProfiles = new Set(['lean', 'balanced', 'deep']);
+      const validExecutionProfiles = new Set(['fast_local', 'balanced_local', 'deep_review', 'api_frontier']);
+      const validProviderProfiles = new Set(['ollama_local', 'openai_compatible', 'openrouter', 'together', 'groq', 'qwen_api', 'kimi_api']);
+      const validPromptProfiles = new Set(['gemma-local-fast', 'qwen-coder-local', 'deepseek-coder-local', 'kimi-api-long-context', 'frontier-mini-api']);
       if (body.baseUrl !== undefined && typeof body.baseUrl !== 'string') {
         sendBadRequest(req, res, 'baseUrl must be a string.');
         return;
@@ -484,6 +487,24 @@ const server = http.createServer(async (req, res) => {
       if (body.localModelBudgetProfile !== undefined && (typeof body.localModelBudgetProfile !== 'string' || !validBudgetProfiles.has(body.localModelBudgetProfile))) {
         sendBadRequest(req, res, 'localModelBudgetProfile must be one of lean, balanced, or deep.');
         return;
+      }
+      if (body.executionProfile !== undefined && (typeof body.executionProfile !== 'string' || !validExecutionProfiles.has(body.executionProfile))) {
+        sendBadRequest(req, res, 'executionProfile must be one of fast_local, balanced_local, deep_review, or api_frontier.');
+        return;
+      }
+      if (body.providerProfile !== undefined && (typeof body.providerProfile !== 'string' || !validProviderProfiles.has(body.providerProfile))) {
+        sendBadRequest(req, res, 'providerProfile is not supported.');
+        return;
+      }
+      if (body.promptProfile !== undefined && (typeof body.promptProfile !== 'string' || !validPromptProfiles.has(body.promptProfile))) {
+        sendBadRequest(req, res, 'promptProfile is not supported.');
+        return;
+      }
+      for (const key of ['fastModel', 'codingModel', 'reviewModel', 'apiModel']) {
+        if (body[key] !== undefined && typeof body[key] !== 'string') {
+          sendBadRequest(req, res, `${key} must be a string.`);
+          return;
+        }
       }
       if (body.internetAccessEnabled !== undefined && typeof body.internetAccessEnabled !== 'boolean') {
         sendBadRequest(req, res, 'internetAccessEnabled must be a boolean.');
@@ -899,6 +920,78 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/api/workspace/git/diff' && method === 'GET') {
       sendJson(req, res, 200, await engine.gitDiff());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/git/diff/structured' && method === 'GET') {
+      sendJson(req, res, 200, await engine.getStructuredDiff());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/project/commands' && method === 'GET') {
+      sendJson(req, res, 200, await engine.detectProjectCommands());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/symbol' && method === 'GET') {
+      const name = getQueryValue(requestUrl, 'name');
+      const kind = getQueryValue(requestUrl, 'kind');
+      if (!name) {
+        sendBadRequest(req, res, 'name query parameter is required.');
+        return;
+      }
+      if (kind === 'function') {
+        sendJson(req, res, 200, await engine.findFunction(name));
+        return;
+      }
+      if (kind === 'component') {
+        sendJson(req, res, 200, await engine.findComponent(name));
+        return;
+      }
+      sendJson(req, res, 200, await engine.findSymbol(name));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/imports' && method === 'GET') {
+      const targetPath = getQueryValue(requestUrl, 'path');
+      const direction = getQueryValue(requestUrl, 'direction');
+      if (!targetPath) {
+        sendBadRequest(req, res, 'path query parameter is required.');
+        return;
+      }
+      if (direction === 'reverse') {
+        sendJson(req, res, 200, await engine.whoImports(targetPath));
+        return;
+      }
+      if (direction === 'affected') {
+        sendJson(req, res, 200, await engine.affectedFiles(targetPath));
+        return;
+      }
+      sendJson(req, res, 200, await engine.whatDoesThisImport(targetPath));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/tests/select' && method === 'POST') {
+      const body = await readBody(req);
+      sendJson(req, res, 200, await engine.selectTestsForChangedFiles(body.changedFiles));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/checkpoint' && method === 'POST') {
+      const body = await readBody(req);
+      const label = typeof body.label === 'string' ? body.label : undefined;
+      sendJson(req, res, 200, await engine.createCheckpoint(label));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/checkpoint/rollback' && method === 'POST') {
+      const body = await readBody(req);
+      const checkpointId = typeof body.checkpointId === 'string' ? body.checkpointId : '';
+      if (!checkpointId) {
+        sendBadRequest(req, res, 'checkpointId is required.');
+        return;
+      }
+      sendJson(req, res, 200, await engine.rollbackToCheckpoint(checkpointId));
       return;
     }
 

@@ -4,6 +4,35 @@ export interface ToolDiffStats {
   removedLines: number;
 }
 
+export type StructuredDiffLineType = 'context' | 'added' | 'removed' | 'hunk' | 'file';
+
+export interface StructuredDiffLine {
+  type: StructuredDiffLineType;
+  oldLine?: number;
+  newLine?: number;
+  content: string;
+}
+
+export interface StructuredDiffHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: StructuredDiffLine[];
+}
+
+export interface StructuredDiffFile {
+  path: string;
+  oldPath?: string;
+  addedLines: number;
+  removedLines: number;
+  hunks: StructuredDiffHunk[];
+}
+
+export interface StructuredDiff {
+  files: StructuredDiffFile[];
+}
+
 export interface ToolSearchRecord {
   query: string;
   pattern?: string;
@@ -38,6 +67,11 @@ export interface ToolResultMetadata {
   webFetches?: ToolWebFetchRecord[];
   command?: ToolCommandRecord;
   lineStats?: ToolDiffStats;
+  structuredDiff?: StructuredDiff;
+  selectedTests?: string[];
+  checkpointId?: string;
+  contextBudgetUsed?: number;
+  contextBudgetLimit?: number;
   truncated?: boolean;
 }
 

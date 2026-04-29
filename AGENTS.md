@@ -16,6 +16,15 @@
 - `TASK-09 [done]` Regression coverage added for continuation recovery, direct-chat conversation compaction, and large tool-output compaction in unit tests; full repo test sweep passes.
 - `TASK-10 [done]` External-reference intent now maps to concrete repo changes instead of notes only: qwe-qwe informed continuation/compaction; Osaurus informed main-shell/live-activity UI posture; Codex docs informed explicit approval/runtime/status visibility.
 
+# 0.1 2026-04-28 smart-agent tool ledger
+
+- `TASK-11 [done]` Deterministic code-structure tools added: `findSymbol`, `findFunction`, `findComponent`, import graph queries, affected-file discovery, context packs, project command detection, and targeted test selection.
+- `TASK-12 [done]` Precision edit tools added: `replaceFunction`, `insertImport`, `addTypeProperty`, and `renameIdentifier`, all routed through existing policy/approval/diff paths instead of whole-file rewrites.
+- `TASK-13 [done]` Structured diff and rollback trust path added: `getStructuredDiff`, structured run summary fields, checkpoint creation, rollback-to-checkpoint, and API endpoints for UI/runtime use.
+- `TASK-14 [done]` Run console now shows inline diff hunks with old/new line numbers, file-level change totals, why-file-selected notes, context-budget telemetry, and richer tool transparency with duration/output previews.
+- `TASK-15 [done]` Model routing foundation added: execution profiles, provider profile labels, prompt profiles, fast/code/review/API model slots, route selection traces, and model-per-purpose calls for direct/code/summarize paths.
+- `TASK-16 [done]` Regression coverage added for deterministic repo tools, AST edits, import graph, targeted test selection, command detection, checkpoint rollback, and full `npm test` passes.
+
 Implementation audit note:
 - `qwe-qwe` mechanisms selectively ported: response continuation, context compaction mindset, bounded retry/continuation loop, compacted tool reinjection.
 - `osaurus` ideas selectively ported: clearer direct-vs-agent posture, stronger live command-center framing, better visible session/activity shell.

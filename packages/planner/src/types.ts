@@ -18,6 +18,8 @@ export interface PlanState {
   sessionMemoryEnabled?: boolean;
   sessionMemoryTurns?: number;
   selfCheckEnabled?: boolean;
+  executionProfile?: string;
+  promptProfile?: string;
   lastStatus?: string;
   currentRunId?: string;
   currentTool?: string;

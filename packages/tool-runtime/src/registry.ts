@@ -1,4 +1,21 @@
-import { ApprovalDecision, ToolActionContext, ToolDiffStats, ToolResult } from './types';
+import { ApprovalDecision, StructuredDiff, ToolActionContext, ToolDiffStats, ToolResult } from './types';
+import {
+  addInterfaceProperty,
+  buildContextPack as buildCodeContextPack,
+  findSymbols,
+  insertImportStatement,
+  renameIdentifierText,
+  replaceFunctionBody,
+} from './code-tools';
+import { createWorkspaceCheckpoint, rollbackWorkspaceCheckpoint } from './checkpoint-tools';
+import { parseStructuredDiff } from './diff-tools';
+import {
+  affectedFiles as findAffectedFiles,
+  detectProjectCommands as detectCommands,
+  selectTestsForChangedFiles as selectTests,
+  whatDoesThisImport as findImports,
+  whoImports as findImporters,
+} from './project-tools';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
@@ -12,6 +29,7 @@ const MAX_WEB_RESULTS = 5;
 const MAX_WEB_FETCH_BYTES = 180_000;
 const MAX_WEB_FETCH_TEXT_CHARS = 16_000;
 const WEB_REQUEST_TIMEOUT_MS = 12_000;
+const CHECKPOINT_TARGET = '.gamma-harness/checkpoints';
 
 function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
@@ -397,6 +415,16 @@ function parseUnifiedDiffStats(diff: string): ToolDiffStats {
 
   return {
     changedFiles: addedLines > 0 || removedLines > 0 ? 1 : 0,
+    addedLines,
+    removedLines,
+  };
+}
+
+function diffStatsFromStructuredDiff(diff: StructuredDiff): ToolDiffStats {
+  const addedLines = diff.files.reduce((total, file) => total + file.addedLines, 0);
+  const removedLines = diff.files.reduce((total, file) => total + file.removedLines, 0);
+  return {
+    changedFiles: diff.files.length,
     addedLines,
     removedLines,
   };
@@ -1226,6 +1254,316 @@ export class ToolRegistry {
         metadata: {
           fileDeletes: stat.isDirectory() ? undefined : [filePath],
           lineStats: diff.lineStats,
+        },
+      };
+    });
+  }
+
+  async findSymbol(symbolName: string): Promise<ToolResult> {
+    return this.wrapExecution('find_symbol', `Finding symbol ${symbolName}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const matches = await findSymbols(this.context.cwd, symbolName, 'symbol');
+      return {
+        success: true,
+        output: JSON.stringify({ symbolName, matches }, null, 2),
+        metadata: {
+          searches: [{ query: symbolName, pattern: 'symbol' }],
+        },
+      };
+    });
+  }
+
+  async findFunction(functionName: string): Promise<ToolResult> {
+    return this.wrapExecution('find_function', `Finding function ${functionName}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const matches = await findSymbols(this.context.cwd, functionName, 'function');
+      return {
+        success: true,
+        output: JSON.stringify({ functionName, matches }, null, 2),
+        metadata: {
+          searches: [{ query: functionName, pattern: 'function' }],
+        },
+      };
+    });
+  }
+
+  async findComponent(componentName: string): Promise<ToolResult> {
+    return this.wrapExecution('find_component', `Finding component ${componentName}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const matches = await findSymbols(this.context.cwd, componentName, 'component');
+      return {
+        success: true,
+        output: JSON.stringify({ componentName, matches }, null, 2),
+        metadata: {
+          searches: [{ query: componentName, pattern: 'component' }],
+        },
+      };
+    });
+  }
+
+  async replaceFunction(filePath: string, functionName: string, newBody: string): Promise<ToolResult> {
+    return this.wrapExecution('replace_function', `Replacing ${functionName} in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const absolutePath = this.resolveTarget(filePath);
+      const { before, after } = await replaceFunctionBody(this.context.cwd, filePath, functionName, newBody);
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('replace_function', filePath, diff.preview, { functionName });
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
+          };
+        }
+      }
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `Replaced function ${functionName} in ${filePath}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
+      };
+    });
+  }
+
+  async insertImport(filePath: string, importStatement: string): Promise<ToolResult> {
+    return this.wrapExecution('insert_import', `Inserting import in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const absolutePath = this.resolveTarget(filePath);
+      const { before, after } = await insertImportStatement(this.context.cwd, filePath, importStatement);
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('insert_import', filePath, diff.preview);
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats } };
+        }
+      }
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return { success: true, output: `Inserted import in ${filePath}`, preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats } };
+    });
+  }
+
+  async addTypeProperty(filePath: string, interfaceName: string, property: string): Promise<ToolResult> {
+    return this.wrapExecution('add_type_property', `Adding ${interfaceName}.${property}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const absolutePath = this.resolveTarget(filePath);
+      const { before, after } = await addInterfaceProperty(this.context.cwd, filePath, interfaceName, property);
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('add_type_property', filePath, diff.preview, { interfaceName });
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats } };
+        }
+      }
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return { success: true, output: `Added property to ${interfaceName}`, preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats } };
+    });
+  }
+
+  async renameIdentifier(filePath: string, oldName: string, newName: string): Promise<ToolResult> {
+    return this.wrapExecution('rename_identifier', `Renaming ${oldName} to ${newName} in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const absolutePath = this.resolveTarget(filePath);
+      const { before, after, replacements } = await renameIdentifierText(this.context.cwd, filePath, oldName, newName);
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('rename_identifier', filePath, diff.preview, { oldName, newName });
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats } };
+        }
+      }
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `Renamed ${replacements} identifier occurrence${replacements === 1 ? '' : 's'} in ${filePath}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats },
+      };
+    });
+  }
+
+  async whatDoesThisImport(filePath: string): Promise<ToolResult> {
+    return this.wrapExecution('what_does_this_import', `Reading imports for ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('read', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const imports = await findImports(this.context.cwd, filePath);
+      return { success: true, output: JSON.stringify({ filePath, imports }, null, 2), metadata: { fileReads: [filePath] } };
+    });
+  }
+
+  async whoImports(filePath: string): Promise<ToolResult> {
+    return this.wrapExecution('who_imports', `Finding importers for ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const importers = await findImporters(this.context.cwd, filePath);
+      return { success: true, output: JSON.stringify({ filePath, importers }, null, 2), metadata: { searches: [{ query: filePath, pattern: 'imports' }] } };
+    });
+  }
+
+  async affectedFiles(filePath: string): Promise<ToolResult> {
+    return this.wrapExecution('affected_files', `Finding affected files for ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const affected = await findAffectedFiles(this.context.cwd, filePath);
+      return { success: true, output: JSON.stringify({ filePath, affectedFiles: affected }, null, 2), metadata: { searches: [{ query: filePath, pattern: 'affected-files' }] } };
+    });
+  }
+
+  async selectTestsForChangedFiles(changedFiles: string | string[]): Promise<ToolResult> {
+    return this.wrapExecution('select_tests_for_changed_files', 'Selecting targeted tests', async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const selection = await selectTests(this.context.cwd, changedFiles);
+      return { success: true, output: JSON.stringify(selection, null, 2), metadata: { selectedTests: selection.tests } };
+    });
+  }
+
+  async detectProjectCommands(): Promise<ToolResult> {
+    return this.wrapExecution('detect_project_commands', 'Detecting project commands', async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const commands = await detectCommands(this.context.cwd);
+      return { success: true, output: JSON.stringify(commands, null, 2), metadata: { fileReads: commands.detectedFiles } };
+    });
+  }
+
+  async buildContextPack(query: string, maxFiles = 5): Promise<ToolResult> {
+    return this.wrapExecution('build_context_pack', `Building context pack for "${query}"`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const pack = await buildCodeContextPack(this.context.cwd, query, 8_000, maxFiles);
+      return {
+        success: true,
+        output: JSON.stringify(pack, null, 2),
+        metadata: {
+          fileReads: pack.fileCards.map((card) => card.filePath),
+          contextBudgetUsed: pack.contextBudgetUsed,
+          contextBudgetLimit: pack.contextBudgetLimit,
+        },
+      };
+    });
+  }
+
+  async getStructuredDiff(): Promise<ToolResult> {
+    return this.wrapExecution('get_structured_diff', 'git diff as structured hunks', async () => {
+      try {
+        const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--unified=80', '--'], {
+          cwd: this.context.cwd,
+          maxBuffer: MAX_BUFFER_BYTES,
+        });
+        const structuredDiff = parseStructuredDiff(stdout);
+        const lineStats = diffStatsFromStructuredDiff(structuredDiff);
+        return {
+          success: true,
+          output: JSON.stringify(structuredDiff, null, 2),
+          metadata: {
+            structuredDiff,
+            lineStats,
+            command: { command: 'git diff --no-ext-diff --unified=80 --', success: true },
+          },
+        };
+      } catch (error) {
+        if (isNotGitRepository(error)) {
+          const structuredDiff = { files: [] };
+          return {
+            success: true,
+            output: JSON.stringify(structuredDiff, null, 2),
+            metadata: {
+              structuredDiff,
+              lineStats: { changedFiles: 0, addedLines: 0, removedLines: 0 },
+              command: { command: 'git diff --no-ext-diff --unified=80 --', success: true },
+            },
+          };
+        }
+        throw error;
+      }
+    });
+  }
+
+  async createCheckpoint(label?: string): Promise<ToolResult> {
+    return this.wrapExecution('create_checkpoint', 'Creating workspace checkpoint', async () => {
+      const policy = this.context.checkPolicy('write', CHECKPOINT_TARGET);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const preview = `Create checkpoint${label ? `: ${label}` : ''}`;
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('create_checkpoint', CHECKPOINT_TARGET, preview);
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview };
+        }
+      }
+      const checkpoint = await createWorkspaceCheckpoint(this.context.cwd, label);
+      this.context.emitTrace('checkpoint_created', checkpoint);
+      return {
+        success: true,
+        output: JSON.stringify(checkpoint, null, 2),
+        preview,
+        metadata: {
+          checkpointId: checkpoint.id,
+          directoriesCreated: [checkpoint.path],
+        },
+      };
+    });
+  }
+
+  async rollbackToCheckpoint(checkpointId: string): Promise<ToolResult> {
+    return this.wrapExecution('rollback_to_checkpoint', `Rollback to ${checkpointId}`, async () => {
+      const policy = this.context.checkPolicy('write', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const preview = `Rollback workspace to checkpoint ${checkpointId}. This restores snapshot files and removes files created after the checkpoint.`;
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('rollback_to_checkpoint', checkpointId, preview);
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview };
+        }
+      }
+      const rollback = await rollbackWorkspaceCheckpoint(this.context.cwd, checkpointId);
+      this.context.emitTrace('checkpoint_rolled_back', rollback);
+      return {
+        success: true,
+        output: JSON.stringify(rollback, null, 2),
+        preview,
+        metadata: {
+          checkpointId,
+          directoriesCreated: [rollback.checkpoint.path],
         },
       };
     });

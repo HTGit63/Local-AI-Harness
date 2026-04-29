@@ -123,6 +123,29 @@ async function testSaferEditTools() {
     '',
   ].join('\n'), 'utf8');
   await fs.writeFile(path.join(tempDir, 'patch-target.txt'), 'old\n', 'utf8');
+  await fs.writeFile(path.join(tempDir, 'package.json'), JSON.stringify({ scripts: { build: 'tsc', test: 'node test.js', dev: 'vite' } }), 'utf8');
+  await fs.mkdir(path.join(tempDir, 'src'), { recursive: true });
+  await fs.writeFile(path.join(tempDir, 'src', 'types.ts'), [
+    'export interface RunState {',
+    '  id: string;',
+    '}',
+    '',
+  ].join('\n'), 'utf8');
+  await fs.writeFile(path.join(tempDir, 'src', 'consumer.ts'), [
+    'import type { RunState } from "./types";',
+    '',
+    'export function chatStream(state: RunState) {',
+    '  const messageText = state.id;',
+    '  return messageText;',
+    '}',
+    '',
+  ].join('\n'), 'utf8');
+  await fs.writeFile(path.join(tempDir, 'src', 'RunConsole.tsx'), [
+    'export function RunConsole() {',
+    '  return <div>Run</div>;',
+    '}',
+    '',
+  ].join('\n'), 'utf8');
 
   const registry = new ToolRegistry({
     cwd: tempDir,
@@ -177,6 +200,66 @@ async function testSaferEditTools() {
   assert.ok(patchResult.metadata?.filesWritten?.includes('patch-target.txt'));
   assert.ok(traces.some((entry) => entry.type === 'tool_call_started' && entry.data.tool === 'replaceRange'));
   assert.ok(traces.some((entry) => entry.type === 'tool_call_completed' && entry.data.tool === 'applyUnifiedPatch'));
+
+  const symbolResult = await registry.findSymbol('RunState');
+  assert.strictEqual(symbolResult.success, true);
+  assert.ok(symbolResult.output.includes('src/types.ts'));
+
+  const functionResult = await registry.findFunction('chatStream');
+  assert.strictEqual(functionResult.success, true);
+  assert.ok(functionResult.output.includes('src/consumer.ts'));
+
+  const componentResult = await registry.findComponent('RunConsole');
+  assert.strictEqual(componentResult.success, true);
+  assert.ok(componentResult.output.includes('src/RunConsole.tsx'));
+
+  const importsResult = await registry.whatDoesThisImport('src/consumer.ts');
+  assert.strictEqual(importsResult.success, true);
+  assert.ok(importsResult.output.includes('./types'));
+
+  const importersResult = await registry.whoImports('src/types.ts');
+  assert.strictEqual(importersResult.success, true);
+  assert.ok(importersResult.output.includes('src/consumer.ts'));
+
+  const affectedResult = await registry.affectedFiles('src/types.ts');
+  assert.strictEqual(affectedResult.success, true);
+  assert.ok(affectedResult.output.includes('src/consumer.ts'));
+
+  const replaceFunctionResult = await registry.replaceFunction('src/consumer.ts', 'chatStream', 'return "patched";');
+  assert.strictEqual(replaceFunctionResult.success, true);
+  assert.ok((await fs.readFile(path.join(tempDir, 'src', 'consumer.ts'), 'utf8')).includes('return "patched";'));
+
+  const importResult = await registry.insertImport('src/consumer.ts', 'import { readFile } from "fs/promises";');
+  assert.strictEqual(importResult.success, true);
+  assert.ok((await fs.readFile(path.join(tempDir, 'src', 'consumer.ts'), 'utf8')).includes('fs/promises'));
+
+  const propertyResult = await registry.addTypeProperty('src/types.ts', 'RunState', 'status?: string;');
+  assert.strictEqual(propertyResult.success, true);
+  assert.ok((await fs.readFile(path.join(tempDir, 'src', 'types.ts'), 'utf8')).includes('status?: string;'));
+
+  const renameResult = await registry.renameIdentifier('src/consumer.ts', 'chatStream', 'chatStreamPatched');
+  assert.strictEqual(renameResult.success, true);
+  assert.ok((await fs.readFile(path.join(tempDir, 'src', 'consumer.ts'), 'utf8')).includes('chatStreamPatched'));
+
+  const commandsResult = await registry.detectProjectCommands();
+  assert.strictEqual(commandsResult.success, true);
+  assert.ok(commandsResult.output.includes('"packageManager": "npm"'));
+  assert.ok(commandsResult.output.includes('"build": "npm run build"'));
+
+  const testSelection = await registry.selectTestsForChangedFiles(['packages/tool-runtime/src/registry.ts']);
+  assert.strictEqual(testSelection.success, true);
+  assert.ok(testSelection.output.includes('tests/integration/workflow.test.ts'));
+
+  const checkpoint = await registry.createCheckpoint('before test edit');
+  assert.strictEqual(checkpoint.success, true);
+  const checkpointId = checkpoint.metadata?.checkpointId;
+  assert.ok(checkpointId);
+  await fs.writeFile(path.join(tempDir, 'src', 'created-after-checkpoint.ts'), 'remove me', 'utf8');
+  await fs.writeFile(path.join(tempDir, 'src', 'types.ts'), 'changed\n', 'utf8');
+  const rollback = await registry.rollbackToCheckpoint(checkpointId);
+  assert.strictEqual(rollback.success, true);
+  assert.ok((await fs.readFile(path.join(tempDir, 'src', 'types.ts'), 'utf8')).includes('status?: string;'));
+  assert.strictEqual(await fs.stat(path.join(tempDir, 'src', 'created-after-checkpoint.ts')).then(() => true).catch(() => false), false);
 
   await fs.rm(tempDir, { recursive: true, force: true });
 }

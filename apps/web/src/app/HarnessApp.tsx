@@ -3,7 +3,7 @@ import { ApprovalQueue } from '../components/approvals/ApprovalQueue';
 import { ChatMessageRow } from '../components/ChatMessageRow';
 import { RunConsole } from '../components/run-console/RunConsole';
 import { useStreamingBuffer } from '../hooks/useStreamingBuffer';
-import type { RunApprovalItem, TaskComplexity, TaskPlan } from '../types/run';
+import type { RunApprovalItem, StructuredDiff, TaskComplexity, TaskPlan } from '../types/run';
 
 /* ─────────── API helpers ─────────── */
 function getApiBase(): string {
@@ -91,6 +91,13 @@ interface ConfigState {
     maxModelCallsPerRun: number;
     maxToolCallsPerRun: number;
   };
+  executionProfile?: 'fast_local' | 'balanced_local' | 'deep_review' | 'api_frontier';
+  providerProfile?: string;
+  promptProfile?: string;
+  fastModel?: string;
+  codingModel?: string;
+  reviewModel?: string;
+  apiModel?: string;
 }
 
 interface SessionState {
@@ -471,6 +478,16 @@ function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     }
     return res.json() as Promise<T>;
   });
+}
+
+function parseStructuredDiffResponse(response: { output?: string; metadata?: { structuredDiff?: StructuredDiff } }): StructuredDiff | null {
+  if (response.metadata?.structuredDiff) return response.metadata.structuredDiff;
+  if (!response.output) return null;
+  try {
+    return JSON.parse(response.output) as StructuredDiff;
+  } catch {
+    return null;
+  }
 }
 
 function readFileAsDataUrl(file: File): Promise<string> {
@@ -1062,6 +1079,7 @@ function HarnessApp() {
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [repoContext, setRepoContext] = useState<RepoContext | null>(null);
   const [gitDiff, setGitDiff] = useState('');
+  const [structuredDiff, setStructuredDiff] = useState<StructuredDiff | null>(null);
 
   // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -1307,12 +1325,14 @@ function HarnessApp() {
       setSkills(sk);
 
       if (includeHeavy) {
-        const [repo, diff] = await Promise.all([
+        const [repo, diff, structured] = await Promise.all([
           safe<RepoContext | null>(`${API}/workspace/index`, null),
           safe<{ output: string }>(`${API}/workspace/git/diff`, { output: '' }),
+          safe<{ output: string; metadata?: { structuredDiff?: StructuredDiff } }>(`${API}/workspace/git/diff/structured`, { output: '' }),
         ]);
         setRepoContext(repo);
         setGitDiff(diff.output);
+        setStructuredDiff(parseStructuredDiffResponse(structured));
       }
     } catch { setBackendStatus('offline'); }
   }, [repoContext, settingsOpen, settingsTab]);
@@ -2477,6 +2497,7 @@ function HarnessApp() {
           traces={traces}
           approvals={approvals}
           gitDiff={gitDiff}
+          structuredDiff={structuredDiff}
           onResolveApproval={resolveApproval}
         />
 
@@ -2587,6 +2608,18 @@ function HarnessApp() {
                       <div className="settings-info-row">
                         <span>Local Budget Profile</span>
                         <span>{config?.localModelBudgetProfile || 'balanced'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Execution Profile</span>
+                        <span>{config?.executionProfile || 'balanced_local'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Prompt Profile</span>
+                        <span>{config?.promptProfile || 'gemma-local-fast'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Router</span>
+                        <span>fast {config?.fastModel || 'gemma4:e4b'} · code {config?.codingModel || config?.model}</span>
                       </div>
                       <div className="settings-info-row">
                         <span>Run Budget</span>

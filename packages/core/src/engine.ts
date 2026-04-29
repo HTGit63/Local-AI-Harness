@@ -24,8 +24,21 @@ const SUPPORTED_TOOLS = [
   'listDir',
   'webSearch',
   'fetchUrl',
+  'findSymbol',
+  'findFunction',
+  'findComponent',
+  'whatDoesThisImport',
+  'whoImports',
+  'affectedFiles',
+  'selectTestsForChangedFiles',
+  'detectProjectCommands',
+  'buildContextPack',
   'writeFile',
   'patchFile',
+  'replaceFunction',
+  'insertImport',
+  'addTypeProperty',
+  'renameIdentifier',
   'replaceRange',
   'insertAfter',
   'insertBefore',
@@ -34,6 +47,9 @@ const SUPPORTED_TOOLS = [
   'previewPatch',
   'makeDir',
   'deleteFile',
+  'getStructuredDiff',
+  'createCheckpoint',
+  'rollbackToCheckpoint',
   'runCommand',
   'gitStatus',
   'gitDiff',
@@ -55,6 +71,10 @@ type ManualToolDecision =
   | { kind: 'final'; content: string };
 type ImmediateChatAnswer = { content: string; action: string; source: string };
 type ToolProtocolMode = 'native' | 'manual_preferred' | 'manual_fallback';
+type ExecutionProfile = 'fast_local' | 'balanced_local' | 'deep_review' | 'api_frontier';
+type ProviderProfile = 'ollama_local' | 'openai_compatible' | 'openrouter' | 'together' | 'groq' | 'qwen_api' | 'kimi_api';
+type PromptProfile = 'gemma-local-fast' | 'qwen-coder-local' | 'deepseek-coder-local' | 'kimi-api-long-context' | 'frontier-mini-api';
+type ModelRoutePurpose = 'direct' | 'classify' | 'code' | 'summarize' | 'review';
 type BootstrapPlanStep =
   | { type: 'inventory'; title: string }
   | { type: 'tool'; title: string; toolName: SupportedTool; args: Record<string, unknown> };
@@ -183,6 +203,13 @@ export interface EngineConfig {
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
   localModelBudgetProfile: LocalModelBudgetProfileName;
+  executionProfile: ExecutionProfile;
+  providerProfile: ProviderProfile;
+  promptProfile: PromptProfile;
+  fastModel: string;
+  codingModel: string;
+  reviewModel: string;
+  apiModel: string;
 }
 
 export interface PublicEngineConfig {
@@ -201,6 +228,13 @@ export interface PublicEngineConfig {
   selfCheckEnabled: boolean;
   localModelBudgetProfile: LocalModelBudgetProfileName;
   localModelBudget: LocalModelBudgetProfile;
+  executionProfile: ExecutionProfile;
+  providerProfile: ProviderProfile;
+  promptProfile: PromptProfile;
+  fastModel: string;
+  codingModel: string;
+  reviewModel: string;
+  apiModel: string;
 }
 
 export interface UpdateConfigOptions {
@@ -223,6 +257,13 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   sessionMemoryTurns: Number(process.env.HARNESS_SESSION_MEMORY_TURNS || 3),
   selfCheckEnabled: process.env.HARNESS_SELF_CHECK !== '0',
   localModelBudgetProfile: (process.env.HARNESS_LOCAL_MODEL_BUDGET_PROFILE as LocalModelBudgetProfileName) || 'balanced',
+  executionProfile: (process.env.HARNESS_EXECUTION_PROFILE as ExecutionProfile) || 'balanced_local',
+  providerProfile: (process.env.HARNESS_PROVIDER_PROFILE as ProviderProfile) || 'ollama_local',
+  promptProfile: (process.env.HARNESS_PROMPT_PROFILE as PromptProfile) || 'gemma-local-fast',
+  fastModel: process.env.HARNESS_FAST_MODEL || 'gemma4:e4b',
+  codingModel: process.env.HARNESS_CODING_MODEL || process.env.HARNESS_MODEL || 'qwen3.5:9b-q4_K_M',
+  reviewModel: process.env.HARNESS_REVIEW_MODEL || 'VladimirGav/gemma4-26b-16GB-VRAM:latest',
+  apiModel: process.env.HARNESS_API_MODEL || '',
 };
 
 function resolveSessionDataDir(workspaceRoot: string, sessionDataDir: string): string {
@@ -342,6 +383,17 @@ function getRequiredStringArg(args: Record<string, unknown>, key: string, toolNa
 function getOptionalStringArg(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function getOptionalNumberArg(args: Record<string, unknown>, key: string): number | undefined {
+  const value = args[key];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+  return undefined;
 }
 
 function getRequiredNumberArg(args: Record<string, unknown>, key: string, toolName: SupportedTool): number {
@@ -578,6 +630,10 @@ function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown
     case 'readFile':
     case 'writeFile':
     case 'patchFile':
+    case 'replaceFunction':
+    case 'insertImport':
+    case 'addTypeProperty':
+    case 'renameIdentifier':
     case 'replaceRange':
     case 'insertAfter':
     case 'insertBefore':
@@ -601,12 +657,31 @@ function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown
       return `Query: ${getRequiredStringArg(args, 'query', toolName)}`;
     case 'fetchUrl':
       return `URL: ${getRequiredStringArg(args, 'url', toolName)}`;
+    case 'findSymbol':
+      return `Symbol: ${getRequiredStringArg(args, 'symbolName', toolName)}`;
+    case 'findFunction':
+      return `Function: ${getRequiredStringArg(args, 'functionName', toolName)}`;
+    case 'findComponent':
+      return `Component: ${getRequiredStringArg(args, 'componentName', toolName)}`;
+    case 'whatDoesThisImport':
+    case 'whoImports':
+    case 'affectedFiles':
+      return `Path: ${getRequiredStringArg(args, 'filePath', toolName)}`;
+    case 'selectTestsForChangedFiles':
+      return 'Changed files';
+    case 'buildContextPack':
+      return `Query: ${getRequiredStringArg(args, 'query', toolName)}`;
     case 'makeDir':
       return `Path: ${getRequiredStringArg(args, 'dirPath', toolName)}`;
+    case 'rollbackToCheckpoint':
+      return `Checkpoint: ${getRequiredStringArg(args, 'checkpointId', toolName)}`;
     case 'runCommand':
       return `Command: ${getRequiredStringArg(args, 'command', toolName)}`;
     case 'gitStatus':
     case 'gitDiff':
+    case 'getStructuredDiff':
+    case 'detectProjectCommands':
+    case 'createCheckpoint':
       return 'Workspace command';
     default:
       return truncateStreamPreview(JSON.stringify(args));
@@ -648,6 +723,22 @@ function buildStepScopedPrompt(taskPlan: TaskPlan, currentStep: TaskStep | null,
   ].join('\n\n');
 }
 
+function promptProfileInstruction(profile: PromptProfile): string {
+  switch (profile) {
+    case 'qwen-coder-local':
+      return 'Local Qwen coder profile: use deterministic tools first, keep patches small, prefer AST edit tools, return one tool call or one concise final answer.';
+    case 'deepseek-coder-local':
+      return 'Local DeepSeek coder profile: inspect exact code before edits, avoid broad rewrites, use structured diff and targeted verification.';
+    case 'kimi-api-long-context':
+      return 'Kimi long-context profile: synthesize compact file cards before reading long files, keep citations to file paths and line ranges.';
+    case 'frontier-mini-api':
+      return 'Frontier mini profile: plan briefly, execute with tools, verify targeted tests, summarize exact diff hunks.';
+    case 'gemma-local-fast':
+    default:
+      return 'Local Gemma fast profile: no preamble before tool use, one tool call at a time, small context, max 1-2 model loops for small tasks.';
+  }
+}
+
 export class CoreEngine extends EventEmitter {
   public config: EngineConfig;
 
@@ -660,6 +751,7 @@ export class CoreEngine extends EventEmitter {
   private readonly repoIndexer: RepoIndexer;
   private readonly taskOrchestrator: TaskOrchestrator;
   private readonly toolRegistry: ToolRegistry;
+  private readonly autoCheckpointRuns = new Set<string>();
   private sessionDataDirSetting: string;
   private readonly traceLog: TraceEvent[] = [];
   private currentSession: SessionMetadata | null = null;
@@ -685,12 +777,18 @@ export class CoreEngine extends EventEmitter {
     this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
     this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
     this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
+    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
+    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
+    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
     if (!LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]) {
       this.config.localModelBudgetProfile = DEFAULT_ENGINE_CONFIG.localModelBudgetProfile;
     }
     if (!LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]) {
       this.config.localModelBudgetProfile = DEFAULT_ENGINE_CONFIG.localModelBudgetProfile;
     }
+    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
+    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
+    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
 
     this.modelAdapter = new ModelAdapter(this.config);
     this.workspacePolicy = new WorkspacePolicy({
@@ -778,7 +876,62 @@ export class CoreEngine extends EventEmitter {
       selfCheckEnabled: this.config.selfCheckEnabled,
       localModelBudgetProfile: this.config.localModelBudgetProfile,
       localModelBudget: LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile],
+      executionProfile: this.config.executionProfile,
+      providerProfile: this.config.providerProfile,
+      promptProfile: this.config.promptProfile,
+      fastModel: this.config.fastModel,
+      codingModel: this.config.codingModel,
+      reviewModel: this.config.reviewModel,
+      apiModel: this.config.apiModel,
     };
+  }
+
+  private normalizeExecutionProfile(value: string): ExecutionProfile {
+    return ['fast_local', 'balanced_local', 'deep_review', 'api_frontier'].includes(value)
+      ? value as ExecutionProfile
+      : DEFAULT_ENGINE_CONFIG.executionProfile;
+  }
+
+  private normalizeProviderProfile(value: string): ProviderProfile {
+    return ['ollama_local', 'openai_compatible', 'openrouter', 'together', 'groq', 'qwen_api', 'kimi_api'].includes(value)
+      ? value as ProviderProfile
+      : DEFAULT_ENGINE_CONFIG.providerProfile;
+  }
+
+  private normalizePromptProfile(value: string): PromptProfile {
+    return ['gemma-local-fast', 'qwen-coder-local', 'deepseek-coder-local', 'kimi-api-long-context', 'frontier-mini-api'].includes(value)
+      ? value as PromptProfile
+      : DEFAULT_ENGINE_CONFIG.promptProfile;
+  }
+
+  private selectModelForPurpose(purpose: ModelRoutePurpose): string {
+    const fallback = this.config.model;
+    if (this.config.executionProfile === 'api_frontier' && this.config.apiModel) {
+      return this.config.apiModel;
+    }
+    if (this.config.executionProfile === 'deep_review' && (purpose === 'review' || purpose === 'summarize') && this.config.reviewModel) {
+      return this.config.reviewModel;
+    }
+    if (purpose === 'code' && this.config.codingModel) {
+      return this.config.codingModel;
+    }
+    if ((purpose === 'direct' || purpose === 'classify' || purpose === 'summarize') && this.config.fastModel) {
+      return this.config.fastModel;
+    }
+    return fallback;
+  }
+
+  private traceModelRoute(purpose: ModelRoutePurpose, model: string) {
+    this.traceBus.emitEvent({
+      type: 'model_route_selected',
+      data: {
+        purpose,
+        model,
+        executionProfile: this.config.executionProfile,
+        providerProfile: this.config.providerProfile,
+        promptProfile: this.config.promptProfile,
+      },
+    });
   }
 
   private async persistCurrentSession(): Promise<void> {
@@ -922,6 +1075,8 @@ export class CoreEngine extends EventEmitter {
       sessionMemoryEnabled: this.config.sessionMemoryEnabled,
       sessionMemoryTurns: this.config.sessionMemoryTurns,
       selfCheckEnabled: this.config.selfCheckEnabled,
+      executionProfile: this.config.executionProfile,
+      promptProfile: this.config.promptProfile,
     };
   }
 
@@ -1600,9 +1755,37 @@ export class CoreEngine extends EventEmitter {
       selected.add('searchText');
     }
 
+    if (/\b(symbol|function|component|definition|where is|jump to)\b/.test(normalized)) {
+      selected.add('findSymbol');
+      selected.add('findFunction');
+      selected.add('findComponent');
+    }
+
+    if (/\b(imports?|dependency|dependencies|affected files?|who imports|what does.*import)\b/.test(normalized)) {
+      selected.add('whatDoesThisImport');
+      selected.add('whoImports');
+      selected.add('affectedFiles');
+    }
+
+    if (/\b(test selection|select tests|targeted tests|changed files)\b/.test(normalized)) {
+      selected.add('selectTestsForChangedFiles');
+    }
+
+    if (/\b(package manager|project commands|build command|test command|dev command|detect commands)\b/.test(normalized)) {
+      selected.add('detectProjectCommands');
+    }
+
+    if (/\b(context pack|file card|relevance|relevant snippets|context budget)\b/.test(normalized)) {
+      selected.add('buildContextPack');
+    }
+
     if (this.shouldIncludeWriteTools(latestUserMessage, promptMode)) {
       selected.add('writeFile');
       selected.add('patchFile');
+      selected.add('replaceFunction');
+      selected.add('insertImport');
+      selected.add('addTypeProperty');
+      selected.add('renameIdentifier');
       selected.add('replaceRange');
       selected.add('insertAfter');
       selected.add('insertBefore');
@@ -1612,11 +1795,24 @@ export class CoreEngine extends EventEmitter {
       selected.add('makeDir');
       selected.add('deleteFile');
       selected.add('searchText');
+      selected.add('findSymbol');
+      selected.add('findFunction');
+      selected.add('whatDoesThisImport');
+      selected.add('affectedFiles');
+      selected.add('createCheckpoint');
+      selected.add('getStructuredDiff');
+      selected.add('selectTestsForChangedFiles');
     }
 
     if (this.shouldIncludeGitTools(latestUserMessage, promptMode)) {
       selected.add('gitStatus');
       selected.add('gitDiff');
+      selected.add('getStructuredDiff');
+    }
+
+    if (/\b(checkpoint|rollback|roll back|restore checkpoint)\b/.test(normalized)) {
+      selected.add('createCheckpoint');
+      selected.add('rollbackToCheckpoint');
     }
 
     if (this.shouldIncludeCommandTool(latestUserMessage)) {
@@ -1891,8 +2087,21 @@ export class CoreEngine extends EventEmitter {
       listDir: '{"action":"listDir","args":{"dirPath":"src"}}',
       webSearch: '{"action":"webSearch","args":{"query":"latest ollama gemma4 tool calling docs"}}',
       fetchUrl: '{"action":"fetchUrl","args":{"url":"https://example.com/docs"}}',
+      findSymbol: '{"action":"findSymbol","args":{"symbolName":"CoreEngine"}}',
+      findFunction: '{"action":"findFunction","args":{"functionName":"chatStream"}}',
+      findComponent: '{"action":"findComponent","args":{"componentName":"RunConsole"}}',
+      whatDoesThisImport: '{"action":"whatDoesThisImport","args":{"filePath":"src/index.ts"}}',
+      whoImports: '{"action":"whoImports","args":{"filePath":"src/types.ts"}}',
+      affectedFiles: '{"action":"affectedFiles","args":{"filePath":"src/types.ts"}}',
+      selectTestsForChangedFiles: '{"action":"selectTestsForChangedFiles","args":{"changedFiles":["packages/tool-runtime/src/registry.ts"]}}',
+      detectProjectCommands: '{"action":"detectProjectCommands","args":{}}',
+      buildContextPack: '{"action":"buildContextPack","args":{"query":"fix RunConsole diff panel","maxFiles":5}}',
       writeFile: '{"action":"writeFile","args":{"filePath":"README.md","content":"# Title\\n"}}',
       patchFile: '{"action":"patchFile","args":{"filePath":"src/index.ts","oldContent":"before","newContent":"after"}}',
+      replaceFunction: '{"action":"replaceFunction","args":{"filePath":"src/index.ts","functionName":"main","newBody":"return 1;"}}',
+      insertImport: '{"action":"insertImport","args":{"filePath":"src/index.ts","importStatement":"import { x } from \\"./x\\";"}}',
+      addTypeProperty: '{"action":"addTypeProperty","args":{"filePath":"src/types.ts","interfaceName":"RunState","property":"fileChanges?: string[];"}}',
+      renameIdentifier: '{"action":"renameIdentifier","args":{"filePath":"src/index.ts","oldName":"oldName","newName":"newName"}}',
       replaceRange: '{"action":"replaceRange","args":{"filePath":"src/index.ts","startLine":10,"endLine":12,"newContent":"replacement\\n"}}',
       insertAfter: '{"action":"insertAfter","args":{"filePath":"src/index.ts","anchorText":"export {};","newContent":"\\nconst x = 1;\\n"}}',
       insertBefore: '{"action":"insertBefore","args":{"filePath":"src/index.ts","anchorText":"export {};","newContent":"const x = 1;\\n"}}',
@@ -1901,6 +2110,9 @@ export class CoreEngine extends EventEmitter {
       previewPatch: '{"action":"previewPatch","args":{"filePath":"src/index.ts","before":"old","after":"new"}}',
       makeDir: '{"action":"makeDir","args":{"dirPath":"src/new-folder"}}',
       deleteFile: '{"action":"deleteFile","args":{"filePath":"old.txt"}}',
+      getStructuredDiff: '{"action":"getStructuredDiff","args":{}}',
+      createCheckpoint: '{"action":"createCheckpoint","args":{"label":"before editing 3 files"}}',
+      rollbackToCheckpoint: '{"action":"rollbackToCheckpoint","args":{"checkpointId":"cp-..."}}',
       runCommand: '{"action":"runCommand","args":{"command":"npm test"}}',
       gitStatus: '{"action":"gitStatus","args":{}}',
       gitDiff: '{"action":"gitDiff","args":{}}',
@@ -2071,7 +2283,12 @@ export class CoreEngine extends EventEmitter {
     return [
       {
         role: 'system',
-        content: `Prompt recipe (${promptMode}):\n${optimizationPrompt}`,
+        content: [
+          `Prompt profile: ${this.config.promptProfile}`,
+          promptProfileInstruction(this.config.promptProfile),
+          `Prompt recipe (${promptMode}):`,
+          optimizationPrompt,
+        ].join('\n'),
       },
       ...messages,
     ];
@@ -2137,12 +2354,47 @@ export class CoreEngine extends EventEmitter {
       }
     }
 
+    this.traceBus.emitEvent({
+      type: 'context_pack_built',
+      data: {
+        contextBudgetUsed: contextMessages.reduce((sum, message) => sum + message.content.length, 0),
+        contextBudgetLimit: totalContextBudget,
+        filesIncluded: includeRepoContext ? 'repo-summary' : 0,
+        snippetsIncluded: sessionMemoryMessage ? 1 : 0,
+        memoryTurns: this.config.sessionMemoryEnabled ? this.config.sessionMemoryTurns : 0,
+      },
+    });
+
     return contextMessages;
   }
 
   private static readonly WORKSPACE_MUTATING_TOOLS: ReadonlySet<string> = new Set([
-    'writeFile', 'patchFile', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'makeDir', 'deleteFile',
+    'writeFile', 'patchFile', 'replaceFunction', 'insertImport', 'addTypeProperty', 'renameIdentifier', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'makeDir', 'deleteFile', 'createCheckpoint', 'rollbackToCheckpoint',
   ]);
+
+  private async ensureRunCheckpointBeforeMutation(runId: string | undefined, toolName: SupportedTool): Promise<ToolResult | null> {
+    if (!runId || this.autoCheckpointRuns.has(runId) || !CoreEngine.WORKSPACE_MUTATING_TOOLS.has(toolName)) {
+      return null;
+    }
+    if (toolName === 'createCheckpoint' || toolName === 'rollbackToCheckpoint') {
+      return null;
+    }
+
+    const checkpoint = await this.toolRegistry.createCheckpoint(`before ${toolName} in ${runId}`);
+    if (!checkpoint.success) {
+      return checkpoint;
+    }
+    this.autoCheckpointRuns.add(runId);
+    this.traceBus.emitEvent({
+      type: 'run_auto_checkpoint_created',
+      data: {
+        runId,
+        tool: toolName,
+        checkpointId: checkpoint.metadata?.checkpointId,
+      },
+    });
+    return checkpoint;
+  }
 
   private async executeToolCall(toolName: SupportedTool, args: Record<string, unknown>, runId?: string): Promise<any> {
     const inputSummary = summarizeToolArgs(toolName, args);
@@ -2151,7 +2403,21 @@ export class CoreEngine extends EventEmitter {
       data: { runId, tool: toolName, inputSummary },
     });
     let result: any;
+    let checkpointResult: ToolResult | null = null;
     try {
+      checkpointResult = await this.ensureRunCheckpointBeforeMutation(runId, toolName);
+      if (checkpointResult && !checkpointResult.success) {
+        this.traceBus.emitEvent({
+          type: 'tool_call_completed',
+          data: {
+            runId,
+            tool: toolName,
+            success: false,
+            outputPreview: truncateStreamPreview(checkpointResult.output || 'Checkpoint failed.'),
+          },
+        });
+        return checkpointResult;
+      }
       switch (toolName) {
         case 'readFile':
           result = await this.readFile(getRequiredStringArg(args, 'filePath', toolName));
@@ -2174,6 +2440,36 @@ export class CoreEngine extends EventEmitter {
         case 'fetchUrl':
           result = await this.fetchUrl(getRequiredStringArg(args, 'url', toolName));
           break;
+        case 'findSymbol':
+          result = await this.findSymbol(getRequiredStringArg(args, 'symbolName', toolName));
+          break;
+        case 'findFunction':
+          result = await this.findFunction(getRequiredStringArg(args, 'functionName', toolName));
+          break;
+        case 'findComponent':
+          result = await this.findComponent(getRequiredStringArg(args, 'componentName', toolName));
+          break;
+        case 'whatDoesThisImport':
+          result = await this.whatDoesThisImport(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'whoImports':
+          result = await this.whoImports(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'affectedFiles':
+          result = await this.affectedFiles(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'selectTestsForChangedFiles':
+          result = await this.selectTestsForChangedFiles(args.changedFiles);
+          break;
+        case 'detectProjectCommands':
+          result = await this.detectProjectCommands();
+          break;
+        case 'buildContextPack':
+          result = await this.buildContextPack(
+            getRequiredStringArg(args, 'query', toolName),
+            getOptionalNumberArg(args, 'maxFiles'),
+          );
+          break;
         case 'writeFile':
           result = await this.writeFile(
             getRequiredStringArg(args, 'filePath', toolName),
@@ -2185,6 +2481,33 @@ export class CoreEngine extends EventEmitter {
             getRequiredStringArg(args, 'filePath', toolName),
             getRequiredStringArg(args, 'oldContent', toolName),
             getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'replaceFunction':
+          result = await this.replaceFunction(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'functionName', toolName),
+            getRequiredStringArg(args, 'newBody', toolName),
+          );
+          break;
+        case 'insertImport':
+          result = await this.insertImport(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'importStatement', toolName),
+          );
+          break;
+        case 'addTypeProperty':
+          result = await this.addTypeProperty(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'interfaceName', toolName),
+            getRequiredStringArg(args, 'property', toolName),
+          );
+          break;
+        case 'renameIdentifier':
+          result = await this.renameIdentifier(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'oldName', toolName),
+            getRequiredStringArg(args, 'newName', toolName),
           );
           break;
         case 'replaceRange':
@@ -2233,6 +2556,15 @@ export class CoreEngine extends EventEmitter {
         case 'deleteFile':
           result = await this.deleteFile(getRequiredStringArg(args, 'filePath', toolName));
           break;
+        case 'getStructuredDiff':
+          result = await this.getStructuredDiff();
+          break;
+        case 'createCheckpoint':
+          result = await this.createCheckpoint(getOptionalStringArg(args, 'label'));
+          break;
+        case 'rollbackToCheckpoint':
+          result = await this.rollbackToCheckpoint(getRequiredStringArg(args, 'checkpointId', toolName));
+          break;
         case 'gitStatus':
           result = await this.gitStatus();
           break;
@@ -2256,6 +2588,16 @@ export class CoreEngine extends EventEmitter {
         },
       });
       throw error;
+    }
+
+    if (checkpointResult?.metadata?.checkpointId) {
+      result = {
+        ...result,
+        metadata: {
+          ...(result.metadata ?? {}),
+          checkpointId: checkpointResult.metadata.checkpointId,
+        },
+      };
     }
 
     // Invalidate repo context cache after workspace-modifying tools so next turn gets fresh context
@@ -2602,7 +2944,15 @@ export class CoreEngine extends EventEmitter {
       case 'readFile':
         return Math.min(12_000, Math.max(4_500, Math.floor(budget * 0.55)));
       case 'gitDiff':
+      case 'getStructuredDiff':
       case 'searchText':
+      case 'findSymbol':
+      case 'findFunction':
+      case 'findComponent':
+      case 'whatDoesThisImport':
+      case 'whoImports':
+      case 'affectedFiles':
+      case 'buildContextPack':
       case 'fetchUrl':
       case 'webSearch':
       case 'runCommand':
@@ -2729,6 +3079,133 @@ export class CoreEngine extends EventEmitter {
       {
         type: 'function',
         function: {
+          name: 'findSymbol',
+          description: 'Find code definitions for a class, interface, type, function, method, or exported variable by symbol name.',
+          parameters: {
+            type: 'object',
+            properties: {
+              symbolName: { type: 'string', description: 'Exact symbol name, e.g. CoreEngine' }
+            },
+            required: ['symbolName']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'findFunction',
+          description: 'Find function, method, or arrow-function definitions by exact function name.',
+          parameters: {
+            type: 'object',
+            properties: {
+              functionName: { type: 'string', description: 'Exact function name, e.g. chatStream' }
+            },
+            required: ['functionName']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'findComponent',
+          description: 'Find React-style component definitions by exact component name.',
+          parameters: {
+            type: 'object',
+            properties: {
+              componentName: { type: 'string', description: 'Exact component name, e.g. RunConsole' }
+            },
+            required: ['componentName']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'whatDoesThisImport',
+          description: 'Return structured imports for one source file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'Source file path' }
+            },
+            required: ['filePath']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'whoImports',
+          description: 'Return workspace files that import a source file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'Imported file path' }
+            },
+            required: ['filePath']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'affectedFiles',
+          description: 'Return transitive source files affected by edits to a file based on reverse imports.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'Changed file path' }
+            },
+            required: ['filePath']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'selectTestsForChangedFiles',
+          description: 'Select targeted tests and commands for changed files.',
+          parameters: {
+            type: 'object',
+            properties: {
+              changedFiles: {
+                oneOf: [
+                  { type: 'array', items: { type: 'string' } },
+                  { type: 'string' }
+                ],
+                description: 'Changed file paths as array, comma list, or newline list'
+              }
+            },
+            required: ['changedFiles']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'detectProjectCommands',
+          description: 'Detect package manager and build/test/lint/dev commands from lockfiles and package.json.',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'buildContextPack',
+          description: 'Build compact file cards and snippets for a user request instead of dumping full repo context.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'User request or search query' },
+              maxFiles: { type: 'number', description: 'Maximum file cards to include' }
+            },
+            required: ['query']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'writeFile',
           description: 'Write content to a file',
           parameters: {
@@ -2754,6 +3231,69 @@ export class CoreEngine extends EventEmitter {
               newContent: { type: 'string', description: 'The replacement text' }
             },
             required: ['filePath', 'oldContent', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'replaceFunction',
+          description: 'Replace only the body of a function/method/arrow function by AST location. Prefer this over rewriting whole files.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The source file path' },
+              functionName: { type: 'string', description: 'Exact function name to replace' },
+              newBody: { type: 'string', description: 'New function body, with or without outer braces' }
+            },
+            required: ['filePath', 'functionName', 'newBody']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'insertImport',
+          description: 'Insert an import statement in the import block if not already present.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The source file path' },
+              importStatement: { type: 'string', description: 'Complete import statement' }
+            },
+            required: ['filePath', 'importStatement']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'addTypeProperty',
+          description: 'Add a property to a TypeScript interface without rewriting the full file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The source file path' },
+              interfaceName: { type: 'string', description: 'Exact interface name' },
+              property: { type: 'string', description: 'Property declaration, e.g. fileChanges?: StructuredDiffFile[]' }
+            },
+            required: ['filePath', 'interfaceName', 'property']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'renameIdentifier',
+          description: 'Rename matching identifier tokens in one file without changing string literals.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The source file path' },
+              oldName: { type: 'string', description: 'Existing identifier' },
+              newName: { type: 'string', description: 'Replacement identifier' }
+            },
+            required: ['filePath', 'oldName', 'newName']
           }
         }
       },
@@ -2884,6 +3424,41 @@ export class CoreEngine extends EventEmitter {
       {
         type: 'function',
         function: {
+          name: 'getStructuredDiff',
+          description: 'Return current git diff as structured files, hunks, line numbers, added lines, and removed lines.',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'createCheckpoint',
+          description: 'Create a rollback checkpoint before editing files.',
+          parameters: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: 'Optional checkpoint label' }
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'rollbackToCheckpoint',
+          description: 'Rollback workspace files to a checkpoint created earlier.',
+          parameters: {
+            type: 'object',
+            properties: {
+              checkpointId: { type: 'string', description: 'Checkpoint id returned by createCheckpoint' }
+            },
+            required: ['checkpointId']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'gitStatus',
           description: 'Get the git status of the workspace',
           parameters: { type: 'object', properties: {} }
@@ -3000,6 +3575,8 @@ export class CoreEngine extends EventEmitter {
     let continuationCount = 0;
     const directOutputBudget = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]?.outputBudgetDirect
       ?? LOCAL_MODEL_BUDGET_PROFILES.lean.outputBudgetDirect;
+    const routedDirectModel = this.selectModelForPurpose('direct');
+    this.traceModelRoute('direct', routedDirectModel);
 
     while (true) {
       let message: EngineChatMessage | undefined;
@@ -3018,6 +3595,7 @@ export class CoreEngine extends EventEmitter {
         finishReason = typeof message?.finish_reason === 'string' ? message.finish_reason : undefined;
       } else {
         const result = await this.modelAdapter.createChatCompletion({
+          model: routedDirectModel,
           messages: currentMessages,
           stream: false,
           max_tokens: directOutputBudget,
@@ -3113,7 +3691,10 @@ export class CoreEngine extends EventEmitter {
     think?: boolean,
     onFirstToken?: () => void,
   ): Promise<any> {
+    const routedModel = this.selectModelForPurpose(tools && tools.length > 0 ? 'code' : 'direct');
+    this.traceModelRoute(tools && tools.length > 0 ? 'code' : 'direct', routedModel);
     const stream = await this.modelAdapter.createChatCompletion({
+      model: routedModel,
       messages: currentMessages,
       stream: true,
       tools,
@@ -3125,6 +3706,7 @@ export class CoreEngine extends EventEmitter {
 
     if (!stream || typeof (stream as ReadableStream<Uint8Array>).getReader !== 'function') {
       const result = await this.modelAdapter.createChatCompletion({
+        model: routedModel,
         messages: currentMessages,
         stream: false,
         tools,
@@ -3265,6 +3847,7 @@ export class CoreEngine extends EventEmitter {
               },
             });
             const result = await this.modelAdapter.createChatCompletion({
+              model: routedModel,
               messages: currentMessages,
               stream: false,
               tools,
@@ -3354,6 +3937,8 @@ export class CoreEngine extends EventEmitter {
       workspaceBound,
     });
     const classificationMs = Date.now() - intentStartedAt;
+    const initialRouteModel = this.selectModelForPurpose('classify');
+    this.traceModelRoute('classify', initialRouteModel);
 
     await this.recordTurnExecution('agentic', {
       promptMode,
@@ -3367,7 +3952,7 @@ export class CoreEngine extends EventEmitter {
       executionMode: 'agentic',
       workspaceRoot: this.config.workspaceRoot,
       workspaceSource,
-      model: this.config.model,
+      model: initialRouteModel,
       promptMode,
       intent: intentDecision.intent,
       browserContextActive: browserFolderContextActive,
@@ -3593,23 +4178,23 @@ export class CoreEngine extends EventEmitter {
 	      await persistCheckpoint();
 	    };
 
-	    this.planner.setTaskPlan(runId, taskPlan);
-	    taskContext = workspaceBound
-	      ? await this.repoIndexer.buildTaskContext({
-	          userRequest: latestUserMessage,
-	          intent: intentDecision.intent,
-	          complexity: taskPlan.complexity,
-	        }).catch(() => null)
-	      : null;
-		    await persistCheckpoint();
-	    const initialTaskStep = await startTaskStep();
-	    if (initialTaskStep && initialTaskStep.type === 'intake') {
-	      await completeCurrentTaskStep(taskContext ? `Task context selected: ${taskContext.taskArea}` : 'No backend task context available');
-	    }
+    this.planner.setTaskPlan(runId, taskPlan);
+    taskContext = workspaceBound
+      ? await this.repoIndexer.buildTaskContext({
+          userRequest: latestUserMessage,
+          intent: intentDecision.intent,
+          complexity: taskPlan.complexity,
+        }).catch(() => null)
+      : null;
+    await persistCheckpoint();
+    const initialTaskStep = await startTaskStep();
+    if (initialTaskStep && initialTaskStep.type === 'intake') {
+      await completeCurrentTaskStep(taskContext ? `Task context selected: ${taskContext.taskArea}` : 'No backend task context available');
+    }
 
-	    const finalizeRun = async (baseAnswer: string, error?: string): Promise<string> => {
-	      await finishTaskPlan(error ? `Run ended with error: ${error}` : 'Run finalized');
-	      const gitStats = await this.computeGitDiffStats(runBuilder.snapshot().git);
+    const finalizeRun = async (baseAnswer: string, error?: string): Promise<string> => {
+      await finishTaskPlan(error ? `Run ended with error: ${error}` : 'Run finalized');
+      const gitStats = await this.computeGitDiffStats(runBuilder.snapshot().git);
       runBuilder.setGitStats(gitStats);
       const summary = summarizeRun(runBuilder.snapshot());
       runBuilder.finalize({
@@ -3629,6 +4214,7 @@ export class CoreEngine extends EventEmitter {
       this.emitRunMetric(streamHandlers, runId, completedRun);
       this.emitRunSummary(streamHandlers, runId, completedRun);
       await this.persistCurrentSession();
+      this.autoCheckpointRuns.delete(runId);
       return buildFinalAnswer(baseAnswer, completedRun);
     };
 
@@ -4023,6 +4609,8 @@ export class CoreEngine extends EventEmitter {
 
         let result: any;
         let message: any;
+        const routedAgentModel = this.selectModelForPurpose(nativeToolDefinitions ? 'code' : 'summarize');
+        this.traceModelRoute(nativeToolDefinitions ? 'code' : 'summarize', routedAgentModel);
         try {
           if (streamHandlers) {
             message = await this.streamAssistantMessage(
@@ -4045,6 +4633,7 @@ export class CoreEngine extends EventEmitter {
             );
           } else {
             result = await this.modelAdapter.createChatCompletion({
+              model: routedAgentModel,
               messages: currentMessages,
               stream: false,
               tools: nativeToolDefinitions,
@@ -4652,12 +5241,78 @@ export class CoreEngine extends EventEmitter {
     return this.runTool('fetchUrl', url);
   }
 
+  async findSymbol(symbolName: string) {
+    return this.runTool('findSymbol', symbolName);
+  }
+
+  async findFunction(functionName: string) {
+    return this.runTool('findFunction', functionName);
+  }
+
+  async findComponent(componentName: string) {
+    return this.runTool('findComponent', componentName);
+  }
+
+  async whatDoesThisImport(filePath: string) {
+    return this.runTool('whatDoesThisImport', filePath);
+  }
+
+  async whoImports(filePath: string) {
+    return this.runTool('whoImports', filePath);
+  }
+
+  async affectedFiles(filePath: string) {
+    return this.runTool('affectedFiles', filePath);
+  }
+
+  async selectTestsForChangedFiles(changedFiles: unknown) {
+    this.ensureToolAllowed('selectTestsForChangedFiles');
+    const normalized = Array.isArray(changedFiles)
+      ? changedFiles.filter((entry): entry is string => typeof entry === 'string')
+      : typeof changedFiles === 'string'
+        ? changedFiles
+        : '';
+    const result = await this.toolRegistry.selectTestsForChangedFiles(normalized);
+    await this.persistCurrentSession();
+    return result;
+  }
+
+  async detectProjectCommands() {
+    this.ensureToolAllowed('detectProjectCommands');
+    const result = await this.toolRegistry.detectProjectCommands();
+    await this.persistCurrentSession();
+    return result;
+  }
+
+  async buildContextPack(query: string, maxFiles?: number) {
+    this.ensureToolAllowed('buildContextPack');
+    const result = await this.toolRegistry.buildContextPack(query, maxFiles);
+    await this.persistCurrentSession();
+    return result;
+  }
+
   async writeFile(filePath: string, content: string) {
     return this.runTool('writeFile', filePath, content);
   }
 
   async patchFile(filePath: string, oldContent: string, newContent: string) {
     return this.runTool('patchFile', filePath, oldContent, newContent);
+  }
+
+  async replaceFunction(filePath: string, functionName: string, newBody: string) {
+    return this.runTool('replaceFunction', filePath, functionName, newBody);
+  }
+
+  async insertImport(filePath: string, importStatement: string) {
+    return this.runTool('insertImport', filePath, importStatement);
+  }
+
+  async addTypeProperty(filePath: string, interfaceName: string, property: string) {
+    return this.runTool('addTypeProperty', filePath, interfaceName, property);
+  }
+
+  async renameIdentifier(filePath: string, oldName: string, newName: string) {
+    return this.runTool('renameIdentifier', filePath, oldName, newName);
   }
 
   async replaceRange(filePath: string, startLine: number, endLine: number, newContent: string) {
@@ -4693,6 +5348,24 @@ export class CoreEngine extends EventEmitter {
 
   async deleteFile(filePath: string) {
     return this.runTool('deleteFile', filePath);
+  }
+
+  async getStructuredDiff() {
+    return this.runTool('getStructuredDiff');
+  }
+
+  async createCheckpoint(label?: string) {
+    this.ensureToolAllowed('createCheckpoint');
+    const result = await this.toolRegistry.createCheckpoint(label);
+    await this.persistCurrentSession();
+    return result;
+  }
+
+  async rollbackToCheckpoint(checkpointId: string) {
+    this.ensureToolAllowed('rollbackToCheckpoint');
+    const result = await this.toolRegistry.rollbackToCheckpoint(checkpointId);
+    await this.persistCurrentSession();
+    return result;
   }
 
   async gitStatus() {

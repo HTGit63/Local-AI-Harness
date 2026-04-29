@@ -3928,6 +3928,11 @@ body::after {
   background: rgba(47, 155, 255, 0.08);
 }
 
+.tool-call-output {
+  margin-top: 4px;
+  color: var(--text-tertiary);
+}
+
 .task-step-status {
   background: #080808;
 }
@@ -3936,6 +3941,20 @@ body::after {
 .task-step-body code {
   background: #080808;
   border-color: var(--border);
+}
+
+.run-file-card {
+  display: grid;
+  gap: 4px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: #121212;
+}
+
+.run-file-card span {
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  line-height: 1.35;
 }
 
 .diff-file-list {
@@ -3984,6 +4003,74 @@ body::after {
 
 .diff-raw-details {
   border-top: 1px solid var(--border);
+}
+
+.inline-diff-viewer {
+  display: grid;
+  gap: 8px;
+  padding: 0 8px 8px;
+}
+
+.inline-diff-file {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #080808;
+}
+
+.inline-diff-file summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.inline-diff-file summary code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inline-diff-hunks {
+  max-height: 360px;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+}
+
+.inline-diff-line {
+  display: grid;
+  grid-template-columns: 36px 36px minmax(0, 1fr);
+  gap: 6px;
+  min-height: 19px;
+  align-items: start;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.inline-diff-line code {
+  overflow-x: auto;
+  color: inherit;
+  white-space: pre;
+}
+
+.inline-diff-line-no {
+  color: var(--text-tertiary);
+  text-align: right;
+  user-select: none;
+}
+
+.inline-diff-line.diff-line-added {
+  background: rgba(73, 209, 125, 0.08);
+}
+
+.inline-diff-line.diff-line-removed {
+  background: rgba(255, 107, 97, 0.08);
 }
 
 .diff-raw-details summary {

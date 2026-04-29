@@ -86,6 +86,35 @@ export interface RunTraceEntry {
   timestamp: number;
 }
 
+export type StructuredDiffLineType = 'context' | 'added' | 'removed' | 'hunk' | 'file';
+
+export interface StructuredDiffLine {
+  type: StructuredDiffLineType;
+  oldLine?: number;
+  newLine?: number;
+  content: string;
+}
+
+export interface StructuredDiffHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: StructuredDiffLine[];
+}
+
+export interface StructuredDiffFile {
+  path: string;
+  oldPath?: string;
+  addedLines: number;
+  removedLines: number;
+  hunks: StructuredDiffHunk[];
+}
+
+export interface StructuredDiff {
+  files: StructuredDiffFile[];
+}
+
 export interface LocalModelBudgetProfile {
   contextBudget: number;
   outputBudgetDirect: number;

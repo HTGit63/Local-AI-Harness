@@ -1,4 +1,4 @@
-import type { RunApprovalItem, RunTraceEntry, StepProgress, TaskPlan } from '../../types/run';
+import type { RunApprovalItem, RunTraceEntry, StepProgress, StructuredDiff, StructuredDiffLine, TaskPlan } from '../../types/run';
 import { ApprovalQueue } from '../approvals/ApprovalQueue';
 import { CurrentTaskCard } from './CurrentTaskCard';
 import { TaskPlanView } from './TaskPlanView';
@@ -15,6 +15,7 @@ interface RunConsoleProps {
   traces: RunTraceEntry[];
   approvals: RunApprovalItem[];
   gitDiff: string;
+  structuredDiff?: StructuredDiff | null;
   onResolveApproval: (id: string, approved: boolean) => void;
 }
 
@@ -25,6 +26,17 @@ function collectPlanFiles(plan?: TaskPlan): string[] {
     for (const file of step.files || []) files.add(file);
   }
   return Array.from(files);
+}
+
+function explainPlanFile(file: string, plan?: TaskPlan): string {
+  const step = plan?.steps.find((entry) => entry.files?.includes(file));
+  if (step?.detail) return step.detail;
+  if (step?.title) return step.title;
+  if (file.includes('RunConsole')) return 'RunConsole renders agent work, tool transparency, and code changes.';
+  if (file.includes('types/run')) return 'Shared run types define UI diff, checkpoint, and timeline contracts.';
+  if (file.includes('engine.ts')) return 'Core engine routes model calls and executes deterministic tools.';
+  if (file.includes('registry.ts')) return 'Tool registry owns file, diff, command, and repo tool behavior.';
+  return 'Selected from current task plan or repo relevance ranking.';
 }
 
 interface DiffFileStat {
@@ -63,6 +75,22 @@ function getDiffLineClass(line: string): string {
   return '';
 }
 
+function structuredLineClass(line: StructuredDiffLine): string {
+  if (line.type === 'added') return 'diff-line-added';
+  if (line.type === 'removed') return 'diff-line-removed';
+  if (line.type === 'hunk') return 'diff-line-hunk';
+  if (line.type === 'file') return 'diff-line-file';
+  return '';
+}
+
+function lineNumber(value?: number): string {
+  return typeof value === 'number' ? String(value) : '';
+}
+
+function traceData(trace: RunTraceEntry): Record<string, unknown> {
+  return trace.data && typeof trace.data === 'object' ? trace.data as Record<string, unknown> : {};
+}
+
 export function RunConsole({
   plan,
   currentStepId,
@@ -73,16 +101,22 @@ export function RunConsole({
   traces,
   approvals,
   gitDiff,
+  structuredDiff,
   onResolveApproval,
 }: RunConsoleProps) {
   const planFiles = collectPlanFiles(plan);
-  const diffFiles = parseDiffFileStats(gitDiff);
-  const changedCount = diffFiles.length;
+  const fallbackDiffFiles = parseDiffFileStats(gitDiff);
+  const diffFiles = structuredDiff?.files.length
+    ? structuredDiff.files.map((file) => ({ file: file.path, added: file.addedLines, removed: file.removedLines }))
+    : fallbackDiffFiles;
+  const changedCount = structuredDiff?.files.length ?? diffFiles.length;
   const addedLines = diffFiles.reduce((total, file) => total + file.added, 0);
   const removedLines = diffFiles.reduce((total, file) => total + file.removed, 0);
   const runState = plan?.failedAt ? 'failed' : plan?.completedAt ? 'done' : plan ? 'running' : 'idle';
   const diffPreviewLines = gitDiff.split('\n').slice(0, 520);
   const diffIsTruncated = gitDiff.split('\n').length > diffPreviewLines.length;
+  const contextTrace = traces.filter((trace) => trace.type === 'context_pack_built').slice(-1)[0];
+  const contextData = contextTrace ? traceData(contextTrace) : null;
 
   return (
     <aside className="run-console" data-testid="run-console">
@@ -100,6 +134,19 @@ export function RunConsole({
 
       <div className="run-console-body">
         <CurrentTaskCard plan={plan} currentStepId={currentStepId} progress={progress} phase={phase} streamStatus={streamStatus} />
+        {contextData && (
+          <section className="run-console-section">
+            <div className="run-console-section-head">
+              <span>Context budget</span>
+              <span>{String(contextData.contextBudgetUsed ?? 0)} / {String(contextData.contextBudgetLimit ?? 0)}</span>
+            </div>
+            <div className="run-console-metrics">
+              <div><span>Files</span><strong>{String(contextData.filesIncluded ?? 0)}</strong></div>
+              <div><span>Snippets</span><strong>{String(contextData.snippetsIncluded ?? 0)}</strong></div>
+              <div><span>Memory turns</span><strong>{String(contextData.memoryTurns ?? 0)}</strong></div>
+            </div>
+          </section>
+        )}
         <TaskPlanView plan={plan} currentStepId={currentStepId} />
         <ToolCallList traces={traces} currentTool={currentTool} />
 
@@ -112,7 +159,12 @@ export function RunConsole({
             <div className="empty-note">No files selected yet</div>
           ) : (
             <div className="run-file-list">
-              {planFiles.slice(0, 12).map((file) => <code key={file}>{file}</code>)}
+              {planFiles.slice(0, 12).map((file) => (
+                <div key={file} className="run-file-card">
+                  <code>{file}</code>
+                  <span>Why selected: {explainPlanFile(file, plan)}</span>
+                </div>
+              ))}
             </div>
           )}
         </section>
@@ -144,6 +196,31 @@ export function RunConsole({
                   </div>
                 ))}
               </div>
+              {structuredDiff?.files.length ? (
+                <div className="inline-diff-viewer">
+                  {structuredDiff.files.slice(0, 8).map((file) => (
+                    <details key={file.path} className="inline-diff-file" open>
+                      <summary>
+                        <code>{file.path}</code>
+                        <span><span className="diff-added">+{file.addedLines}</span> <span className="diff-removed">-{file.removedLines}</span></span>
+                      </summary>
+                      <div className="inline-diff-hunks">
+                        {file.hunks.slice(0, 8).map((hunk, hunkIndex) => (
+                          <div key={`${file.path}-${hunk.oldStart}-${hunk.newStart}-${hunkIndex}`} className="inline-diff-hunk">
+                            {hunk.lines.slice(0, 260).map((line, lineIndex) => (
+                              <div key={`${lineIndex}-${line.type}-${line.content.slice(0, 24)}`} className={`inline-diff-line ${structuredLineClass(line)}`}>
+                                <span className="inline-diff-line-no">{lineNumber(line.oldLine)}</span>
+                                <span className="inline-diff-line-no">{lineNumber(line.newLine)}</span>
+                                <code>{line.type === 'added' ? '+' : line.type === 'removed' ? '-' : line.type === 'hunk' ? '@' : ' '}{line.content || ' '}</code>
+                              </div>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              ) : null}
               <details className="diff-raw-details" open>
                 <summary>Raw diff</summary>
                 <pre className="run-diff-preview diff-code">

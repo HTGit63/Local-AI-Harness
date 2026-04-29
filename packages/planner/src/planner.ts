@@ -55,6 +55,8 @@ export class Planner {
         | 'sessionMemoryEnabled'
         | 'sessionMemoryTurns'
         | 'selfCheckEnabled'
+        | 'executionProfile'
+        | 'promptProfile'
         | 'taskPlan'
         | 'currentStepId'
         | 'complexity'
