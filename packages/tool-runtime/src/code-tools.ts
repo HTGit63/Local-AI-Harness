@@ -117,7 +117,7 @@ function collectSymbolsFromFile(filePath: string, text: string, source: ts.Sourc
   const visit = (node: ts.Node) => {
     if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) || ts.isEnumDeclaration(node)) && node.name) {
       const kind = ts.isFunctionDeclaration(node)
-        ? 'function'
+        ? (/^[A-Z]/.test(node.name.text) && hasJsxBody(node) ? 'component' : 'function')
         : ts.isClassDeclaration(node)
           ? 'class'
           : ts.isInterfaceDeclaration(node)
@@ -221,6 +221,15 @@ export async function insertImportStatement(cwd: string, filePath: string, impor
   if (text.includes(normalized)) {
     return { before: text, after: text };
   }
+  const requestedModule = normalized.match(/\sfrom\s+['"]([^'"]+)['"]/)?.[1] ?? normalized.match(/^import\s+['"]([^'"]+)['"]/)?.[1];
+  if (requestedModule && source.statements.some((statement) =>
+    ts.isImportDeclaration(statement) &&
+    ts.isStringLiteral(statement.moduleSpecifier) &&
+    statement.moduleSpecifier.text === requestedModule &&
+    statement.getText(source).replace(/\s+/g, ' ').trim() === normalized.replace(/\s+/g, ' ').trim()
+  )) {
+    return { before: text, after: text };
+  }
 
   let insertAt = 0;
   for (const statement of source.statements) {
@@ -238,13 +247,21 @@ export async function insertImportStatement(cwd: string, filePath: string, impor
 export async function addInterfaceProperty(cwd: string, filePath: string, interfaceName: string, property: string): Promise<{ before: string; after: string }> {
   const { text, source } = await readSourceFile(cwd, filePath);
   const normalized = property.trim().endsWith(';') ? property.trim() : `${property.trim()};`;
+  const requestedName = normalized.match(/^([A-Za-z_$][\w$]*|['"][^'"]+['"])\??\s*:/)?.[1]?.replace(/^['"]|['"]$/g, '');
   let edit: { start: number; end: number; text: string } | null = null;
   let alreadyExists = false;
 
   const visit = (node: ts.Node) => {
     if (edit) return;
     if (ts.isInterfaceDeclaration(node) && node.name.text === interfaceName) {
-      if (node.members.some((member) => member.getText(source).replace(/\s+/g, ' ').trim() === normalized.replace(/\s+/g, ' ').trim())) {
+      if (node.members.some((member) => {
+        if (requestedName && ts.isPropertySignature(member) && member.name) {
+          if (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name)) {
+            return member.name.text === requestedName;
+          }
+        }
+        return member.getText(source).replace(/\s+/g, ' ').trim() === normalized.replace(/\s+/g, ' ').trim();
+      })) {
         alreadyExists = true;
         return;
       }

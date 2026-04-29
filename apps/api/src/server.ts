@@ -3,6 +3,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { CoreEngine } from '@local-harness/core';
 import { ModelAdapter } from '@local-harness/model-adapter';
+import type { ModelRuntimeState } from '@local-harness/model-adapter';
 
 const PORT = parseInt(process.env.API_PORT || '3001', 10);
 const HOST = process.env.API_HOST || '127.0.0.1';
@@ -15,6 +16,10 @@ const MAX_CHAT_IMAGE_BYTES = 1024 * 1024;
 const WORKSPACE_RESOLVE_MAX_DEPTH = 3;
 const WORKSPACE_RESOLVE_MAX_VISITS = 2000;
 const WORKSPACE_RESOLVE_MAX_CANDIDATES = 64;
+const modelRuntimeCacheTtlSetting = Number(process.env.HARNESS_MODEL_RUNTIME_CACHE_MS);
+const MODEL_RUNTIME_CACHE_TTL_MS = Number.isFinite(modelRuntimeCacheTtlSetting)
+  ? Math.max(5_000, Math.min(15_000, modelRuntimeCacheTtlSetting))
+  : 10_000;
 const WORKSPACE_RESOLVE_IGNORES = new Set([
   '.git',
   '.next',
@@ -53,6 +58,25 @@ const ALLOWED_ORIGINS = new Set([
 const engine = new CoreEngine({
   workspaceRoot: WORKSPACE_ROOT,
 });
+let modelRuntimeCache: { value: ModelRuntimeState; expiresAt: number } | null = null;
+
+async function getCachedModelRuntime(force = false): Promise<ModelRuntimeState> {
+  const now = Date.now();
+  if (!force && modelRuntimeCache && modelRuntimeCache.expiresAt > now) {
+    return modelRuntimeCache.value;
+  }
+
+  const value = await engine.getModelRuntime();
+  modelRuntimeCache = {
+    value,
+    expiresAt: Date.now() + MODEL_RUNTIME_CACHE_TTL_MS,
+  };
+  return value;
+}
+
+function clearModelRuntimeCache() {
+  modelRuntimeCache = null;
+}
 
 function getApiGuide() {
   const localHost = HOST === '0.0.0.0' ? 'localhost' : HOST;
@@ -550,6 +574,7 @@ const server = http.createServer(async (req, res) => {
       await engine.updateConfig(body as any, {
         activateModel: body.activateModel === true,
       });
+      clearModelRuntimeCache();
       sendJson(req, res, 200, engine.getPublicConfig());
       return;
     }
@@ -619,7 +644,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (requestUrl.pathname === '/api/model/runtime' && method === 'GET') {
-      sendJson(req, res, 200, await engine.getModelRuntime());
+      sendJson(req, res, 200, await getCachedModelRuntime());
       return;
     }
 
@@ -639,7 +664,7 @@ const server = http.createServer(async (req, res) => {
           sendBadRequest(req, res, imageValidationError);
           return;
         }
-        const runtime = await engine.getModelRuntime();
+        const runtime = await getCachedModelRuntime();
         const thinkingWarning = getThinkingWarning(runtime.configuredModelCapabilities, thinkingEnabled);
 
         // Attach images to the last user message if provided
@@ -691,7 +716,7 @@ const server = http.createServer(async (req, res) => {
           res.end();
           return;
         }
-        const runtime = await engine.getModelRuntime();
+        const runtime = await getCachedModelRuntime();
         const thinkingWarning = getThinkingWarning(runtime.configuredModelCapabilities, thinkingEnabled);
 
         // Attach images to the last user message if provided

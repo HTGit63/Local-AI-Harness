@@ -1,3 +1,5 @@
+import type { StructuredDiff, StructuredDiffFile } from '../types/run';
+
 interface AgentRunLineStats {
   changedFiles: number;
   addedLines: number;
@@ -34,6 +36,9 @@ export interface AgentRunSummaryData {
   commands: AgentRunCommand[];
   approvals: AgentRunApproval[];
   git?: AgentRunLineStats;
+  structuredDiff?: StructuredDiff;
+  fileChanges?: StructuredDiffFile[];
+  checkpointIds?: string[];
   usedManualFallback: boolean;
   fallbackReason?: string;
   metrics?: AgentRunMetrics;
@@ -70,6 +75,7 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
     ...run.filesDeleted,
     ...run.directoriesCreated,
   ];
+  const fileChangesCount = run.fileChanges?.length ?? run.structuredDiff?.files.length ?? 0;
 
   return (
     <div className="tool-execution-tracker">
@@ -111,7 +117,7 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
             <span className="tool-call-name">Changed</span>
-            <span className="tool-call-state">{changedSummary}</span>
+            <span className="tool-call-state">{fileChangesCount > 0 ? `${fileChangesCount} diff file${fileChangesCount === 1 ? '' : 's'}` : changedSummary}</span>
           </div>
           <div className="tool-call-input">{summarizeList(touchedPaths)}</div>
         </div>
@@ -128,6 +134,13 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
             <span className="tool-call-state">{run.approvals.length}</span>
           </div>
           <div className="tool-call-input">{approvalsApproved} approved · {run.workspaceBound ? 'bound' : 'snapshot only'}</div>
+        </div>
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Checkpoint</span>
+            <span className="tool-call-state">{run.checkpointIds?.length ? 'created' : 'none'}</span>
+          </div>
+          <div className="tool-call-input">{run.checkpointIds?.slice(-1)[0] || 'No rollback checkpoint recorded'}</div>
         </div>
         <div className={`tool-call-card ${run.usedManualFallback ? 'tool-call-card-error' : 'tool-call-card-done'}`}>
           <div className="tool-call-card-top">

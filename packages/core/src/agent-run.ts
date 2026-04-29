@@ -246,8 +246,11 @@ export class AgentRunBuilder {
     mergeCommands(this.run.commands, metadata.command);
     this.run.git = mergeLineStats(this.run.git, metadata.lineStats);
     if (metadata.structuredDiff) {
-      this.run.structuredDiff = metadata.structuredDiff;
-      this.run.fileChanges = metadata.structuredDiff.files;
+      const existingFiles = this.run.structuredDiff?.files ?? [];
+      this.run.structuredDiff = {
+        files: [...existingFiles, ...metadata.structuredDiff.files],
+      };
+      this.run.fileChanges = this.run.structuredDiff.files;
     }
     uniquePush(this.run.selectedTests ??= [], metadata.selectedTests);
     if (metadata.checkpointId) {

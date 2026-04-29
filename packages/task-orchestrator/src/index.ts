@@ -188,29 +188,29 @@ function planStepTemplates(complexity: TaskComplexity, files: string[]): TaskSte
     case 'single_file':
       return [
         step('inspect_target', 'Inspect target file', 'inspect', ['readFile'], ['Target file read or explained as missing'], baseBudget({ maxToolCalls: 1, maxFilesToRead: 1 }), files.slice(0, 1)),
-        step('focused_action', 'Apply focused action', 'edit', ['readFile', 'patchFile', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock'], ['Single focused outcome completed'], baseBudget({ maxModelCalls: 1, maxToolCalls: 3, maxFilesToRead: 1, maxFilesToWrite: 1, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.lean.outputBudgetEdit }), files.slice(0, 1)),
-        step('verify', 'Verify targeted result', 'verify', ['gitDiff', 'runCommand'], ['Diff or targeted check confirms result'], baseBudget({ maxModelCalls: 0, maxToolCalls: 2, maxFilesToRead: 1 })),
+        step('focused_action', 'Create checkpoint and apply focused action', 'edit', ['createCheckpoint', 'patchFile', 'replaceRange', 'replaceFunction'], ['Checkpoint created before edit and one focused outcome completed'], baseBudget({ maxModelCalls: 1, maxToolCalls: 4, maxFilesToRead: 1, maxFilesToWrite: 1, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.lean.outputBudgetEdit }), files.slice(0, 1)),
+        step('verify', 'Verify targeted result', 'verify', ['getStructuredDiff', 'selectTestsForChangedFiles', 'runCommand'], ['Structured diff and selected check confirm result'], baseBudget({ maxModelCalls: 0, maxToolCalls: 3, maxFilesToRead: 1 })),
         step('summarize', 'Summarize result', 'summarize', [], ['Files changed and verification summarized'], baseBudget({ maxModelCalls: 1, maxToolCalls: 0, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.lean.outputBudgetFinalReport })),
       ];
 
     case 'small_patch':
       return [
-        step('search_relevant', 'Search relevant files', 'inspect', ['searchText', 'glob', 'listDir'], ['Relevant file candidates identified'], baseBudget({ maxToolCalls: 3, maxFilesToRead: 0 })),
+        step('context_pack', 'Build compact context pack', 'inspect', ['buildContextPack', 'findSymbol', 'searchText'], ['Relevant symbols and file candidates identified without broad repo read'], baseBudget({ maxToolCalls: 4, maxFilesToRead: 0 })),
         step('inspect_files', 'Inspect 1-3 likely files', 'inspect', ['readFile'], ['Only top relevant files read'], baseBudget({ maxToolCalls: 3, maxFilesToRead: 3 }), files.slice(0, 3)),
-        step('patch', 'Patch necessary files', 'edit', ['patchFile', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'previewPatch'], ['Minimal patch proposed/applied through approval path'], baseBudget({ maxModelCalls: 1, maxToolCalls: 5, maxFilesToRead: 3, maxFilesToWrite: 2, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetEdit })),
-        step('verify', 'Verify patch', 'verify', ['gitDiff', 'runCommand'], ['Diff and targeted command checked'], baseBudget({ maxToolCalls: 3 })),
+        step('patch', 'Checkpoint and patch necessary files', 'edit', ['createCheckpoint', 'patchFile', 'replaceRange', 'replaceFunction', 'insertImport', 'addTypeProperty'], ['Minimal patch applied through deterministic edit tools'], baseBudget({ maxModelCalls: 1, maxToolCalls: 7, maxFilesToRead: 3, maxFilesToWrite: 2, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetEdit })),
+        step('verify', 'Verify patch', 'verify', ['getStructuredDiff', 'selectTestsForChangedFiles', 'detectProjectCommands', 'runCommand'], ['Structured diff and targeted command checked'], baseBudget({ maxToolCalls: 5 })),
         step('summarize', 'Summarize patch', 'summarize', [], ['Outcome, files, and verification summarized'], baseBudget({ maxModelCalls: 1, maxToolCalls: 0, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetFinalReport })),
       ];
 
     case 'multi_file':
       return [
-        step('inspect_structure', 'Inspect project structure', 'inspect', ['listDir', 'glob'], ['Project structure and likely areas identified'], baseBudget({ maxToolCalls: 4, maxFilesToRead: 0 })),
-        step('identify_files', 'Identify relevant files', 'inspect', ['searchText', 'readFile'], ['Relevant files grouped by task area'], baseBudget({ maxToolCalls: 5, maxFilesToRead: 6 }), files.slice(0, 6)),
+        step('context_pack', 'Build compact context pack', 'inspect', ['buildContextPack', 'findSymbol'], ['Relevant files and symbols identified without dumping repo'], baseBudget({ maxToolCalls: 4, maxFilesToRead: 0 })),
+        step('dependency_map', 'Map affected files', 'inspect', ['affectedFiles', 'whoImports', 'whatDoesThisImport'], ['Import and affected-file surface identified'], baseBudget({ maxToolCalls: 6, maxFilesToRead: 0 }), files.slice(0, 6)),
         step('subtask_plan', 'Create subtask plan', 'plan', [], ['Work decomposed by file group'], baseBudget({ maxModelCalls: 1, maxToolCalls: 0, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetComplexPlan })),
-        step('execute_group_1', 'Execute file group 1', 'edit', ['readFile', 'patchFile', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'previewPatch'], ['First file group complete'], baseBudget({ maxModelCalls: 1, maxToolCalls: 6, maxFilesToRead: 4, maxFilesToWrite: 4, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetEdit })),
-        step('verify_group_1', 'Verify file group 1', 'verify', ['gitDiff', 'runCommand'], ['First file group checked'], baseBudget({ maxToolCalls: 2 })),
-        step('execute_group_2', 'Execute file group 2', 'edit', ['readFile', 'patchFile', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'previewPatch'], ['Second file group complete'], baseBudget({ maxModelCalls: 1, maxToolCalls: 6, maxFilesToRead: 4, maxFilesToWrite: 4, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetEdit })),
-        step('verify_all', 'Run build/test check', 'verify', ['runCommand', 'gitDiff'], ['Build or relevant tests checked'], baseBudget({ maxToolCalls: 3 })),
+        step('execute_group_1', 'Checkpoint and execute file group 1', 'edit', ['readFile', 'createCheckpoint', 'patchFile', 'replaceRange', 'replaceFunction', 'insertImport', 'addTypeProperty', 'renameIdentifier'], ['First file group complete'], baseBudget({ maxModelCalls: 1, maxToolCalls: 8, maxFilesToRead: 4, maxFilesToWrite: 4, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetEdit })),
+        step('verify_group_1', 'Verify file group 1', 'verify', ['getStructuredDiff', 'selectTestsForChangedFiles', 'runCommand'], ['First file group checked'], baseBudget({ maxToolCalls: 3 })),
+        step('execute_group_2', 'Execute file group 2', 'edit', ['readFile', 'patchFile', 'replaceRange', 'replaceFunction', 'insertImport', 'addTypeProperty', 'renameIdentifier'], ['Second file group complete'], baseBudget({ maxModelCalls: 1, maxToolCalls: 8, maxFilesToRead: 4, maxFilesToWrite: 4, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetEdit })),
+        step('verify_all', 'Run selected build/test check', 'verify', ['getStructuredDiff', 'selectTestsForChangedFiles', 'runCommand'], ['Selected tests or build checked'], baseBudget({ maxToolCalls: 4 })),
         step('summarize', 'Summarize multi-file work', 'summarize', [], ['Final summary includes completed and remaining work'], baseBudget({ maxModelCalls: 1, maxToolCalls: 0, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetFinalReport })),
       ];
 
@@ -230,11 +230,9 @@ function planStepTemplates(complexity: TaskComplexity, files: string[]): TaskSte
 
     case 'repo_wide_audit':
       return [
-        step('inspect_manifests', 'Inspect manifests', 'inspect', ['readFile', 'glob'], ['Manifests inspected'], baseBudget({ maxToolCalls: 4, maxFilesToRead: 4 })),
-        step('inspect_docs', 'Inspect architecture docs', 'inspect', ['readFile', 'searchText'], ['Architecture docs inspected'], baseBudget({ maxToolCalls: 5, maxFilesToRead: 5 })),
-        step('inspect_core', 'Inspect core files', 'inspect', ['readFile', 'searchText'], ['Core runtime sampled'], baseBudget({ maxToolCalls: 8, maxFilesToRead: 8 })),
-        step('inspect_ui', 'Inspect UI files', 'inspect', ['readFile', 'searchText'], ['UI runtime sampled'], baseBudget({ maxToolCalls: 6, maxFilesToRead: 6 })),
-        step('inspect_tests', 'Inspect tests', 'inspect', ['readFile', 'searchText'], ['Tests sampled'], baseBudget({ maxToolCalls: 6, maxFilesToRead: 6 })),
+        step('detect_commands', 'Detect project commands', 'inspect', ['detectProjectCommands'], ['Project commands and manifests detected'], baseBudget({ maxToolCalls: 1, maxFilesToRead: 0 })),
+        step('context_pack', 'Build audit context pack', 'inspect', ['buildContextPack', 'glob', 'searchText'], ['Top relevant audit files identified without reading whole repo'], baseBudget({ maxToolCalls: 5, maxFilesToRead: 0 })),
+        step('inspect_top_files', 'Inspect top relevant files', 'inspect', ['readFile'], ['Only top relevant files read'], baseBudget({ maxToolCalls: 8, maxFilesToRead: 8 })),
         step('report', 'Produce audit report', 'summarize', [], ['Findings and recommendations reported without edits'], baseBudget({ maxModelCalls: 1, maxToolCalls: 0, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.deep.outputBudgetFinalReport })),
       ];
 

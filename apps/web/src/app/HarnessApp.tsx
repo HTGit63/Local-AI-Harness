@@ -3,7 +3,7 @@ import { ApprovalQueue } from '../components/approvals/ApprovalQueue';
 import { ChatMessageRow } from '../components/ChatMessageRow';
 import { RunConsole } from '../components/run-console/RunConsole';
 import { useStreamingBuffer } from '../hooks/useStreamingBuffer';
-import type { RunApprovalItem, StructuredDiff, TaskComplexity, TaskPlan } from '../types/run';
+import type { RunApprovalItem, StructuredDiff, StructuredDiffFile, TaskComplexity, TaskPlan } from '../types/run';
 
 /* ─────────── API helpers ─────────── */
 function getApiBase(): string {
@@ -306,6 +306,9 @@ interface AgentRunSummary {
     addedLines: number;
     removedLines: number;
   };
+  structuredDiff?: StructuredDiff;
+  fileChanges?: StructuredDiffFile[];
+  checkpointIds?: string[];
   metrics?: {
     totalMs?: number;
     firstTokenMs?: number;
@@ -1118,6 +1121,12 @@ function HarnessApp() {
   const [streamIdleTimeoutDraft, setStreamIdleTimeoutDraft] = useState('45');
   const [contextBudgetDraft, setContextBudgetDraft] = useState('24000');
   const [localModelBudgetProfileDraft, setLocalModelBudgetProfileDraft] = useState<'lean' | 'balanced' | 'deep'>('balanced');
+  const [executionProfileDraft, setExecutionProfileDraft] = useState<NonNullable<ConfigState['executionProfile']>>('balanced_local');
+  const [promptProfileDraft, setPromptProfileDraft] = useState('gemma-local-fast');
+  const [fastModelDraft, setFastModelDraft] = useState('');
+  const [codingModelDraft, setCodingModelDraft] = useState('');
+  const [reviewModelDraft, setReviewModelDraft] = useState('');
+  const [apiModelDraft, setApiModelDraft] = useState('');
   const [toolRetryMaxDraft, setToolRetryMaxDraft] = useState('2');
   const [sessionMemoryEnabledDraft, setSessionMemoryEnabledDraft] = useState(true);
   const [sessionMemoryTurnsDraft, setSessionMemoryTurnsDraft] = useState('3');
@@ -1208,6 +1217,10 @@ function HarnessApp() {
     () => [...traces].slice(-6).reverse(),
     [traces],
   );
+  const currentRunSummary = useMemo(
+    () => [...messages].reverse().find((message) => message.runSummary)?.runSummary,
+    [messages],
+  );
   const liveActivityBadge = streamStatus || plan?.lastStatus || plan?.currentPhase || 'Ready';
 
   /* ─── Refresh dashboard data ─── */
@@ -1272,6 +1285,12 @@ function HarnessApp() {
             sessionMemoryTurns: cfg.sessionMemoryTurns,
             selfCheckEnabled: cfg.selfCheckEnabled,
             localModelBudgetProfile: cfg.localModelBudgetProfile,
+            executionProfile: cfg.executionProfile,
+            promptProfile: cfg.promptProfile,
+            fastModel: cfg.fastModel,
+            codingModel: cfg.codingModel,
+            reviewModel: cfg.reviewModel,
+            apiModel: cfg.apiModel,
           });
 
           if (sig !== lastConfigSigRef.current) {
@@ -1289,6 +1308,12 @@ function HarnessApp() {
             setSessionMemoryTurnsDraft(String(cfg.sessionMemoryTurns));
             setSelfCheckEnabledDraft(cfg.selfCheckEnabled);
             setLocalModelBudgetProfileDraft(cfg.localModelBudgetProfile || 'balanced');
+            setExecutionProfileDraft(cfg.executionProfile || 'balanced_local');
+            setPromptProfileDraft(cfg.promptProfile || 'gemma-local-fast');
+            setFastModelDraft(cfg.fastModel || '');
+            setCodingModelDraft(cfg.codingModel || '');
+            setReviewModelDraft(cfg.reviewModel || '');
+            setApiModelDraft(cfg.apiModel || '');
           }
         }
       };
@@ -1645,6 +1670,7 @@ function HarnessApp() {
         }
 
         if (event.type === 'run_summary') {
+          setStructuredDiff(event.summary.structuredDiff ?? null);
           setMessages(cur => cur.map(m => (
             m.id === placeholderId
               ? {
@@ -1826,6 +1852,12 @@ function HarnessApp() {
           sessionMemoryTurns,
           selfCheckEnabled: selfCheckEnabledDraft,
           localModelBudgetProfile: localModelBudgetProfileDraft,
+          executionProfile: executionProfileDraft,
+          promptProfile: promptProfileDraft,
+          fastModel: fastModelDraft.trim(),
+          codingModel: codingModelDraft.trim(),
+          reviewModel: reviewModelDraft.trim(),
+          apiModel: apiModelDraft.trim(),
           activateModel: shouldActivate,
         }),
       });
@@ -2497,7 +2529,8 @@ function HarnessApp() {
           traces={traces}
           approvals={approvals}
           gitDiff={gitDiff}
-          structuredDiff={structuredDiff}
+          structuredDiff={currentRunSummary?.structuredDiff ?? structuredDiff}
+          checkpointIds={currentRunSummary?.checkpointIds ?? []}
           onResolveApproval={resolveApproval}
         />
 
@@ -2560,6 +2593,43 @@ function HarnessApp() {
                         </select>
                       </div>
                     </div>
+                    <div className="settings-row">
+                      <div className="settings-field">
+                        <label>Execution Profile</label>
+                        <select className="settings-select" value={executionProfileDraft} onChange={e => setExecutionProfileDraft(e.target.value as NonNullable<ConfigState['executionProfile']>)}>
+                          <option value="fast_local">Fast Local</option>
+                          <option value="balanced_local">Balanced Local</option>
+                          <option value="deep_review">Deep Review</option>
+                          <option value="api_frontier">API Frontier</option>
+                        </select>
+                      </div>
+                      <div className="settings-field">
+                        <label>Prompt Profile</label>
+                        <select className="settings-select" value={promptProfileDraft} onChange={e => setPromptProfileDraft(e.target.value)}>
+                          <option value="gemma-local-fast">Gemma Local Fast</option>
+                          <option value="qwen-coder-local">Qwen Coder Local</option>
+                          <option value="deepseek-coder-local">DeepSeek Coder Local</option>
+                          <option value="kimi-api-long-context">Kimi API Long Context</option>
+                          <option value="frontier-mini-api">Frontier Mini API</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div className="settings-field">
+                      <label>Fast Model</label>
+                      <input className="settings-input" value={fastModelDraft} onChange={e => setFastModelDraft(e.target.value)} placeholder="gemma4:e4b" />
+                    </div>
+                    <div className="settings-field">
+                      <label>Coding Model</label>
+                      <input className="settings-input" value={codingModelDraft} onChange={e => setCodingModelDraft(e.target.value)} placeholder="qwen3.5:9b-q4_K_M" />
+                    </div>
+                    <div className="settings-field">
+                      <label>Review Model</label>
+                      <input className="settings-input" value={reviewModelDraft} onChange={e => setReviewModelDraft(e.target.value)} placeholder="VladimirGav/gemma4-26b-16GB-VRAM:latest" />
+                    </div>
+                    <div className="settings-field">
+                      <label>API Model</label>
+                      <input className="settings-input" value={apiModelDraft} onChange={e => setApiModelDraft(e.target.value)} placeholder="optional" />
+                    </div>
                     <button className="settings-btn" onClick={() => void saveConfig()} type="button">
                       Save & Apply
                     </button>
@@ -2619,7 +2689,9 @@ function HarnessApp() {
                       </div>
                       <div className="settings-info-row">
                         <span>Router</span>
-                        <span>fast {config?.fastModel || 'gemma4:e4b'} · code {config?.codingModel || config?.model}</span>
+                        <span>
+                          fast {config?.fastModel || 'gemma4:e4b'} · code {config?.codingModel || config?.model} · review {config?.reviewModel || config?.model} · api {config?.apiModel || 'off'}
+                        </span>
                       </div>
                       <div className="settings-info-row">
                         <span>Run Budget</span>

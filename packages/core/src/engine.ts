@@ -74,7 +74,7 @@ type ToolProtocolMode = 'native' | 'manual_preferred' | 'manual_fallback';
 type ExecutionProfile = 'fast_local' | 'balanced_local' | 'deep_review' | 'api_frontier';
 type ProviderProfile = 'ollama_local' | 'openai_compatible' | 'openrouter' | 'together' | 'groq' | 'qwen_api' | 'kimi_api';
 type PromptProfile = 'gemma-local-fast' | 'qwen-coder-local' | 'deepseek-coder-local' | 'kimi-api-long-context' | 'frontier-mini-api';
-type ModelRoutePurpose = 'direct' | 'classify' | 'code' | 'summarize' | 'review';
+type ModelRoutePurpose = 'classify' | 'direct' | 'inspect' | 'code' | 'summarize' | 'review';
 type BootstrapPlanStep =
   | { type: 'inventory'; title: string }
   | { type: 'tool'; title: string; toolName: SupportedTool; args: Record<string, unknown> };
@@ -726,16 +726,16 @@ function buildStepScopedPrompt(taskPlan: TaskPlan, currentStep: TaskStep | null,
 function promptProfileInstruction(profile: PromptProfile): string {
   switch (profile) {
     case 'qwen-coder-local':
-      return 'Local Qwen coder profile: use deterministic tools first, keep patches small, prefer AST edit tools, return one tool call or one concise final answer.';
+      return 'Local Qwen coder profile: use deterministic tools first, keep patches small, prefer AST edit tools, get structured diff, run selected tests, return one tool call or one concise final answer.';
     case 'deepseek-coder-local':
-      return 'Local DeepSeek coder profile: inspect exact code before edits, avoid broad rewrites, use structured diff and targeted verification.';
+      return 'Local DeepSeek coder profile: inspect exact code before edits, avoid broad rewrites, use checkpoint, structured diff, and targeted verification.';
     case 'kimi-api-long-context':
       return 'Kimi long-context profile: synthesize compact file cards before reading long files, keep citations to file paths and line ranges.';
     case 'frontier-mini-api':
       return 'Frontier mini profile: plan briefly, execute with tools, verify targeted tests, summarize exact diff hunks.';
     case 'gemma-local-fast':
     default:
-      return 'Local Gemma fast profile: no preamble before tool use, one tool call at a time, small context, max 1-2 model loops for small tasks.';
+      return 'Local Gemma fast profile: no preamble before tool use, one tool call at a time, deterministic tools first, small context, max 1-2 model loops for small tasks.';
   }
 }
 
@@ -777,6 +777,9 @@ export class CoreEngine extends EventEmitter {
     this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
     this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
     this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
+    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
+    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
+    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
     this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
     this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
     this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
@@ -909,13 +912,23 @@ export class CoreEngine extends EventEmitter {
     if (this.config.executionProfile === 'api_frontier' && this.config.apiModel) {
       return this.config.apiModel;
     }
-    if (this.config.executionProfile === 'deep_review' && (purpose === 'review' || purpose === 'summarize') && this.config.reviewModel) {
+
+    if (purpose === 'review' && this.config.reviewModel) {
       return this.config.reviewModel;
     }
+
+    if (this.config.executionProfile === 'deep_review' && purpose === 'summarize' && this.config.reviewModel) {
+      return this.config.reviewModel;
+    }
+
+    if (this.config.executionProfile === 'fast_local') {
+      return this.config.fastModel || fallback;
+    }
+
     if (purpose === 'code' && this.config.codingModel) {
       return this.config.codingModel;
     }
-    if ((purpose === 'direct' || purpose === 'classify' || purpose === 'summarize') && this.config.fastModel) {
+    if ((purpose === 'direct' || purpose === 'classify' || purpose === 'inspect' || purpose === 'summarize') && this.config.fastModel) {
       return this.config.fastModel;
     }
     return fallback;
@@ -1350,6 +1363,7 @@ export class CoreEngine extends EventEmitter {
   private async selectToolProtocol(
     toolNames: SupportedTool[],
     modelCapabilities: string[] | null,
+    modelName = this.config.model,
   ): Promise<{ manualToolProtocol: boolean; mode: ToolProtocolMode; reason?: string }> {
     if (toolNames.length === 0) {
       return { manualToolProtocol: false, mode: 'native' };
@@ -1364,7 +1378,7 @@ export class CoreEngine extends EventEmitter {
       };
     }
 
-    const canAttemptNativeTools = await this.modelAdapter.canAttemptNativeToolCalling(this.config.model, modelCapabilities);
+    const canAttemptNativeTools = await this.modelAdapter.canAttemptNativeToolCalling(modelName, modelCapabilities);
     if (canAttemptNativeTools || !Array.isArray(modelCapabilities)) {
       return { manualToolProtocol: false, mode: 'native' };
     }
@@ -2372,7 +2386,27 @@ export class CoreEngine extends EventEmitter {
     'writeFile', 'patchFile', 'replaceFunction', 'insertImport', 'addTypeProperty', 'renameIdentifier', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'makeDir', 'deleteFile', 'createCheckpoint', 'rollbackToCheckpoint',
   ]);
 
-  private async ensureRunCheckpointBeforeMutation(runId: string | undefined, toolName: SupportedTool): Promise<ToolResult | null> {
+  private checkpointTargetsForTool(toolName: SupportedTool, args: Record<string, unknown>): string[] | undefined {
+    if (toolName === 'applyUnifiedPatch') {
+      const patchText = typeof args.patchText === 'string' ? args.patchText : '';
+      const files = new Set<string>();
+      for (const line of patchText.split('\n')) {
+        if (!line.startsWith('+++ ') && !line.startsWith('--- ')) continue;
+        const raw = line.slice(4).trim().split(/\s+/)[0];
+        if (!raw || raw === '/dev/null') continue;
+        files.add(raw.replace(/^a\//, '').replace(/^b\//, ''));
+      }
+      return Array.from(files);
+    }
+    if (toolName === 'makeDir') {
+      const dirPath = typeof args.dirPath === 'string' ? args.dirPath : undefined;
+      return dirPath ? [dirPath] : undefined;
+    }
+    const filePath = typeof args.filePath === 'string' ? args.filePath : undefined;
+    return filePath ? [filePath] : undefined;
+  }
+
+  private async ensureRunCheckpointBeforeMutation(runId: string | undefined, toolName: SupportedTool, args: Record<string, unknown>): Promise<ToolResult | null> {
     if (!runId || this.autoCheckpointRuns.has(runId) || !CoreEngine.WORKSPACE_MUTATING_TOOLS.has(toolName)) {
       return null;
     }
@@ -2380,7 +2414,10 @@ export class CoreEngine extends EventEmitter {
       return null;
     }
 
-    const checkpoint = await this.toolRegistry.createCheckpoint(`before ${toolName} in ${runId}`);
+    const checkpoint = await this.toolRegistry.createCheckpoint(
+      `before ${toolName} in ${runId}`,
+      this.checkpointTargetsForTool(toolName, args),
+    );
     if (!checkpoint.success) {
       return checkpoint;
     }
@@ -2405,7 +2442,7 @@ export class CoreEngine extends EventEmitter {
     let result: any;
     let checkpointResult: ToolResult | null = null;
     try {
-      checkpointResult = await this.ensureRunCheckpointBeforeMutation(runId, toolName);
+      checkpointResult = await this.ensureRunCheckpointBeforeMutation(runId, toolName, args);
       if (checkpointResult && !checkpointResult.success) {
         this.traceBus.emitEvent({
           type: 'tool_call_completed',
@@ -2814,8 +2851,8 @@ export class CoreEngine extends EventEmitter {
       return false;
     }
 
-    const mutatingTools = new Set<SupportedTool>(['writeFile', 'patchFile', 'deleteFile', 'makeDir', 'runCommand']);
-    const verificationTools = new Set<SupportedTool>(['readFile', 'gitDiff', 'gitStatus', 'listDir', 'searchText', 'runCommand']);
+    const mutatingTools = new Set<SupportedTool>(['writeFile', 'patchFile', 'replaceFunction', 'insertImport', 'addTypeProperty', 'renameIdentifier', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'deleteFile', 'makeDir', 'runCommand']);
+    const verificationTools = new Set<SupportedTool>(['readFile', 'getStructuredDiff', 'selectTestsForChangedFiles', 'gitDiff', 'gitStatus', 'listDir', 'searchText', 'runCommand']);
     let lastMutationIndex = -1;
 
     run.steps.forEach((step, index) => {
@@ -2850,7 +2887,7 @@ export class CoreEngine extends EventEmitter {
       recentCommands.length > 0 ? `Recent commands: ${recentCommands.join(' | ')}` : null,
       manualToolProtocol
         ? 'Return exactly one JSON tool action to verify the result, then return {"final":"..."} when verification is complete.'
-        : 'Use one verification tool call now (readFile, gitDiff, gitStatus, listDir, searchText, or runCommand) before the final answer.',
+        : 'Use one verification tool call now (getStructuredDiff, selectTestsForChangedFiles, readFile, gitDiff, gitStatus, listDir, searchText, or runCommand) before the final answer.',
     ].filter(Boolean).join('\n');
   }
 
@@ -3690,9 +3727,11 @@ export class CoreEngine extends EventEmitter {
     signal?: AbortSignal,
     think?: boolean,
     onFirstToken?: () => void,
+    routePurpose?: ModelRoutePurpose,
   ): Promise<any> {
-    const routedModel = this.selectModelForPurpose(tools && tools.length > 0 ? 'code' : 'direct');
-    this.traceModelRoute(tools && tools.length > 0 ? 'code' : 'direct', routedModel);
+    const purpose = routePurpose ?? (tools && tools.length > 0 ? 'code' : 'direct');
+    const routedModel = this.selectModelForPurpose(purpose);
+    this.traceModelRoute(purpose, routedModel);
     const stream = await this.modelAdapter.createChatCompletion({
       model: routedModel,
       messages: currentMessages,
@@ -4261,8 +4300,10 @@ export class CoreEngine extends EventEmitter {
       const includeWorkspaceContext = workspaceBound && this.isWorkspaceQuestion(latestUserMessage, promptMode);
       const includeRepoContext = workspaceBound && !useStepScopedContext && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
       const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
-      const modelCapabilities = await this.modelAdapter.getModelCapabilities(this.config.model);
-      const toolProtocol = await this.selectToolProtocol(selectedToolNames, modelCapabilities);
+      const capabilityRoutePurpose: ModelRoutePurpose = selectedToolNames.length > 0 ? 'code' : 'inspect';
+      const capabilityRouteModel = this.selectModelForPurpose(capabilityRoutePurpose);
+      const modelCapabilities = await this.modelAdapter.getModelCapabilities(capabilityRouteModel);
+      const toolProtocol = await this.selectToolProtocol(selectedToolNames, modelCapabilities, capabilityRouteModel);
       const rootManifestAnswer = workspaceBound && !['workspace_overview', 'review_diff', 'find_file', 'read_file', 'search_text'].includes(intentDecision.intent)
         ? await this.tryAnswerFromRootManifest(latestUserMessage)
         : null;
@@ -4297,6 +4338,7 @@ export class CoreEngine extends EventEmitter {
           type: 'manual_tool_fallback',
           data: {
             model: this.config.model,
+            routedModel: capabilityRouteModel,
             reason: toolProtocol.reason,
             manualToolProtocol: true,
             selectedTools: selectedToolNames,
@@ -4308,6 +4350,7 @@ export class CoreEngine extends EventEmitter {
           type: 'manual_tool_strategy_selected',
           data: {
             model: this.config.model,
+            routedModel: capabilityRouteModel,
             reason: toolProtocol.reason,
             manualToolProtocol: true,
             selectedTools: selectedToolNames,
@@ -4321,6 +4364,7 @@ export class CoreEngine extends EventEmitter {
           type: 'thinking_unsupported',
           data: {
             model: this.config.model,
+            routedModel: capabilityRouteModel,
             reason: 'Current model does not report thinking capability.',
             requestedThink: true,
             modelCapabilities: modelCapabilities ?? [],
@@ -4397,6 +4441,8 @@ export class CoreEngine extends EventEmitter {
           `Session memory: ${this.config.sessionMemoryEnabled ? `${this.config.sessionMemoryTurns} recent turns` : 'off'}`,
           `Self-check: ${this.config.selfCheckEnabled ? 'required after edits or commands' : 'off'}`,
           'If workspace tools are available and the request is about repo behavior, inspect workspace facts before asking the user for more detail.',
+          'Agentic loop: use deterministic tools first, read minimal files, create checkpoint before edits, patch minimal code, get structured diff, run selected tests only, then summarize exact files and verification.',
+          'Do not read the whole repo unless the current task is repo_wide_audit. Do not rewrite full files unnecessarily. Do not run full build before targeted checks unless needed. Do not continue after budget exceeded.',
           'For complex tasks, do not solve the whole project in one response. Work only the current task step.',
           'Never simulate tool execution or file changes.',
           'Finish with concise answer, What I did, and Files changed.',
@@ -4609,8 +4655,13 @@ export class CoreEngine extends EventEmitter {
 
         let result: any;
         let message: any;
-        const routedAgentModel = this.selectModelForPurpose(nativeToolDefinitions ? 'code' : 'summarize');
-        this.traceModelRoute(nativeToolDefinitions ? 'code' : 'summarize', routedAgentModel);
+        const routePurpose: ModelRoutePurpose = nativeToolDefinitions
+          ? 'code'
+          : promptMode === 'quick_inspect'
+            ? 'inspect'
+            : 'summarize';
+        const routedAgentModel = this.selectModelForPurpose(routePurpose);
+        this.traceModelRoute(routePurpose, routedAgentModel);
         try {
           if (streamHandlers) {
             message = await this.streamAssistantMessage(
@@ -4630,6 +4681,7 @@ export class CoreEngine extends EventEmitter {
                   this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
                 }
               },
+              routePurpose,
             );
           } else {
             result = await this.modelAdapter.createChatCompletion({

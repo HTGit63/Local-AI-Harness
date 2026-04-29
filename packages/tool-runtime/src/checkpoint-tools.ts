@@ -22,6 +22,7 @@ interface ManifestFile {
 
 interface CheckpointManifest extends WorkspaceCheckpoint {
   files: ManifestFile[];
+  missingFiles?: string[];
 }
 
 async function walkFiles(cwd: string, dir = cwd): Promise<string[]> {
@@ -48,6 +49,44 @@ function checkpointPath(cwd: string, id: string): string {
   return path.join(cwd, CHECKPOINT_DIR, id);
 }
 
+function normalizeCheckpointTarget(filePath: string): string {
+  const normalized = path.normalize(filePath).replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!normalized || normalized === '.' || normalized.startsWith('../') || normalized === '..') {
+    throw new Error(`Invalid checkpoint target: ${filePath}`);
+  }
+  return normalized;
+}
+
+async function expandCheckpointTargets(cwd: string, targetFiles?: string[]): Promise<{ files: string[]; missingFiles: string[] }> {
+  if (!targetFiles?.length) {
+    return { files: await walkFiles(cwd), missingFiles: [] };
+  }
+
+  const files = new Set<string>();
+  const missingFiles = new Set<string>();
+  for (const target of targetFiles) {
+    const normalized = normalizeCheckpointTarget(target);
+    const absolute = path.join(cwd, normalized);
+    try {
+      const stat = await fs.stat(absolute);
+      if (stat.isDirectory()) {
+        for (const nested of await walkFiles(cwd, absolute)) {
+          files.add(nested);
+        }
+      } else {
+        files.add(normalized);
+      }
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') {
+        missingFiles.add(normalized);
+        continue;
+      }
+      throw error;
+    }
+  }
+  return { files: Array.from(files).sort(), missingFiles: Array.from(missingFiles).sort() };
+}
+
 async function copyIntoCheckpoint(cwd: string, checkpointRoot: string, filePath: string): Promise<number> {
   const source = path.join(cwd, filePath);
   const target = path.join(checkpointRoot, 'files', filePath);
@@ -57,15 +96,15 @@ async function copyIntoCheckpoint(cwd: string, checkpointRoot: string, filePath:
   return stat.size;
 }
 
-export async function createWorkspaceCheckpoint(cwd: string, label?: string): Promise<WorkspaceCheckpoint> {
+export async function createWorkspaceCheckpoint(cwd: string, label?: string, targetFiles?: string[]): Promise<WorkspaceCheckpoint> {
   const id = checkpointId();
   const root = checkpointPath(cwd, id);
-  const allFiles = await walkFiles(cwd);
+  const targetSnapshot = await expandCheckpointTargets(cwd, targetFiles);
   let totalBytes = 0;
   const files: ManifestFile[] = [];
 
   await fs.mkdir(root, { recursive: true });
-  for (const filePath of allFiles) {
+  for (const filePath of targetSnapshot.files) {
     if (files.length >= MAX_SNAPSHOT_FILES) {
       throw new Error(`Checkpoint exceeds max file count (${MAX_SNAPSHOT_FILES}).`);
     }
@@ -85,6 +124,7 @@ export async function createWorkspaceCheckpoint(cwd: string, label?: string): Pr
     totalBytes,
     path: path.relative(cwd, root).replace(/\\/g, '/'),
     files,
+    missingFiles: targetSnapshot.missingFiles,
   };
   await fs.writeFile(path.join(root, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
   return {
@@ -97,19 +137,42 @@ export async function createWorkspaceCheckpoint(cwd: string, label?: string): Pr
   };
 }
 
-export async function rollbackWorkspaceCheckpoint(cwd: string, id: string): Promise<{ checkpoint: WorkspaceCheckpoint; restoredFiles: number; deletedFiles: number }> {
+async function readCheckpointManifest(cwd: string, id: string): Promise<CheckpointManifest> {
   const root = checkpointPath(cwd, id);
   const manifestPath = path.join(root, 'manifest.json');
-  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as CheckpointManifest;
-  const checkpointFiles = new Set(manifest.files.map((file) => file.path));
-  const currentFiles = await walkFiles(cwd);
-  let deletedFiles = 0;
-  let restoredFiles = 0;
+  return JSON.parse(await fs.readFile(manifestPath, 'utf8')) as CheckpointManifest;
+}
 
-  for (const filePath of currentFiles) {
-    if (!checkpointFiles.has(filePath)) {
-      await fs.rm(path.join(cwd, filePath), { force: true });
-      deletedFiles += 1;
+export async function getWorkspaceCheckpointAffectedFiles(cwd: string, id: string): Promise<string[]> {
+  const manifest = await readCheckpointManifest(cwd, id);
+  return Array.from(new Set([
+    ...manifest.files.map((file) => file.path),
+    ...(manifest.missingFiles ?? []),
+  ])).sort();
+}
+
+export async function rollbackWorkspaceCheckpoint(cwd: string, id: string): Promise<{
+  checkpoint: WorkspaceCheckpoint;
+  restoredFiles: number;
+  deletedFiles: number;
+  restoredPaths: string[];
+  deletedPaths: string[];
+  affectedFiles: string[];
+}> {
+  const root = checkpointPath(cwd, id);
+  const manifest = await readCheckpointManifest(cwd, id);
+  const deletedPaths: string[] = [];
+  const restoredPaths: string[] = [];
+
+  for (const filePath of manifest.missingFiles ?? []) {
+    const target = path.join(cwd, filePath);
+    try {
+      await fs.rm(target, { force: true, recursive: true });
+      deletedPaths.push(filePath);
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
     }
   }
 
@@ -118,7 +181,7 @@ export async function rollbackWorkspaceCheckpoint(cwd: string, id: string): Prom
     const target = path.join(cwd, file.path);
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.copyFile(source, target);
-    restoredFiles += 1;
+    restoredPaths.push(file.path);
   }
 
   return {
@@ -130,7 +193,10 @@ export async function rollbackWorkspaceCheckpoint(cwd: string, id: string): Prom
       totalBytes: manifest.totalBytes,
       path: manifest.path,
     },
-    restoredFiles,
-    deletedFiles,
+    restoredFiles: restoredPaths.length,
+    deletedFiles: deletedPaths.length,
+    restoredPaths,
+    deletedPaths,
+    affectedFiles: Array.from(new Set([...restoredPaths, ...deletedPaths])).sort(),
   };
 }

@@ -16,6 +16,7 @@ interface RunConsoleProps {
   approvals: RunApprovalItem[];
   gitDiff: string;
   structuredDiff?: StructuredDiff | null;
+  checkpointIds?: string[];
   onResolveApproval: (id: string, approved: boolean) => void;
 }
 
@@ -80,11 +81,11 @@ function structuredLineClass(line: StructuredDiffLine): string {
   if (line.type === 'removed') return 'diff-line-removed';
   if (line.type === 'hunk') return 'diff-line-hunk';
   if (line.type === 'file') return 'diff-line-file';
-  return '';
+  return 'diff-line-context';
 }
 
-function lineNumber(value?: number): string {
-  return typeof value === 'number' ? String(value) : '';
+function lineNumber(label: 'old' | 'new', value?: number): string {
+  return typeof value === 'number' ? `${label} ${value}` : '';
 }
 
 function traceData(trace: RunTraceEntry): Record<string, unknown> {
@@ -102,14 +103,17 @@ export function RunConsole({
   approvals,
   gitDiff,
   structuredDiff,
+  checkpointIds = [],
   onResolveApproval,
 }: RunConsoleProps) {
   const planFiles = collectPlanFiles(plan);
   const fallbackDiffFiles = parseDiffFileStats(gitDiff);
-  const diffFiles = structuredDiff?.files.length
-    ? structuredDiff.files.map((file) => ({ file: file.path, added: file.addedLines, removed: file.removedLines }))
+  const structuredFiles = structuredDiff?.files ?? [];
+  const hasStructuredDiff = structuredFiles.length > 0;
+  const diffFiles = hasStructuredDiff
+    ? structuredFiles.map((file) => ({ file: file.path, added: file.addedLines, removed: file.removedLines }))
     : fallbackDiffFiles;
-  const changedCount = structuredDiff?.files.length ?? diffFiles.length;
+  const changedCount = diffFiles.length;
   const addedLines = diffFiles.reduce((total, file) => total + file.added, 0);
   const removedLines = diffFiles.reduce((total, file) => total + file.removed, 0);
   const runState = plan?.failedAt ? 'failed' : plan?.completedAt ? 'done' : plan ? 'running' : 'idle';
@@ -150,6 +154,20 @@ export function RunConsole({
         <TaskPlanView plan={plan} currentStepId={currentStepId} />
         <ToolCallList traces={traces} currentTool={currentTool} />
 
+        {checkpointIds.length > 0 && (
+          <section className="run-console-section">
+            <div className="run-console-section-head">
+              <span>Safety checkpoint</span>
+              <span>Rollback available</span>
+            </div>
+            <div className="checkpoint-list">
+              {checkpointIds.slice(-3).map((checkpointId) => (
+                <code key={checkpointId}>{checkpointId}</code>
+              ))}
+            </div>
+          </section>
+        )}
+
         <section className="run-console-section">
           <div className="run-console-section-head">
             <span>Files in plan</span>
@@ -189,16 +207,16 @@ export function RunConsole({
           ) : (
             <>
               <div className="diff-file-list">
-                {diffFiles.slice(0, 10).map((file) => (
+                {diffFiles.slice(0, 8).map((file) => (
                   <div key={file.file} className="diff-file-row">
                     <code>{file.file}</code>
                     <span><span className="diff-added">+{file.added}</span> <span className="diff-removed">-{file.removed}</span></span>
                   </div>
                 ))}
               </div>
-              {structuredDiff?.files.length ? (
+              {hasStructuredDiff ? (
                 <div className="inline-diff-viewer">
-                  {structuredDiff.files.slice(0, 8).map((file) => (
+                  {structuredFiles.slice(0, 8).map((file) => (
                     <details key={file.path} className="inline-diff-file" open>
                       <summary>
                         <code>{file.path}</code>
@@ -209,11 +227,18 @@ export function RunConsole({
                           <div key={`${file.path}-${hunk.oldStart}-${hunk.newStart}-${hunkIndex}`} className="inline-diff-hunk">
                             {hunk.lines.slice(0, 260).map((line, lineIndex) => (
                               <div key={`${lineIndex}-${line.type}-${line.content.slice(0, 24)}`} className={`inline-diff-line ${structuredLineClass(line)}`}>
-                                <span className="inline-diff-line-no">{lineNumber(line.oldLine)}</span>
-                                <span className="inline-diff-line-no">{lineNumber(line.newLine)}</span>
+                                <span className="inline-diff-line-no">{lineNumber('old', line.oldLine)}</span>
+                                <span className="inline-diff-line-no">{lineNumber('new', line.newLine)}</span>
                                 <code>{line.type === 'added' ? '+' : line.type === 'removed' ? '-' : line.type === 'hunk' ? '@' : ' '}{line.content || ' '}</code>
                               </div>
                             ))}
+                            {hunk.lines.length > 260 && (
+                              <div className="inline-diff-line diff-line-hunk">
+                                <span className="inline-diff-line-no" />
+                                <span className="inline-diff-line-no" />
+                                <code>... hunk truncated in UI preview ...</code>
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -221,17 +246,19 @@ export function RunConsole({
                   ))}
                 </div>
               ) : null}
-              <details className="diff-raw-details" open>
-                <summary>Raw diff</summary>
-                <pre className="run-diff-preview diff-code">
-                  {diffPreviewLines.map((line, index) => (
-                    <span key={`${index}-${line.slice(0, 20)}`} className={getDiffLineClass(line)}>
-                      {line || ' '}
-                    </span>
-                  ))}
-                  {diffIsTruncated && <span className="diff-line-hunk">... diff truncated in UI preview ...</span>}
-                </pre>
-              </details>
+              {!hasStructuredDiff && gitDiff.trim() ? (
+                <details className="diff-raw-details" open>
+                  <summary>Raw diff</summary>
+                  <pre className="run-diff-preview diff-code">
+                    {diffPreviewLines.map((line, index) => (
+                      <span key={`${index}-${line.slice(0, 20)}`} className={getDiffLineClass(line)}>
+                        {line || ' '}
+                      </span>
+                    ))}
+                    {diffIsTruncated && <span className="diff-line-hunk">... diff truncated in UI preview ...</span>}
+                  </pre>
+                </details>
+              ) : null}
             </>
           )}
         </section>

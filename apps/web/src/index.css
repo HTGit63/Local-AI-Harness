@@ -3997,6 +3997,10 @@ body::after {
   color: #9aa4af;
 }
 
+.diff-line-context {
+  color: #c9c9c9;
+}
+
 .diff-line-hunk {
   color: #7cb7ff;
 }
@@ -4042,9 +4046,13 @@ body::after {
   border-top: 1px solid var(--border);
 }
 
+.inline-diff-hunk + .inline-diff-hunk {
+  border-top: 1px solid var(--border);
+}
+
 .inline-diff-line {
   display: grid;
-  grid-template-columns: 36px 36px minmax(0, 1fr);
+  grid-template-columns: 58px 58px minmax(0, 1fr);
   gap: 6px;
   min-height: 19px;
   align-items: start;
@@ -4071,6 +4079,31 @@ body::after {
 
 .inline-diff-line.diff-line-removed {
   background: rgba(255, 107, 97, 0.08);
+}
+
+.inline-diff-line.diff-line-hunk {
+  background: rgba(124, 183, 255, 0.08);
+}
+
+.inline-diff-line.diff-line-file {
+  background: rgba(154, 164, 175, 0.08);
+}
+
+.checkpoint-list {
+  display: grid;
+  gap: 6px;
+}
+
+.checkpoint-list code {
+  overflow: hidden;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #080808;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .diff-raw-details summary {
