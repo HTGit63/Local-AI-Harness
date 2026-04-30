@@ -25,6 +25,8 @@
 - `TASK-15 [done]` Model routing foundation added: execution profiles, provider profile labels, prompt profiles, fast/code/review/API model slots, route selection traces, and model-per-purpose calls for direct/code/summarize paths.
 - `TASK-16 [done]` Regression coverage added for deterministic repo tools, AST edits, import graph, targeted test selection, command detection, checkpoint rollback, and full `npm test` passes.
 
+Status: complete as of 2026-04-30; all checklist items in sections 0 and 0.1 are marked [done].
+
 Implementation audit note:
 - `qwe-qwe` mechanisms selectively ported: response continuation, context compaction mindset, bounded retry/continuation loop, compacted tool reinjection.
 - `osaurus` ideas selectively ported: clearer direct-vs-agent posture, stronger live command-center framing, better visible session/activity shell.
