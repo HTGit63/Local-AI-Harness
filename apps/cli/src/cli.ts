@@ -3,7 +3,7 @@
 import * as readline from 'readline';
 import * as path from 'path';
 import { CoreEngine } from '@local-harness/core';
-import { runBenchmarks, runDiagnostics } from '@local-harness/doctor';
+import { runBenchmarks, runDiagnostics, summarizeTraceTelemetry } from '@local-harness/doctor';
 import { loadCuratedSkills } from '@local-harness/skills';
 
 const args = process.argv.slice(2);
@@ -76,6 +76,79 @@ function renderRunSummary(summary: { summary?: string }) {
 
 function supportsThinking(capabilities: string[] | undefined): boolean {
   return Array.isArray(capabilities) && capabilities.includes('thinking');
+}
+
+function getArgValue(flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  if (index === -1 || index + 1 >= args.length) {
+    return undefined;
+  }
+
+  const next = args[index + 1];
+  return next.startsWith('--') ? undefined : next;
+}
+
+function hasArg(flag: string): boolean {
+  return args.includes(flag);
+}
+
+function normalizeActionName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+interface SmokeRunStartedState {
+  agentProtocol: string;
+  workflow?: { workflowType?: string };
+}
+
+interface SmokeRunSummaryState {
+  workflow?: { workflowType?: string; status?: string };
+  summary?: string;
+  git?: { changedFiles: number; addedLines: number; removedLines: number };
+}
+
+function formatAgentSmokeRuntimeError(error: unknown, details: {
+  task: string;
+  protocol: string;
+  model: string;
+  agentModel: string;
+  summaryModel: string;
+}): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const lines = [
+    'Smoke run failed before completion.',
+    `Task: ${details.task}`,
+    `Protocol: ${details.protocol}`,
+    `Model: ${details.model}`,
+    `Agent model: ${details.agentModel}`,
+    `Summary model: ${details.summaryModel}`,
+    `Error: ${message}`,
+  ];
+
+  if (/requires more system memory|out of memory|not enough memory/i.test(message)) {
+    lines.push('Likely cause: agent model cannot fit in available RAM right now.');
+    lines.push('Try closing other apps, unloading other Ollama models, or set HARNESS_AGENT_MODEL=gemma4:e4b for smoke-only verification.');
+  } else if (/not installed/i.test(message)) {
+    lines.push('Likely cause: configured agent model is not installed in Ollama.');
+  } else if (/lifecycle control is unavailable/i.test(message)) {
+    lines.push('Likely cause: current provider cannot list/load/unload Ollama models.');
+  }
+
+  return new Error(lines.join('\n'));
+}
+
+function createSmokeEngine(agentProtocol: 'native_tools' | 'action_dsl' | 'workflow_runner') {
+  const baseUrl = process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1';
+  return new CoreEngine({
+    workspaceRoot: process.cwd(),
+    profile: 'fast',
+    baseUrl,
+    model: process.env.HARNESS_MODEL || process.env.OPENAI_MODEL || 'gemma4:e4b',
+    agentModel: process.env.HARNESS_AGENT_MODEL || process.env.OPENAI_MODEL || 'VladimirGav/gemma4-26b-16GB-VRAM:latest',
+    summaryModel: process.env.HARNESS_SUMMARY_MODEL || process.env.HARNESS_MODEL || process.env.OPENAI_MODEL || 'gemma4:e4b',
+    agentProtocol,
+    agentKeepAlive: process.env.HARNESS_AGENT_KEEP_ALIVE || '90s',
+  });
 }
 
 async function listSkills() {
@@ -272,6 +345,176 @@ async function handleConfig() {
   }
 
   printOutput(engine.getPublicConfig());
+}
+
+async function handleAgentSmoke() {
+  const task = getArgValue('--task');
+  if (!task) {
+    throw new Error('Usage: harness agent-smoke --task "<prompt>" [--require-action <name>] [--require-approval] [--require-diff] [--workflow <name>]');
+  }
+
+  const requireAction = getArgValue('--require-action');
+  const requireWorkflow = getArgValue('--workflow');
+  const requireApproval = hasArg('--require-approval');
+  const requireDiff = hasArg('--require-diff');
+  const normalizedRequireAction = requireAction ? normalizeActionName(requireAction) : '';
+  const agentProtocol: 'native_tools' | 'action_dsl' | 'workflow_runner' = requireWorkflow
+    ? 'workflow_runner'
+    : normalizedRequireAction === 'readfile'
+      ? 'workflow_runner'
+    : (process.env.HARNESS_AGENT_PROTOCOL as 'native_tools' | 'action_dsl' | 'workflow_runner' | undefined) || 'action_dsl';
+  const smokeEngine = createSmokeEngine(agentProtocol);
+  const startedAt = Date.now();
+  const toolEvents: Array<{ id: string; name: string; state: 'start' | 'done'; inputSummary: string; output?: string; success?: boolean }> = [];
+  const approvalEvents: Array<{ id: string; target: string; preview: string }> = [];
+  const approvalIds = new Set<string>();
+  let firstApprovalPreview = '';
+  let firstTokenMs = 0;
+  let sawToken = false;
+  let responseText = '';
+  let runStarted: SmokeRunStartedState | null = null;
+  let runSummary: SmokeRunSummaryState | null = null;
+
+  smokeEngine.on('approval_requested', (event: { id: string; target: string; preview: string }) => {
+    if (!approvalIds.has(event.id)) {
+      approvalIds.add(event.id);
+      approvalEvents.push(event);
+    }
+    if (!firstApprovalPreview && event.preview) {
+      firstApprovalPreview = event.preview;
+    }
+    smokeEngine.resolveApproval(event.id, true);
+  });
+
+  try {
+    await smokeEngine.chatStream([
+      { role: 'user', content: task },
+    ], {
+      onDelta: (delta: string) => {
+        if (!sawToken) {
+          sawToken = true;
+          firstTokenMs = Date.now() - startedAt;
+        }
+        responseText += delta;
+      },
+      onTool: (event) => {
+        toolEvents.push(event);
+      },
+      onApproval: (event) => {
+        const id = event.approval.id;
+        if (!approvalIds.has(id)) {
+          approvalIds.add(id);
+          approvalEvents.push({
+            id,
+            target: event.approval.target || '',
+            preview: event.approval.diffPreview || '',
+          });
+        }
+        if (event.approval.diffPreview?.trim()) {
+          firstApprovalPreview = event.approval.diffPreview;
+        }
+      },
+      onRunStarted: (event) => {
+        runStarted = {
+          agentProtocol: event.agentProtocol,
+          workflow: event.workflow ? { workflowType: event.workflow.workflowType } : undefined,
+        };
+      },
+      onRunSummary: (event) => {
+        runSummary = {
+          workflow: event.summary.workflow ? {
+            workflowType: event.summary.workflow.workflowType,
+            status: event.summary.workflow.status,
+          } : undefined,
+          summary: event.summary.summary,
+          git: event.summary.git,
+        };
+      },
+    }, { think: false });
+  } catch (error) {
+    throw formatAgentSmokeRuntimeError(error, {
+      task,
+      protocol: agentProtocol,
+      model: smokeEngine.getPublicConfig().model,
+      agentModel: smokeEngine.getPublicConfig().agentModel,
+      summaryModel: smokeEngine.getPublicConfig().summaryModel,
+    });
+  }
+
+  if (!sawToken) {
+    firstTokenMs = Date.now() - startedAt;
+  }
+
+  const session = smokeEngine.getSession();
+  const latestRun = session?.turnHistory?.[session.turnHistory.length - 1]?.runSummary;
+  const traceTelemetry = summarizeTraceTelemetry(smokeEngine.getTraceLog());
+  const normalizedExpectedAction = requireAction ? normalizeActionName(requireAction) : '';
+  const observedActionNames = new Set([
+    ...toolEvents.map((event) => normalizeActionName(event.name)),
+    ...(latestRun?.steps || []).map((step) => normalizeActionName(step.toolName || step.title || '')),
+  ].filter((entry) => entry.length > 0));
+  const startedSnapshot = runStarted as SmokeRunStartedState | null;
+  const summarySnapshot = runSummary as SmokeRunSummaryState | null;
+  const actualWorkflow = latestRun?.workflow?.workflowType
+    || startedSnapshot?.workflow?.workflowType
+    || summarySnapshot?.workflow?.workflowType;
+  const actualWorkflowStatus = latestRun?.workflow?.status
+    || summarySnapshot?.workflow?.status;
+  const failures: string[] = [];
+
+  if (requireAction && !observedActionNames.has(normalizedExpectedAction)) {
+    failures.push(`Expected action ${requireAction}, saw ${Array.from(observedActionNames).join(', ') || 'none'}.`);
+  }
+  if (requireApproval && approvalEvents.length === 0) {
+    failures.push('Expected approval, but none was requested.');
+  }
+  if (requireDiff && !firstApprovalPreview.trim()) {
+    failures.push('Expected diff preview, but approval preview was empty.');
+  }
+  if (requireWorkflow && actualWorkflow !== requireWorkflow) {
+    failures.push(`Expected workflow ${requireWorkflow}, got ${actualWorkflow || 'none'}.`);
+  }
+  if (!latestRun) {
+    failures.push('No run summary was recorded.');
+  }
+
+  const result = {
+    ok: failures.length === 0,
+    task,
+    protocol: agentProtocol,
+    model: smokeEngine.getPublicConfig().model,
+    agentModel: smokeEngine.getPublicConfig().agentModel,
+    summaryModel: smokeEngine.getPublicConfig().summaryModel,
+    firstTokenMs,
+    totalMs: Date.now() - startedAt,
+    toolCount: toolEvents.length,
+    approvals: approvalEvents.length,
+    diffPreview: firstApprovalPreview || null,
+    responsePreview: responseText.slice(0, 240),
+    workflow: actualWorkflow || null,
+    workflowStatus: actualWorkflowStatus || null,
+    summary: latestRun?.summary || summarySnapshot?.summary || null,
+    parseFailureCount: traceTelemetry.parseFailureCount,
+    routingNotes: traceTelemetry.routingNotes,
+    memoryNotes: traceTelemetry.memoryNotes,
+    observedActions: Array.from(observedActionNames),
+  };
+
+  if (failures.length > 0) {
+    throw new Error([
+      'Smoke test failed.',
+      ...failures,
+      `Observed actions: ${result.observedActions.join(', ') || 'none'}`,
+      `Approvals: ${result.approvals}`,
+      `Diff preview: ${result.diffPreview ? 'present' : 'missing'}`,
+      `Workflow: ${result.workflow || 'none'}${result.workflowStatus ? ` (${result.workflowStatus})` : ''}`,
+      `Parse failures: ${result.parseFailureCount}`,
+      ...(result.routingNotes.length > 0 ? [`Routing notes: ${result.routingNotes.join(' | ')}`] : []),
+      ...(result.memoryNotes.length > 0 ? [`Memory notes: ${result.memoryNotes.join(' | ')}`] : []),
+    ].join('\n'));
+  }
+
+  printOutput(result);
 }
 
 function startRepl() {
@@ -533,6 +776,9 @@ async function main() {
     case 'benchmark':
       printOutput(await runBenchmarks({ quiet: isJson }));
       return;
+    case 'agent-smoke':
+      await handleAgentSmoke();
+      return;
     case 'prompt':
       await handlePrompt();
       return;
@@ -558,7 +804,7 @@ async function main() {
       await handleConfig();
       return;
     default:
-      throw new Error('Available commands: doctor | benchmark | prompt | chat | session | workspace | skills | model | config');
+      throw new Error('Available commands: doctor | benchmark | agent-smoke | prompt | chat | session | workspace | skills | model | config');
   }
 }
 

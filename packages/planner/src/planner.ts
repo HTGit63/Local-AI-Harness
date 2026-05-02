@@ -44,6 +44,7 @@ export class Planner {
     patch: Partial<
       Pick<
         PlanState,
+        | 'agentProtocol'
         | 'workspaceRoot'
         | 'workspaceSource'
         | 'workspaceBound'

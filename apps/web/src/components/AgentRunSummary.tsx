@@ -1,3 +1,5 @@
+import { summarizeWorkflowProgress } from '../lib/run-console';
+
 interface AgentRunLineStats {
   changedFiles: number;
   addedLines: number;
@@ -20,7 +22,21 @@ interface AgentRunMetrics {
   totalMs?: number;
 }
 
+interface WorkflowSummaryData {
+  workflowId: string;
+  workflowType: string;
+  status: string;
+  currentStepId?: string | null;
+  steps: Array<{ id: string; title: string; type: string; status: string }>;
+  filesRead: string[];
+  filesChanged: string[];
+  approvals: string[];
+  commands: string[];
+  errors: string[];
+}
+
 export interface AgentRunSummaryData {
+  agentProtocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
   workspaceSource: 'backend' | 'browser_snapshot';
   workspaceBound: boolean;
   filesRead: string[];
@@ -38,6 +54,7 @@ export interface AgentRunSummaryData {
   fallbackReason?: string;
   metrics?: AgentRunMetrics;
   summary?: string;
+  workflow?: WorkflowSummaryData;
 }
 
 function formatDuration(totalMs?: number): string {
@@ -80,6 +97,13 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
         {run.summary || 'Structured run summary available.'}
       </div>
       <div className="tool-call-list">
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Protocol</span>
+            <span className="tool-call-state">{run.agentProtocol || 'native_tools'}</span>
+          </div>
+          <div className="tool-call-input">Selected protocol for this run.</div>
+        </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
             <span className="tool-call-name">Worked for</span>
@@ -136,6 +160,17 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
           </div>
           <div className="tool-call-input">{run.fallbackReason || 'native path held'}</div>
         </div>
+        {run.workflow && (
+          <div className="tool-call-card tool-call-card-done">
+            <div className="tool-call-card-top">
+              <span className="tool-call-name">Workflow</span>
+              <span className="tool-call-state">{run.workflow.status}</span>
+            </div>
+            <div className="tool-call-input">
+              {summarizeWorkflowProgress(run.workflow)}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -27,6 +27,7 @@ async function testConfigDefaults() {
   assert.strictEqual(config.model, 'gemma4:e4b');
   assert.strictEqual(config.mode, 'workspace-write');
   assert.strictEqual(config.profile, 'fast');
+  assert.strictEqual(config.agentProtocol, 'native_tools');
   assert.strictEqual(config.contextBudget, 24000);
   assert.strictEqual(config.toolRetryMax, 2);
   assert.strictEqual(config.sessionMemoryEnabled, true);
@@ -136,17 +137,108 @@ async function testModelAdapterPrefersNativeOllamaChat() {
   }
 }
 
+async function testEngineRoutesAgenticRunsThroughThe26BModel() {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body: any }> = [];
+  const mockFetch = createMockFetch({
+    initialRunningModels: [
+      { name: 'deepseek-coder-v2:latest', model: 'deepseek-coder-v2:latest', context_length: 4096 },
+    ],
+  });
+
+  globalThis.fetch = (async (url: any, opts?: any) => {
+    const requestUrl = String(url);
+    const parsedBody = typeof opts?.body === 'string' && opts.body.trim() ? JSON.parse(opts.body) : undefined;
+    requests.push({ url: requestUrl, body: parsedBody });
+    return mockFetch(requestUrl, opts);
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine();
+    await engine.updateConfig({ agentProtocol: 'native_tools' });
+    const runtimeBefore = await engine.getModelRuntime();
+    assert.strictEqual(runtimeBefore.agentModel, 'VladimirGav/gemma4-26b-16GB-VRAM:latest');
+    assert.strictEqual(runtimeBefore.agentModelActive, false);
+
+    const response = await engine.chat([
+      { role: 'user', content: 'Tell me a short joke about llamas.' },
+    ]);
+
+    assertAgenticResponse(response, MOCK_CHAT_RESPONSE.choices[0].message.content);
+
+    const runtimeAfter = await engine.getModelRuntime();
+    assert.strictEqual(runtimeAfter.agentModel, 'VladimirGav/gemma4-26b-16GB-VRAM:latest');
+    assert.strictEqual(runtimeAfter.activeModel, 'VladimirGav/gemma4-26b-16GB-VRAM:latest');
+    assert.strictEqual(runtimeAfter.agentModelActive, true);
+    assert.strictEqual(runtimeAfter.lastRouteSelection?.model, 'VladimirGav/gemma4-26b-16GB-VRAM:latest');
+    assert.strictEqual(runtimeAfter.lastRouteSelection?.keepAlive, '90s');
+
+    const traceTypes = engine.getTraceLog().map((entry) => entry.type);
+    assert.ok(traceTypes.includes('model_route_selected'));
+    assert.ok(traceTypes.includes('agent_protocol_selected'));
+    assert.ok(traceTypes.includes('heavy_model_lock_acquired'));
+    assert.ok(traceTypes.includes('heavy_model_lock_released'));
+    assert.ok(traceTypes.includes('model_warmup_completed'));
+    assert.ok(traceTypes.includes('model_unload_attempted'));
+
+    const warmupRequest = requests.find((entry) => entry.url.includes('/api/generate') && entry.body?.keep_alive === '90s');
+    assert.ok(warmupRequest, 'Expected agent warmup request with short keep_alive.');
+    assert.strictEqual(warmupRequest?.body?.model, 'VladimirGav/gemma4-26b-16GB-VRAM:latest');
+
+    const unloadRequest = requests.find((entry) => entry.url.includes('/api/generate') && entry.body?.keep_alive === 0);
+    assert.ok(unloadRequest, 'Expected unrelated model unload request.');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function testEnginePromptRecipeSelection() {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = createMockFetch() as typeof fetch;
 
   try {
     const engine = new CoreEngine();
+    await engine.updateConfig({ agentProtocol: 'native_tools' });
     const response = await engine.chat([
       { role: 'user', content: 'Review this diff for regressions' },
     ]);
     assertAgenticResponse(response, MOCK_CHAT_RESPONSE.choices[0].message.content);
     assert.ok(engine.getTraceLog().some((entry) => entry.type === 'prompt_recipe_selected'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testEngineUsesActionDslProtocol() {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = createMockFetch({
+    chatResponder() {
+      return {
+        id: 'mock-action-dsl',
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: '{"kind":"final","summary":"Action DSL completed","filesChanged":[],"verification":"checked"}',
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine();
+    await engine.updateConfig({ agentProtocol: 'action_dsl' });
+    const response = await engine.chat([
+      { role: 'user', content: 'Summarize the action dsl path' },
+    ]);
+
+    assert.ok(response.startsWith('Action DSL completed'));
+    assert.ok(response.includes('What I did:'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'action_dsl_protocol_selected'));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -546,7 +638,7 @@ async function testEngineRecoversFromPlanningOnlyNativeReply() {
   }
 }
 
-async function testEngineUsesManualToolProtocolWhenModelLacksNativeTools() {
+async function testEngineUsesManualToolProtocolWhenAgentModelLacksNativeTools() {
   const originalFetch = globalThis.fetch;
   const chatRequests: any[] = [];
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-manual-tools-'));
@@ -573,7 +665,11 @@ async function testEngineUsesManualToolProtocolWhenModelLacksNativeTools() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ workspaceRoot, model: 'deepseek-coder-v2:latest' });
+    const engine = new CoreEngine({
+      workspaceRoot,
+      model: 'deepseek-coder-v2:latest',
+      agentModel: 'deepseek-coder-v2:latest',
+    });
     const response = await engine.chat([
       { role: 'user', content: 'Inspect src/index.ts and answer with its content' },
     ]);
@@ -1237,7 +1333,9 @@ async function run() {
   testWorkspacePolicy();
   await testModelAdapter();
   await testModelAdapterPrefersNativeOllamaChat();
+  await testEngineRoutesAgenticRunsThroughThe26BModel();
   await testEnginePromptRecipeSelection();
+  await testEngineUsesActionDslProtocol();
   await testEngineSanitizesDisabledSkills();
   await testEngineChatStream();
   await testEngineChatStreamEmitsToolEvents();
@@ -1249,7 +1347,7 @@ async function run() {
   await testEnginePrefersNativeToolsForGemmaTargetedEdits();
   await testEngineKeepsNativeToolsWhenCapabilitiesOmitTools();
   await testEngineRecoversFromPlanningOnlyNativeReply();
-  await testEngineUsesManualToolProtocolWhenModelLacksNativeTools();
+  await testEngineUsesManualToolProtocolWhenAgentModelLacksNativeTools();
   await testEngineAnswersRepoOverviewFromLocalInventory();
   await testEngineAnswersRootManifestNameFromLocalInventory();
   await testEngineDoesNotShortCircuitWritePromptsThatMentionProjectMetadata();

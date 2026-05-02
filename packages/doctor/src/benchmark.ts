@@ -37,6 +37,7 @@ interface TurnTiming {
   firstDeltaMs: number;
   statusCount: number;
   deltaCount: number;
+  toolCount: number;
   executionCount: number;
   responseLength: number;
   responsePreview: string;
@@ -44,8 +45,14 @@ interface TurnTiming {
 }
 
 export interface BenchmarkScenarioResult extends BenchmarkScenario {
+  protocol: 'direct' | 'agentic';
   cold: TurnTiming;
   warm: TurnTiming;
+  telemetry: {
+    parseFailureCount: number;
+    routingNotes: string[];
+    memoryNotes: string[];
+  };
 }
 
 export interface BenchmarkResults {
@@ -65,6 +72,12 @@ export interface BenchmarkResults {
     toolLoopLatency: number;
     uiEventLag: number;
   };
+}
+
+interface TraceEventLike {
+  type: string;
+  data: unknown;
+  timestamp?: number;
 }
 
 function resolveApiBaseUrl(options: BenchmarkOptions): string {
@@ -129,12 +142,88 @@ function extractString(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
+function extractTraceData(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+export function summarizeTraceTelemetry(events: TraceEventLike[]) {
+  const routingNotes = new Set<string>();
+  const memoryNotes = new Set<string>();
+  let parseFailureCount = 0;
+
+  for (const event of events) {
+    const data = extractTraceData(event.data);
+    switch (event.type) {
+      case 'action_dsl_parse_failed':
+        parseFailureCount += 1;
+        if (typeof data?.error === 'object' && data.error) {
+          const error = data.error as { code?: unknown; message?: unknown };
+          const code = typeof error.code === 'string' ? error.code : 'unknown';
+          const message = typeof error.message === 'string' ? error.message : '';
+          routingNotes.add(`Action DSL parse failed: ${code}${message ? ` (${message})` : ''}`);
+        }
+        break;
+      case 'action_dsl_repair_started':
+        routingNotes.add(`Action DSL repair attempt ${typeof data?.attempt === 'number' ? data.attempt : ''}`.trim());
+        break;
+      case 'action_dsl_repair_succeeded':
+        routingNotes.add(`Action DSL repair succeeded${typeof data?.attempt === 'number' ? ` on attempt ${data.attempt}` : ''}`);
+        break;
+      case 'model_route_selected':
+        routingNotes.add(
+          typeof data?.reason === 'string'
+            ? data.reason
+            : `Route ${extractString(data?.protocol) || 'agent'} → ${extractString(data?.agentModel) || 'model'}`,
+        );
+        break;
+      case 'action_dsl_protocol_selected':
+        routingNotes.add('Action DSL protocol selected');
+        break;
+      case 'manual_tool_fallback':
+        routingNotes.add(`Manual tool fallback: ${extractString(data?.reason) || 'enabled'}`);
+        break;
+      case 'manual_tool_strategy_selected':
+        routingNotes.add(`Manual tool strategy selected: ${extractString(data?.reason) || 'forced'}`);
+        break;
+      case 'heavy_model_lock_acquired':
+        memoryNotes.add(`Heavy model lock acquired${typeof data?.queued === 'number' ? ` (queued ${data.queued})` : ''}`);
+        break;
+      case 'heavy_model_lock_released':
+        memoryNotes.add('Heavy model lock released');
+        break;
+      case 'model_warmup_completed':
+        {
+          const route = data?.route && typeof data.route === 'object'
+            ? data.route as { model?: unknown }
+            : undefined;
+          memoryNotes.add(`Model warmup completed for ${extractString(route?.model) || 'agent model'}`);
+        }
+        break;
+      case 'stream_idle_timeout_retry':
+        memoryNotes.add(`Stream stalled after ${typeof data?.timeoutMs === 'number' ? data.timeoutMs : 0}ms`);
+        break;
+      case 'stream_idle_timeout_partial':
+        memoryNotes.add(`Stream stalled after ${typeof data?.timeoutMs === 'number' ? data.timeoutMs : 0}ms with partial output`);
+        break;
+      default:
+        break;
+    }
+  }
+
+  return {
+    parseFailureCount,
+    routingNotes: Array.from(routingNotes),
+    memoryNotes: Array.from(memoryNotes),
+  };
+}
+
 async function measureChatTurn(apiBaseUrl: string, scenario: BenchmarkScenario, timeoutMs: number): Promise<TurnTiming> {
   const startedAt = Date.now();
   let firstDeltaMs = 0;
   let seenVisibleEvent = false;
   let statusCount = 0;
   let deltaCount = 0;
+  let toolCount = 0;
   let executionCount = 0;
   let responseText = '';
 
@@ -215,6 +304,11 @@ async function measureChatTurn(apiBaseUrl: string, scenario: BenchmarkScenario, 
             continue;
           }
 
+          if (eventType === 'tool') {
+            toolCount += 1;
+            continue;
+          }
+
           if (eventType === 'done') {
             const doneResponse = extractString(event.response);
             if (doneResponse) {
@@ -252,6 +346,8 @@ async function measureChatTurn(apiBaseUrl: string, scenario: BenchmarkScenario, 
               deltaCount += 1;
               responseText += delta;
             }
+          } else if (eventType === 'tool') {
+            toolCount += 1;
           } else if (eventType === 'done') {
             const doneResponse = extractString(event.response);
             if (doneResponse) {
@@ -273,6 +369,7 @@ async function measureChatTurn(apiBaseUrl: string, scenario: BenchmarkScenario, 
       firstDeltaMs: seenVisibleEvent ? firstDeltaMs : totalMs,
       statusCount,
       deltaCount,
+      toolCount,
       executionCount,
       responseLength: responseText.length,
       responsePreview: responseText.slice(0, 120),
@@ -286,6 +383,7 @@ async function measureChatTurn(apiBaseUrl: string, scenario: BenchmarkScenario, 
       firstDeltaMs: seenVisibleEvent ? firstDeltaMs : totalMs,
       statusCount,
       deltaCount,
+      toolCount,
       executionCount,
       responseLength: responseText.length,
       responsePreview: responseText.slice(0, 120),
@@ -294,13 +392,44 @@ async function measureChatTurn(apiBaseUrl: string, scenario: BenchmarkScenario, 
   }
 }
 
+async function readLatestTraceTimestamp(apiBaseUrl: string): Promise<number> {
+  try {
+    const response = await fetch(`${apiBaseUrl}/trace?limit=1`);
+    if (!response.ok) {
+      return 0;
+    }
+    const trace = await response.json() as TraceEventLike[];
+    const last = Array.isArray(trace) && trace.length > 0 ? trace[trace.length - 1] : null;
+    return typeof last?.timestamp === 'number' ? last.timestamp : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function readTraceEventsSince(apiBaseUrl: string, since: number): Promise<TraceEventLike[]> {
+  try {
+    const response = await fetch(`${apiBaseUrl}/trace?since=${since}`);
+    if (!response.ok) {
+      return [];
+    }
+    const trace = await response.json() as TraceEventLike[];
+    return Array.isArray(trace) ? trace : [];
+  } catch {
+    return [];
+  }
+}
+
 async function measureScenario(apiBaseUrl: string, scenario: BenchmarkScenario, timeoutMs: number): Promise<BenchmarkScenarioResult> {
+  const traceSince = await readLatestTraceTimestamp(apiBaseUrl);
   const cold = await measureChatTurn(apiBaseUrl, scenario, timeoutMs);
   const warm = await measureChatTurn(apiBaseUrl, scenario, timeoutMs);
+  const telemetry = summarizeTraceTelemetry(await readTraceEventsSince(apiBaseUrl, traceSince));
   return {
     ...scenario,
+    protocol: scenario.agentic ? 'agentic' : 'direct',
     cold,
     warm,
+    telemetry,
   };
 }
 
@@ -353,7 +482,7 @@ async function measureSupportMetrics(): Promise<BenchmarkResults['support']> {
 }
 
 function formatTurnTiming(turn: TurnTiming): string {
-  const base = `${turn.totalMs}ms total / ${turn.firstDeltaMs}ms first token / ${turn.statusCount} status / ${turn.deltaCount} delta / ${turn.executionCount} execution`;
+  const base = `${turn.totalMs}ms total / ${turn.firstDeltaMs}ms first token / ${turn.statusCount} status / ${turn.deltaCount} delta / ${turn.toolCount} tool / ${turn.executionCount} execution`;
   if (turn.ok) {
     return `${base} / ${turn.responseLength} chars`;
   }
@@ -362,10 +491,19 @@ function formatTurnTiming(turn: TurnTiming): string {
 }
 
 function printScenarioResult(result: BenchmarkScenarioResult) {
-  console.log(`- ${result.name} (${result.agentic ? 'agentic' : 'direct'}, think ${result.thinking ? 'on' : 'off'})`);
+  console.log(`- ${result.name}`);
+  console.log(`  protocol: ${result.protocol}`);
+  console.log(`  think: ${result.thinking ? 'on' : 'off'}`);
   console.log(`  note: ${result.note}`);
   console.log(`  cold: ${formatTurnTiming(result.cold)}`);
   console.log(`  warm: ${formatTurnTiming(result.warm)}`);
+  console.log(`  parse failures: ${result.telemetry.parseFailureCount}`);
+  if (result.telemetry.routingNotes.length > 0) {
+    console.log(`  routing: ${result.telemetry.routingNotes.join(' | ')}`);
+  }
+  if (result.telemetry.memoryNotes.length > 0) {
+    console.log(`  memory: ${result.telemetry.memoryNotes.join(' | ')}`);
+  }
 }
 
 export async function runBenchmarks(options: BenchmarkOptions = {}): Promise<BenchmarkResults> {

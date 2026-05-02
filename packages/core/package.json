@@ -8,10 +8,13 @@
   },
   "dependencies": {
     "@local-harness/model-adapter": "file:../model-adapter",
+    "@local-harness/model-router": "file:../model-router",
     "@local-harness/workspace-policy": "file:../workspace-policy",
     "@local-harness/session-store": "file:../session-store",
     "@local-harness/trace-bus": "file:../trace-bus",
     "@local-harness/tool-runtime": "file:../tool-runtime",
+    "@local-harness/action-dsl": "file:../action-dsl",
+    "@local-harness/workflow-runner": "file:../workflow-runner",
     "@local-harness/planner": "file:../planner",
     "@local-harness/approval-workflow": "file:../approval-workflow",
     "@local-harness/prompt-recipes": "file:../prompt-recipes",

@@ -455,6 +455,25 @@ const server = http.createServer(async (req, res) => {
         sendBadRequest(req, res, 'model must be a string.');
         return;
       }
+      if (body.agentModel !== undefined && typeof body.agentModel !== 'string') {
+        sendBadRequest(req, res, 'agentModel must be a string.');
+        return;
+      }
+      if (body.summaryModel !== undefined && typeof body.summaryModel !== 'string') {
+        sendBadRequest(req, res, 'summaryModel must be a string.');
+        return;
+      }
+      if (
+        body.agentProtocol !== undefined &&
+        (typeof body.agentProtocol !== 'string' || !new Set(['native_tools', 'action_dsl', 'workflow_runner']).has(body.agentProtocol))
+      ) {
+        sendBadRequest(req, res, 'agentProtocol must be one of native_tools, action_dsl, or workflow_runner.');
+        return;
+      }
+      if (body.agentKeepAlive !== undefined && typeof body.agentKeepAlive !== 'string') {
+        sendBadRequest(req, res, 'agentKeepAlive must be a string.');
+        return;
+      }
       if (body.workspaceRoot !== undefined && typeof body.workspaceRoot !== 'string') {
         sendBadRequest(req, res, 'workspaceRoot must be a string.');
         return;

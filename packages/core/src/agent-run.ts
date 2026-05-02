@@ -10,6 +10,7 @@ import {
   AgentRunStepType,
   AgentRunWebFetch,
   AgentRunWebSearch,
+  WorkflowState,
 } from '@local-harness/session-store';
 import { ToolResultMetadata } from '@local-harness/tool-runtime';
 
@@ -67,8 +68,30 @@ function mergeLineStats(current: AgentRunLineStats | undefined, incoming?: Agent
   };
 }
 
+function cloneWorkflowState(workflow: WorkflowState | undefined): WorkflowState | undefined {
+  if (!workflow) {
+    return undefined;
+  }
+
+  return {
+    ...workflow,
+    steps: workflow.steps.map((step) => ({ ...step })),
+    filesRead: [...workflow.filesRead],
+    filesChanged: [...workflow.filesChanged],
+    approvals: [...workflow.approvals],
+    commands: [...workflow.commands],
+    errors: [...workflow.errors],
+  };
+}
+
 export function summarizeRun(run: AgentRun): string {
   const facts: string[] = [];
+  if (run.agentProtocol) {
+    facts.push(`protocol ${run.agentProtocol}`);
+  }
+  if (run.workflow) {
+    facts.push(`workflow ${run.workflow.workflowType} (${run.workflow.status})`);
+  }
   if (run.filesRead.length > 0 || run.directoriesRead.length > 0) {
     const pieces: string[] = [];
     if (run.filesRead.length > 0) pieces.push(`${run.filesRead.length} file${run.filesRead.length === 1 ? '' : 's'}`);
@@ -130,6 +153,7 @@ export class AgentRunBuilder {
       approvals: [...run.approvals],
       metrics: run.metrics ? { ...run.metrics } : undefined,
       git: run.git ? { ...run.git } : undefined,
+      workflow: cloneWorkflowState(run.workflow),
     };
   }
 
@@ -149,6 +173,7 @@ export class AgentRunBuilder {
       approvals: this.run.approvals.map((entry) => ({ ...entry })),
       metrics: this.run.metrics ? { ...this.run.metrics } : undefined,
       git: this.run.git ? { ...this.run.git } : undefined,
+      workflow: cloneWorkflowState(this.run.workflow),
     };
   }
 
@@ -243,6 +268,10 @@ export class AgentRunBuilder {
     if (git) {
       this.run.git = git;
     }
+  }
+
+  setWorkflowState(workflow: WorkflowState | undefined) {
+    this.run.workflow = cloneWorkflowState(workflow);
   }
 
   finalize(params: { finalAnswer?: string; summary?: string; error?: string }) {

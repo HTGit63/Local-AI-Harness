@@ -16,6 +16,7 @@ export const MOCK_MODEL_LIST = {
     { id: 'deepseek-coder-v2:latest', object: 'model', owned_by: 'local' },
     { id: 'qwen3.5:9b-q4_K_M', object: 'model', owned_by: 'local' },
     { id: 'gemma4:e4b', object: 'model', owned_by: 'local' },
+    { id: 'VladimirGav/gemma4-26b-16GB-VRAM:latest', object: 'model', owned_by: 'local' },
   ]
 };
 
@@ -24,12 +25,14 @@ export const MOCK_MODEL_CAPABILITIES: Record<string, string[]> = {
   'gemma4:e4b': ['completion', 'vision', 'audio', 'tools', 'thinking'],
   'qwen3.5:9b-q4_K_M': ['completion', 'vision', 'tools', 'thinking'],
   'deepseek-coder-v2:latest': ['completion', 'insert'],
+  'VladimirGav/gemma4-26b-16GB-VRAM:latest': ['completion', 'vision', 'tools', 'thinking'],
 };
 
 interface MockFetchOptions {
   chatResponder?: (body: any) => any;
   onChatRequest?: (body: any) => void;
   showResponder?: (body: any) => any;
+  initialRunningModels?: Array<{ name: string; model: string; context_length: number }>;
 }
 
 function encodeStreamChunks(chunks: string[]): ReadableStream<Uint8Array> {
@@ -170,7 +173,7 @@ function createNativeStreamingChatBody(response: typeof MOCK_CHAT_RESPONSE): Rea
 }
 
 export function createMockFetch(options: MockFetchOptions = {}) {
-  let runningModels: Array<{ name: string; model: string; context_length: number }> = [];
+  let runningModels: Array<{ name: string; model: string; context_length: number }> = [...(options.initialRunningModels || [])];
 
   return async (url: string, opts?: any) => {
     const rawBody = typeof opts?.body === 'string' ? opts.body : '';

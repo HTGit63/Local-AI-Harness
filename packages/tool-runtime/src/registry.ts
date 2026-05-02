@@ -854,6 +854,20 @@ export class ToolRegistry {
     });
   }
 
+  async previewPatch(filePath: string, oldContent: string, newContent: string): Promise<ToolResult> {
+    return this.wrapExecution('patch_preview', `Previewing patch for ${filePath}`, async () => {
+      const diff = await buildDiffPreview(filePath, oldContent, newContent);
+      return {
+        success: true,
+        output: diff.preview,
+        preview: diff.preview,
+        metadata: {
+          lineStats: diff.lineStats,
+        },
+      };
+    });
+  }
+
   async makeDir(dirPath: string): Promise<ToolResult> {
     return this.wrapExecution('make_dir', `Creating directory ${dirPath}`, async () => {
       const policy = this.context.checkPolicy('write', dirPath);

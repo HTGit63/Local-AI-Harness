@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import { ChatMessageRow } from './components/ChatMessageRow';
 import { useStreamingBuffer } from './hooks/useStreamingBuffer';
+import {
+  formatModelRuntimeSummary,
+  formatTraceHeadline,
+  summarizeActionDslTraceState,
+} from './lib/run-console';
 
 /* ─────────── API helpers ─────────── */
 function getApiBase(): string {
@@ -66,6 +71,10 @@ interface ComposerImageAttachment extends MessageImageAttachment {
 interface ConfigState {
   baseUrl: string;
   model: string;
+  agentModel: string;
+  summaryModel: string;
+  agentProtocol: 'native_tools' | 'action_dsl' | 'workflow_runner';
+  agentKeepAlive: string;
   profile: string;
   mode: string;
   workspaceRoot: string;
@@ -130,6 +139,7 @@ interface PlanState {
   blockers: string[];
   isComplete: boolean;
   finalOutcome?: string;
+  agentProtocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
   workspaceRoot?: string;
   workspaceSource?: 'backend' | 'browser_snapshot';
   workspaceBound?: boolean;
@@ -196,6 +206,22 @@ interface ModelRuntimeState {
   availableModels: AvailableModel[];
   supportsLifecycle: boolean;
   configuredModelCapabilities?: string[];
+  agentModel?: string;
+  summaryModel?: string;
+  agentProtocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
+  agentModelActive?: boolean;
+  heavyModelLock?: {
+    held: boolean;
+    ownerRunId: string | null;
+    queued: number;
+  };
+  lastRouteSelection?: {
+    role: 'fast' | 'agent' | 'coding' | 'review' | 'summary';
+    model: string;
+    protocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
+    keepAlive?: string | number;
+    reason?: string;
+  };
   lastSwitchResult?: {
     message: string;
     previousModel: string | null;
@@ -232,6 +258,7 @@ interface AgentRunStep {
 interface AgentRunSummary {
   id: string;
   intent: string;
+  agentProtocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
   workspaceSource: 'backend' | 'browser_snapshot';
   workspaceBound: boolean;
   browserContextActive: boolean;
@@ -258,6 +285,20 @@ interface AgentRunSummary {
   fallbackReason?: string;
   summary?: string;
   steps: AgentRunStep[];
+  workflow?: {
+    workflowId: string;
+    workflowType: string;
+    status: string;
+    currentStepId?: string | null;
+    steps: Array<{ id: string; type: string; title: string; status: string; detail?: string }>;
+    filesRead: string[];
+    filesChanged: string[];
+    approvals: string[];
+    commands: string[];
+    errors: string[];
+    createdAt: number;
+    updatedAt: number;
+  };
 }
 
 interface BrowserFileNode {
@@ -306,7 +347,7 @@ type ChatStreamEvent =
   | { type: 'status'; phase: string; action: string; loop: number }
   | ({ type: 'tool' } & ChatToolEvent)
   | { type: 'approval'; state: 'pending' | 'updated' | 'resolved'; approval: ApprovalItem }
-  | { type: 'run_started'; runId: string; sessionId: string; intent: string; workspaceBound: boolean; browserContextActive: boolean; workspaceSource: 'backend' | 'browser_snapshot'; executionMode: ExecutionMode }
+  | { type: 'run_started'; runId: string; sessionId: string; intent: string; agentProtocol: 'native_tools' | 'action_dsl' | 'workflow_runner'; workspaceBound: boolean; browserContextActive: boolean; workspaceSource: 'backend' | 'browser_snapshot'; executionMode: ExecutionMode }
   | { type: 'run_step'; runId: string; step: AgentRunStep }
   | { type: 'run_metric'; runId: string; metrics: Partial<{ filesRead: number; directoriesRead: number; filesWritten: number; commandsRun: number; searchesRun: number; approvals: number; addedLines: number; removedLines: number; firstTokenMs: number; totalMs: number }> }
   | { type: 'run_summary'; runId: string; summary: AgentRunSummary }
@@ -511,43 +552,6 @@ function summarizeTurnIntent(turn: NonNullable<SessionState['turnHistory']>[numb
   if (turn.runSummary?.summary) return turn.runSummary.summary;
   if (turn.promptMode) return `${turn.executionMode} · ${turn.promptMode}`;
   return `${turn.executionMode} turn`;
-}
-
-function formatTraceHeadline(trace: TraceEntry): string {
-  const data = trace.data as Record<string, any> | undefined;
-  switch (trace.type) {
-    case 'planner_trace':
-      return data?.state?.intendedNextAction || data?.state?.currentPhase || 'Planner updated';
-    case 'run_step_started':
-    case 'run_step_finished':
-      return data?.step?.title || data?.step?.toolName || 'Run step';
-    case 'run_summary_ready':
-      return data?.summary || 'Run summary ready';
-    case 'manual_tool_fallback':
-      return data?.reason || 'Manual fallback active';
-    case 'manual_tool_strategy_selected':
-      return data?.reason || 'Manual tool strategy selected';
-    case 'tool_simulation_detected':
-      return data?.preview || 'Tool simulation detected';
-    case 'stream_idle_timeout_retry':
-      return `Stream stalled after ${data?.timeoutMs ?? 0}ms; retrying non-stream`;
-    case 'stream_idle_timeout_partial':
-      return `Stream stalled after ${data?.timeoutMs ?? 0}ms with partial output`;
-    case 'repo_context_loaded':
-      return `${data?.fileCount ?? 0} files indexed`;
-    case 'chat_execution_plan':
-      return `Intent ${data?.intent || 'unknown'} · ${data?.toolProtocolMode || 'native'} tools`;
-    case 'model_switch_completed':
-      return data?.message || 'Model switch completed';
-    default:
-      return typeof data?.message === 'string'
-        ? data.message
-        : typeof data?.reason === 'string'
-          ? data.reason
-          : typeof data?.summary === 'string'
-            ? data.summary
-            : 'Open for payload';
-  }
 }
 
 function truncatePreview(content: string) {
@@ -979,6 +983,10 @@ function HarnessApp() {
   // Settings drafts
   const [baseUrlDraft, setBaseUrlDraft] = useState('');
   const [modelDraft, setModelDraft] = useState('');
+  const [agentModelDraft, setAgentModelDraft] = useState('');
+  const [summaryModelDraft, setSummaryModelDraft] = useState('');
+  const [agentProtocolDraft, setAgentProtocolDraft] = useState<'native_tools' | 'action_dsl' | 'workflow_runner'>('native_tools');
+  const [agentKeepAliveDraft, setAgentKeepAliveDraft] = useState('90s');
   const [profileDraft, setProfileDraft] = useState('balanced');
   const [modeDraft, setModeDraft] = useState('workspace-write');
   const [workspaceRootDraft, setWorkspaceRootDraft] = useState('');
@@ -994,6 +1002,7 @@ function HarnessApp() {
   // Refs
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const sidebarSearchInputRef = useRef<HTMLInputElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const lastConfigSigRef = useRef('');
   const lastTraceTimestampRef = useRef(0);
@@ -1009,8 +1018,10 @@ function HarnessApp() {
   const modelOptions = useMemo(() => {
     const opts = new Set((modelRuntime?.availableModels || []).map(m => m.id));
     if (modelDraft.trim()) opts.add(modelDraft.trim());
+    if (agentModelDraft.trim()) opts.add(agentModelDraft.trim());
+    if (summaryModelDraft.trim()) opts.add(summaryModelDraft.trim());
     return Array.from(opts);
-  }, [modelDraft, modelRuntime]);
+  }, [agentModelDraft, modelDraft, modelRuntime, summaryModelDraft]);
   const thinkingSupported = useMemo(() => modelRuntime?.configuredModelCapabilities?.includes('thinking') ?? false, [modelRuntime]);
   const thinkingWarning = thinkingEnabled && modelRuntime && !thinkingSupported
     ? 'Thinking unavailable on current model; toggle may be ignored.'
@@ -1056,6 +1067,10 @@ function HarnessApp() {
   const livePlanSteps = useMemo(
     () => (plan?.runSteps ? [...plan.runSteps].slice(-6).reverse() : []),
     [plan?.runSteps],
+  );
+  const actionDslConsoleState = useMemo(
+    () => summarizeActionDslTraceState(traces),
+    [traces],
   );
   const liveTraceEntries = useMemo(
     () => [...traces].slice(-6).reverse(),
@@ -1115,6 +1130,10 @@ function HarnessApp() {
             workspaceRoot: cfg.workspaceRoot,
             baseUrl: cfg.baseUrl,
             model: cfg.model,
+            agentModel: cfg.agentModel,
+            summaryModel: cfg.summaryModel,
+            agentProtocol: cfg.agentProtocol,
+            agentKeepAlive: cfg.agentKeepAlive,
             profile: cfg.profile,
             mode: cfg.mode,
             internetAccessEnabled: cfg.internetAccessEnabled,
@@ -1131,6 +1150,10 @@ function HarnessApp() {
             setWorkspaceRootDraft(cfg.workspaceRoot);
             setBaseUrlDraft(cfg.baseUrl);
             setModelDraft(cfg.model);
+            setAgentModelDraft(cfg.agentModel);
+            setSummaryModelDraft(cfg.summaryModel);
+            setAgentProtocolDraft(cfg.agentProtocol);
+            setAgentKeepAliveDraft(cfg.agentKeepAlive);
             setProfileDraft(cfg.profile);
             setModeDraft(cfg.mode);
             setInternetAccessDraft(cfg.internetAccessEnabled);
@@ -1426,12 +1449,13 @@ function HarnessApp() {
             m.id === placeholderId
               ? {
                   ...m,
-                  runSummary: {
-                    id: event.runId,
-                    intent: event.intent,
-                    workspaceSource: event.workspaceSource,
-                    workspaceBound: event.workspaceBound,
-                    browserContextActive: event.browserContextActive,
+                runSummary: {
+                  id: event.runId,
+                  intent: event.intent,
+                  agentProtocol: event.agentProtocol,
+                  workspaceSource: event.workspaceSource,
+                  workspaceBound: event.workspaceBound,
+                  browserContextActive: event.browserContextActive,
                     filesRead: [],
                     directoriesRead: [],
                     filesWritten: [],
@@ -1554,7 +1578,7 @@ function HarnessApp() {
 
   /* ─── Settings actions ─── */
   async function saveConfig() {
-    if (!workspaceRootDraft.trim() || !baseUrlDraft.trim() || !modelDraft.trim()) {
+    if (!workspaceRootDraft.trim() || !baseUrlDraft.trim() || !modelDraft.trim() || !agentModelDraft.trim() || !summaryModelDraft.trim() || !agentKeepAliveDraft.trim()) {
       setSettingsStatus('All fields are required.');
       return;
     }
@@ -1578,6 +1602,10 @@ function HarnessApp() {
       setSettingsStatus('Stream stall limit must be 0 seconds or greater.');
       return;
     }
+    if (!['native_tools', 'action_dsl', 'workflow_runner'].includes(agentProtocolDraft)) {
+      setSettingsStatus('Agent protocol must be native_tools, action_dsl, or workflow_runner.');
+      return;
+    }
     const changingModel = config?.model !== modelDraft.trim();
     const changingWorkspace = config?.workspaceRoot !== workspaceRootDraft.trim();
     const shouldActivate = changingModel || modelRuntime?.activeModel !== modelDraft.trim();
@@ -1590,6 +1618,10 @@ function HarnessApp() {
           workspaceRoot: workspaceRootDraft.trim(),
           baseUrl: baseUrlDraft.trim(),
           model: modelDraft.trim(),
+          agentModel: agentModelDraft.trim(),
+          summaryModel: summaryModelDraft.trim(),
+          agentProtocol: agentProtocolDraft,
+          agentKeepAlive: agentKeepAliveDraft.trim(),
           profile: profileDraft,
           mode: modeDraft,
           internetAccessEnabled: internetAccessDraft,
@@ -1756,8 +1788,8 @@ function HarnessApp() {
         <div className="topbar-left">
           <div className="topbar-logo">G4</div>
           <div className="topbar-brand">
-            <span className="topbar-kicker">Local Agent Harness</span>
-            <span className="topbar-title">Gamma 4 Command Center</span>
+            <span className="topbar-kicker">CODEX</span>
+            <span className="topbar-title">{messages.length === 0 ? 'New thread' : 'Gamma 4 Harness'}</span>
           </div>
         </div>
 
@@ -1802,15 +1834,76 @@ function HarnessApp() {
         {/* ── Sidebar: File Tree ── */}
         <aside className="sidebar">
           <div className="sidebar-header">
-            <span className="sidebar-header-title">Explorer</span>
+            <span className="sidebar-header-title">Codex</span>
             <button className="btn-sm" onClick={() => void pickFolder()} type="button">
               {browserLoading ? 'Loading...' : 'Open Folder'}
             </button>
           </div>
 
+          <nav className="sidebar-nav" aria-label="Primary">
+            <button className="sidebar-nav-item" onClick={() => void startNewSession()} type="button">
+              <span>+</span>
+              <span>New thread</span>
+            </button>
+            <button
+              className="sidebar-nav-item"
+              onClick={() => sidebarSearchInputRef.current?.focus()}
+              type="button"
+              disabled={!sidebarSelection}
+            >
+              <span>/</span>
+              <span>Search</span>
+            </button>
+            <button
+              className="sidebar-nav-item"
+              onClick={() => {
+                setSettingsOpen(true);
+                setSettingsTab('agent');
+              }}
+              type="button"
+            >
+              <span>*</span>
+              <span>Automations</span>
+            </button>
+            <button
+              className="sidebar-nav-item"
+              onClick={() => {
+                setSettingsOpen(true);
+                setSettingsTab('connection');
+              }}
+              type="button"
+            >
+              <span>#</span>
+              <span>Skills</span>
+            </button>
+          </nav>
+
+          {sessions.length > 0 && (
+            <>
+              <div className="sidebar-section-label">Threads</div>
+              <div className="sidebar-thread-list">
+                {sessions.slice(0, 5).map((item) => (
+                  <button
+                    key={item.id}
+                    className="sidebar-thread-item"
+                    onClick={() => void resumeSession(item.id)}
+                    type="button"
+                    title={item.id}
+                  >
+                    <span>{shortenText(summarizeTurnIntent(item.turnHistory?.at(-1)), 30) || 'Saved thread'}</span>
+                    <small>{new Date(item.updatedAt).toLocaleDateString()}</small>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          <div className="sidebar-section-label">Workspace</div>
+
           {sidebarSelection && (
             <div className="sidebar-search">
               <input
+                ref={sidebarSearchInputRef}
                 className="search-input"
                 placeholder={workspaceSelection ? 'Search AI workspace...' : 'Search attached folder...'}
                 value={browserFilter}
@@ -1831,7 +1924,7 @@ function HarnessApp() {
               />
             ) : (
               <div className="sidebar-empty">
-                <div className="sidebar-empty-icon">📁</div>
+                <div className="sidebar-empty-icon">[]</div>
                 <div>Open folder to bind AI workspace.<br/>If browser cannot reveal disk path, app falls back to read-only browser context.</div>
               </div>
             )}
@@ -1924,7 +2017,7 @@ function HarnessApp() {
             )}
           </section>
 
-          {(isAgentic || isSending || Boolean(plan?.currentRunId) || livePlanSteps.length > 0) && (
+          {(isSending || Boolean(plan?.currentRunId) || livePlanSteps.length > 0) && (
             <section className="activity-deck">
               <div className="activity-card activity-card-primary">
                 <div className="command-center-section-head">
@@ -1949,12 +2042,78 @@ function HarnessApp() {
                     <strong>{plan?.toolProtocol || 'native'}</strong>
                   </div>
                   <div className="activity-summary-item">
+                    <span>Protocol</span>
+                    <strong>{plan?.agentProtocol || config?.agentProtocol || 'native_tools'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
                     <span>Workspace</span>
                     <strong>{plan?.workspaceBound === false ? 'Snapshot only' : 'Backend bound'}</strong>
                   </div>
                   <div className="activity-summary-item">
                     <span>Approvals</span>
                     <strong>{approvals.length > 0 ? `${approvals.length} pending` : 'Clear'}</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="activity-card">
+                <div className="command-center-section-head">
+                  <span>Runtime</span>
+                  <span>{modelRuntime?.agentProtocol || config?.agentProtocol || 'native_tools'}</span>
+                </div>
+                <div className="activity-summary-grid">
+                  <div className="activity-summary-item">
+                    <span>Loaded</span>
+                    <strong>{modelRuntime?.activeModel || config?.model || 'None'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Agent</span>
+                    <strong>
+                      {modelRuntime?.agentModel || config?.agentModel || 'None'}
+                      {modelRuntime?.agentModelActive ? ' (active)' : ''}
+                    </strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Heavy Lock</span>
+                    <strong>
+                      {modelRuntime?.heavyModelLock
+                        ? `${modelRuntime.heavyModelLock.held ? 'Held' : 'Free'} · queued ${modelRuntime.heavyModelLock.queued}${modelRuntime.heavyModelLock.ownerRunId ? ` · owner ${shortenText(modelRuntime.heavyModelLock.ownerRunId, 12)}` : ''}`
+                        : 'Unknown'}
+                    </strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Route</span>
+                    <strong>
+                      {modelRuntime?.lastRouteSelection
+                        ? `${modelRuntime.lastRouteSelection.role} → ${shortenText(modelRuntime.lastRouteSelection.model, 34)}`
+                        : 'None'}
+                    </strong>
+                  </div>
+                </div>
+                <div className="tool-summary-line">{formatModelRuntimeSummary(modelRuntime)}</div>
+              </div>
+
+              <div className="activity-card">
+                <div className="command-center-section-head">
+                  <span>Action DSL</span>
+                  <span>{actionDslConsoleState.repairAttempts ? `repair ${actionDslConsoleState.repairAttempts}` : actionDslConsoleState.parserState || 'Idle'}</span>
+                </div>
+                <div className="activity-summary-grid">
+                  <div className="activity-summary-item activity-summary-item-code">
+                    <span>Current action</span>
+                    <pre className="activity-summary-pre">{actionDslConsoleState.currentAction || 'None'}</pre>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Parser state</span>
+                    <strong>{actionDslConsoleState.parserState || 'No parser error'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Repair attempts</span>
+                    <strong>{actionDslConsoleState.repairAttempts || 0}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Last parse error</span>
+                    <strong>{actionDslConsoleState.lastError || 'None'}</strong>
                   </div>
                 </div>
               </div>
@@ -2010,8 +2169,8 @@ function HarnessApp() {
             {messages.length === 0 ? (
               <div className="chat-welcome">
                 <div className="chat-welcome-logo">G4</div>
-                <h2>Gamma 4 Harness</h2>
-                <p>Bind a real workspace, then drive the agent with visible memory, retry, and verification controls instead of hidden prompt luck.</p>
+                <h2>Let's build</h2>
+                <p>Gamma 4 Harness is ready. Bind a workspace or ask anything.</p>
                 <div className="chat-welcome-hints">
                   <button className="hint-chip" onClick={() => { setDraft('Review the codebase and summarize the architecture'); }} type="button">
                     Review architecture
@@ -2165,7 +2324,7 @@ function HarnessApp() {
                     title={`Attach images (max ${MAX_IMAGE_ATTACHMENTS}, ${formatBytes(MAX_IMAGE_BYTES)} each)`}
                     aria-label="Attach images"
                   >
-                    Attach
+                    +
                   </button>
                   <input
                     ref={imageInputRef}
@@ -2175,8 +2334,8 @@ function HarnessApp() {
                     className="visually-hidden"
                     onChange={e => { void handleImageInput(e); }}
                   />
-                  <button className="send-btn" disabled={isSending || (!draft.trim() && attachedImages.length === 0)} onClick={() => void sendChat()} type="button">
-                    {isSending ? '…' : 'Send'}
+                  <button className="send-btn" disabled={isSending || (!draft.trim() && attachedImages.length === 0)} onClick={() => void sendChat()} type="button" title="Send">
+                    {isSending ? '...' : '↑'}
                   </button>
                 </div>
               </div>
@@ -2236,6 +2395,42 @@ function HarnessApp() {
                     </div>
                     <div className="settings-row">
                       <div className="settings-field">
+                        <label>Agent Model</label>
+                        {modelOptions.length > 0 ? (
+                          <select className="settings-select" value={agentModelDraft} onChange={e => setAgentModelDraft(e.target.value)}>
+                            {modelOptions.map(id => <option key={`agent-${id}`} value={id}>{id}</option>)}
+                          </select>
+                        ) : (
+                          <input className="settings-input" value={agentModelDraft} onChange={e => setAgentModelDraft(e.target.value)} placeholder="VladimirGav/gemma4-26b-16GB-VRAM:latest" />
+                        )}
+                      </div>
+                      <div className="settings-field">
+                        <label>Summary Model</label>
+                        {modelOptions.length > 0 ? (
+                          <select className="settings-select" value={summaryModelDraft} onChange={e => setSummaryModelDraft(e.target.value)}>
+                            {modelOptions.map(id => <option key={`summary-${id}`} value={id}>{id}</option>)}
+                          </select>
+                        ) : (
+                          <input className="settings-input" value={summaryModelDraft} onChange={e => setSummaryModelDraft(e.target.value)} placeholder="gemma4:e4b" />
+                        )}
+                      </div>
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-field">
+                        <label>Agent Protocol</label>
+                        <select className="settings-select" value={agentProtocolDraft} onChange={e => setAgentProtocolDraft(e.target.value as typeof agentProtocolDraft)}>
+                          <option value="action_dsl">Action DSL</option>
+                          <option value="native_tools">Native Tools</option>
+                          <option value="workflow_runner">Workflow Runner</option>
+                        </select>
+                      </div>
+                      <div className="settings-field">
+                        <label>Agent Keep Alive</label>
+                        <input className="settings-input" value={agentKeepAliveDraft} onChange={e => setAgentKeepAliveDraft(e.target.value)} placeholder="90s" />
+                      </div>
+                    </div>
+                    <div className="settings-row">
+                      <div className="settings-field">
                         <label>Profile</label>
                         <select className="settings-select" value={profileDraft} onChange={e => setProfileDraft(e.target.value)}>
                           <option value="fast">Fast (512 tokens)</option>
@@ -2274,8 +2469,43 @@ function HarnessApp() {
                         <span>{modelRuntime?.activeModel || 'None loaded'}</span>
                       </div>
                       <div className="settings-info-row">
+                        <span>Agent Model</span>
+                        <span>
+                          {modelRuntime?.agentModel || 'N/A'}
+                          {modelRuntime?.agentModelActive ? ' (active)' : ''}
+                        </span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Summary Model</span>
+                        <span>{modelRuntime?.summaryModel || 'N/A'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Agent Protocol</span>
+                        <span>{modelRuntime?.agentProtocol || 'native_tools'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Agent Keep Alive</span>
+                        <span>{config?.agentKeepAlive || '90s'}</span>
+                      </div>
+                      <div className="settings-info-row">
                         <span>Lifecycle</span>
                         <span>{modelRuntime?.supportsLifecycle ? 'Available' : 'Unavailable'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Heavy Lock</span>
+                        <span>
+                          {modelRuntime?.heavyModelLock
+                            ? `${modelRuntime.heavyModelLock.held ? 'Held' : 'Free'} · queued ${modelRuntime.heavyModelLock.queued}${modelRuntime.heavyModelLock.ownerRunId ? ` · owner ${shortenText(modelRuntime.heavyModelLock.ownerRunId, 12)}` : ''}`
+                            : 'Unknown'}
+                        </span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Route</span>
+                        <span>
+                          {modelRuntime?.lastRouteSelection
+                            ? `${modelRuntime.lastRouteSelection.role} → ${shortenText(modelRuntime.lastRouteSelection.model, 34)}`
+                            : 'None'}
+                        </span>
                       </div>
                       <div className="settings-info-row">
                         <span>Installed</span>
@@ -2562,6 +2792,7 @@ function HarnessApp() {
                         <div className="settings-info-row"><span>Source</span><span>{plan.workspaceSource || 'backend'}</span></div>
                         <div className="settings-info-row"><span>Bound</span><span>{plan.workspaceBound === false ? 'No' : 'Yes'}</span></div>
                         <div className="settings-info-row"><span>Tool Path</span><span>{plan.toolProtocol || 'native'}</span></div>
+                        <div className="settings-info-row"><span>Agent Protocol</span><span>{plan.agentProtocol || config?.agentProtocol || 'native_tools'}</span></div>
                         <div className="settings-info-row"><span>Internet</span><span>{plan.internetAccessEnabled ?? config?.internetAccessEnabled ? 'Enabled' : 'Disabled'}</span></div>
                         <div className="settings-info-row"><span>Context Budget</span><span>{plan.contextBudget ?? config?.contextBudget ?? 'Unknown'}</span></div>
                         <div className="settings-info-row"><span>Retry Budget</span><span>{plan.toolRetryMax ?? config?.toolRetryMax ?? 0}</span></div>

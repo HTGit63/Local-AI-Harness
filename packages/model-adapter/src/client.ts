@@ -3,6 +3,7 @@ import {
   AvailableModel,
   ChatCompletionRequest,
   ChatMessage,
+  ModelActivationOptions,
   ModelRuntimeState,
   ModelSwitchResult,
   RunningModel,
@@ -576,7 +577,7 @@ export class ModelAdapter {
     );
   }
 
-  private async preloadModel(modelName: string): Promise<void> {
+  private async preloadModel(modelName: string, keepAlive: string | number = '2m'): Promise<void> {
     await this.fetchJson(
       `${this.nativeBaseUrl}/api/generate`,
       {
@@ -586,7 +587,7 @@ export class ModelAdapter {
           model: modelName,
           prompt: '',
           stream: false,
-          keep_alive: '2m',
+          keep_alive: keepAlive,
         }),
       },
       Math.max(this.timeoutMs * 4, 120_000),
@@ -704,7 +705,11 @@ export class ModelAdapter {
     return /gemma|qwen/i.test(normalizedModelName);
   }
 
-  async activateModel(requestedModel: string, previousModel: string | null = null): Promise<ModelSwitchResult> {
+  async activateModel(
+    requestedModel: string,
+    previousModel: string | null = null,
+    options: ModelActivationOptions = {},
+  ): Promise<ModelSwitchResult> {
     const targetModel = requestedModel.trim();
     if (!targetModel) {
       throw new Error('Model name cannot be empty.');
@@ -717,6 +722,10 @@ export class ModelAdapter {
 
     const runningInfo = await this.tryListRunningModels();
     if (!runningInfo.supportsLifecycle) {
+      if (options.requireActivation) {
+        throw new Error('Model lifecycle control is unavailable for the current provider.');
+      }
+
       const result: ModelSwitchResult = {
         previousModel,
         requestedModel: targetModel,
@@ -743,7 +752,7 @@ export class ModelAdapter {
       await this.unloadModel(modelName);
     }
 
-    await this.preloadModel(targetModel);
+    await this.preloadModel(targetModel, options.keepAlive ?? '2m');
     const runtime = await this.getRuntimeState();
     const loadedTarget = runtime.runningModels.find((entry) => entry.model === targetModel || entry.name === targetModel);
 

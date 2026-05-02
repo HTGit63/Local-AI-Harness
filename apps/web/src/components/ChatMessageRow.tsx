@@ -2,6 +2,7 @@ import { memo } from 'react';
 import { AgentRunSteps, type AgentRunStepData } from './AgentRunSteps';
 import { AgentRunSummary, type AgentRunSummaryData } from './AgentRunSummary';
 import { StreamingMarkdown } from './StreamingMarkdown';
+import { formatToolInputSummary } from '../lib/run-console';
 
 interface ChatToolEvent {
   id: string;
@@ -117,7 +118,7 @@ function ChatMessageRowComponent({ message }: { message: ChatMessageRowData }) {
                       <span className="tool-call-name">{event.name}</span>
                       <span className="tool-call-state">{stateLabel}</span>
                     </div>
-                    <div className="tool-call-input">{event.inputSummary}</div>
+                    <pre className="tool-call-input tool-call-input-json">{formatToolInputSummary(event.inputSummary)}</pre>
                     {event.output && (
                       <pre className="tool-call-output">{event.output}</pre>
                     )}

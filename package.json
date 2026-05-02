@@ -8,10 +8,10 @@
     "apps/*"
   ],
   "scripts": {
-    "build:packages": "npm run build --workspace @local-harness/approval-workflow && npm run build --workspace @local-harness/model-adapter && npm run build --workspace @local-harness/planner && npm run build --workspace @local-harness/prompt-recipes && npm run build --workspace @local-harness/repo-indexer && npm run build --workspace @local-harness/session-store && npm run build --workspace @local-harness/skills && npm run build --workspace @local-harness/tool-runtime && npm run build --workspace @local-harness/trace-bus && npm run build --workspace @local-harness/workspace-policy && npm run build --workspace @local-harness/doctor && npm run build --workspace @local-harness/core",
+    "build:packages": "npm run build --workspace @local-harness/approval-workflow && npm run build --workspace @local-harness/model-adapter && npm run build --workspace @local-harness/model-router && npm run build --workspace @local-harness/planner && npm run build --workspace @local-harness/prompt-recipes && npm run build --workspace @local-harness/repo-indexer && npm run build --workspace @local-harness/session-store && npm run build --workspace @local-harness/skills && npm run build --workspace @local-harness/tool-runtime && npm run build --workspace @local-harness/action-dsl && npm run build --workspace @local-harness/workflow-runner && npm run build --workspace @local-harness/trace-bus && npm run build --workspace @local-harness/workspace-policy && npm run build --workspace @local-harness/doctor && npm run build --workspace @local-harness/core",
     "build:apps": "npm run build --workspace @local-harness/api && npm run build --workspace @local-harness/cli && npm run build --workspace web",
     "build": "npm run build:packages && npm run build:apps",
-    "test": "npm run build && node --import tsx tests/unit/core.test.ts && node --import tsx tests/integration/workflow.test.ts && node --import tsx tests/e2e/cli.test.ts && node --import tsx tests/e2e/api.test.ts"
+    "test": "npm run build && node --import tsx tests/unit/action-dsl.test.ts && node --import tsx tests/unit/model-router.test.ts && node --import tsx tests/unit/core.test.ts && node --import tsx tests/integration/workflow.test.ts && node --import tsx tests/e2e/cli.test.ts && node --import tsx tests/e2e/api.test.ts"
   },
   "devDependencies": {
     "tsx": "^4.20.6",

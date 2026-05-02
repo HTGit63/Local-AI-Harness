@@ -6,6 +6,7 @@ export interface PlanState {
   blockers: string[];
   isComplete: boolean;
   finalOutcome?: string;
+  agentProtocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
   workspaceRoot?: string;
   workspaceSource?: 'backend' | 'browser_snapshot';
   workspaceBound?: boolean;

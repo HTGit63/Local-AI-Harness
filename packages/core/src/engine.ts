@@ -4,7 +4,9 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { ApprovalQueueManager, ApprovalRequestPayload } from '@local-harness/approval-workflow';
-import { ModelAdapter, ModelRuntimeState } from '@local-harness/model-adapter';
+import { ACTION_DSL_TOOL_NAMES, ActionDslExecutor, buildActionDslRepairPrompt, parseActionDsl, type ActionDslDocument } from '@local-harness/action-dsl';
+import { ModelAdapter, ModelRuntimeState, ModelSwitchResult } from '@local-harness/model-adapter';
+import { HeavyModelLock, ModelRouter, type AgentProtocol, type ModelRouteSelection, selectUnloadCandidates } from '@local-harness/model-router';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
 import { RepoIndexer, ProjectContext } from '@local-harness/repo-indexer';
@@ -12,6 +14,18 @@ import { AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSession
 import { ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
+import {
+  buildFixSingleFilePatchPrompt,
+  buildFixSingleFileSummaryPrompt,
+  buildFixSingleFileVerificationPrompt,
+  buildInspectProjectSummaryPrompt,
+  buildRepoAuditSummaryPrompt,
+  buildSmallPatchPatchPrompt,
+  buildSmallPatchSummaryPrompt,
+  buildSmallPatchVerificationPrompt,
+  WorkflowRunner,
+  type WorkflowSnapshot,
+} from '@local-harness/workflow-runner';
 import { AgentRunBuilder, buildFinalAnswer, summarizeRun } from './agent-run';
 import { classifyIntent, IntentDecision, TaskIntent } from './intent-classifier';
 // PromptAnalyzer removed — passes messages straight through for lower latency
@@ -37,6 +51,8 @@ const DISABLED_SKILL_SLUGS = new Set(['caveman']);
 
 type SupportedTool = (typeof SUPPORTED_TOOLS)[number];
 type TurnExecutionMode = 'direct' | 'agentic';
+type WorkflowScenario = 'inspect_project' | 'fix_single_file' | 'small_patch' | 'repo_audit';
+type WorkflowCompletion = { answer: string; error?: string };
 type ReasoningEffort = 'high' | 'medium' | 'low' | 'none';
 type StreamIdleTimeoutError = Error & {
   code: 'stream_idle_timeout';
@@ -64,7 +80,7 @@ export interface ChatStatusEvent {
 
 export interface ChatToolEvent {
   id: string;
-  name: SupportedTool;
+  name: string;
   state: 'start' | 'done';
   inputSummary: string;
   output?: string;
@@ -85,10 +101,12 @@ export interface RunStartedEvent {
   runId: string;
   sessionId: string;
   intent: string;
+  agentProtocol: AgentProtocol;
   workspaceBound: boolean;
   browserContextActive: boolean;
   workspaceSource: 'backend' | 'browser_snapshot';
   executionMode: TurnExecutionMode;
+  workflow?: WorkflowSnapshot;
 }
 
 export interface RunStepEvent {
@@ -135,6 +153,10 @@ export interface EngineConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  agentModel: string;
+  summaryModel: string;
+  agentProtocol: AgentProtocol;
+  agentKeepAlive: string;
   profile: 'fast' | 'balanced' | 'deep';
   workspaceRoot: string;
   mode: PolicyMode;
@@ -151,6 +173,10 @@ export interface EngineConfig {
 export interface PublicEngineConfig {
   baseUrl: string;
   model: string;
+  agentModel: string;
+  summaryModel: string;
+  agentProtocol: AgentProtocol;
+  agentKeepAlive: string;
   profile: 'fast' | 'balanced' | 'deep';
   workspaceRoot: string;
   mode: PolicyMode;
@@ -172,6 +198,10 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1',
   apiKey: process.env.OPENAI_API_KEY || 'ollama',
   model: 'gemma4:e4b',
+  agentModel: process.env.HARNESS_AGENT_MODEL || 'VladimirGav/gemma4-26b-16GB-VRAM:latest',
+  summaryModel: process.env.HARNESS_SUMMARY_MODEL || 'gemma4:e4b',
+  agentProtocol: (process.env.HARNESS_AGENT_PROTOCOL as AgentProtocol) || 'native_tools',
+  agentKeepAlive: process.env.HARNESS_AGENT_KEEP_ALIVE || '90s',
   profile: 'fast',
   workspaceRoot: process.cwd(),
   mode: 'workspace-write',
@@ -276,6 +306,208 @@ function summarizeInventoryForPrompt(inventory: Awaited<ReturnType<RepoIndexer['
     `Packages: ${packagePreview}`,
     `Top-level areas: ${inventory.topLevelAreas.join(', ') || 'none'}`,
   ].join('\n');
+}
+
+function extractWorkflowPathMentions(text: string): string[] {
+  const matches = Array.from(text.matchAll(/\b([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|py|rs|toml|css|html|yml|yaml))\b/g))
+    .map((match) => match[1]?.trim() || '')
+    .filter(Boolean);
+
+  return Array.from(new Set(matches)).slice(0, 3);
+}
+
+function extractWorkflowKeywords(text: string): string[] {
+  const stopWords = new Set([
+    'add', 'and', 'around', 'build', 'change', 'create', 'delete', 'edit', 'fix', 'for', 'from', 'help',
+    'implement', 'make', 'need', 'patch', 'please', 'remove', 'repo', 'show', 'small', 'some', 'that',
+    'the', 'this', 'to', 'update', 'with', 'workflow',
+  ]);
+
+  return Array.from(
+    new Set(
+      text
+        .toLowerCase()
+        .split(/[^a-z0-9_.-]+/)
+        .map((word) => word.trim())
+        .filter((word) => word.length >= 4 && !stopWords.has(word)),
+  ),
+  ).slice(0, 4);
+}
+
+function parseJsonRecord(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function summarizeWorkflowManifest(filePath: string, raw: string): string {
+  if (!filePath.endsWith('.json')) {
+    return `${filePath}: ${compactContextLine(raw, 180)}`;
+  }
+
+  const parsed = parseJsonRecord(raw);
+  if (!parsed) {
+    return `${filePath}: ${compactContextLine(raw, 180)}`;
+  }
+
+  const name = typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name.trim() : 'unnamed';
+  const scripts = parsed.scripts && typeof parsed.scripts === 'object' && !Array.isArray(parsed.scripts)
+    ? Object.keys(parsed.scripts as Record<string, unknown>)
+        .filter((scriptName) => scriptName.trim().length > 0)
+        .slice(0, 8)
+    : [];
+
+  return [
+    `${filePath}: ${name}`,
+    scripts.length > 0 ? `scripts=${scripts.join(', ')}` : null,
+  ].filter((entry): entry is string => Boolean(entry)).join(' | ');
+}
+
+function detectWorkflowCommands(filePath: string, raw: string): string[] {
+  if (!filePath.endsWith('.json')) {
+    return [];
+  }
+
+  const parsed = parseJsonRecord(raw);
+  const scripts = parsed?.scripts && typeof parsed.scripts === 'object' && !Array.isArray(parsed.scripts)
+    ? Object.entries(parsed.scripts as Record<string, unknown>)
+        .filter((entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string')
+        .map(([scriptName, command]) => [scriptName.trim(), command.trim()] as [string, string])
+        .filter(([scriptName, command]) => scriptName.length > 0 && command.length > 0)
+    : [];
+
+  return scripts.map(([scriptName]) => {
+    if (scriptName === 'test') {
+      return 'npm test';
+    }
+    if (scriptName === 'start') {
+      return 'npm start';
+    }
+    return `npm run ${scriptName}`;
+  });
+}
+
+function summarizeWorkflowReadme(filePath: string, raw: string): string {
+  const heading = raw.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  if (heading) {
+    return `${filePath}: ${heading}`;
+  }
+  return `${filePath}: ${compactContextLine(raw, 180)}`;
+}
+
+function findLikelyApiEntryFile(files: string[]): string | undefined {
+  const patterns = [
+    /^apps\/[^/]+\/src\/server\.(?:ts|tsx|js|jsx)$/,
+    /^apps\/[^/]+\/src\/main\.(?:ts|tsx|js|jsx)$/,
+    /^apps\/[^/]+\/src\/index\.(?:ts|tsx|js|jsx)$/,
+    /^apps\/[^/]+\/server\.(?:ts|tsx|js|jsx)$/,
+    /^src\/server\.(?:ts|tsx|js|jsx)$/,
+    /^src\/main\.(?:ts|tsx|js|jsx)$/,
+    /^src\/index\.(?:ts|tsx|js|jsx)$/,
+    /^server\.(?:ts|tsx|js|jsx)$/,
+    /^main\.(?:ts|tsx|js|jsx)$/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = files.find((file) => pattern.test(file));
+    if (match) {
+      return match;
+    }
+  }
+
+  return files.find((file) => /(?:^|\/)app\.(?:ts|tsx|js|jsx)$/.test(file));
+}
+
+function resolveWorkflowCandidateFiles(latestUserMessage: string, contextFiles: string[], entryPoints: string[]): string[] {
+  const explicitMentions = extractWorkflowPathMentions(latestUserMessage);
+  if (explicitMentions.length > 0) {
+    const resolved = explicitMentions.map((mention) => {
+      if (contextFiles.includes(mention)) {
+        return mention;
+      }
+
+      const exactMatch = contextFiles.find((file) => file.endsWith(`/${mention}`) || file.endsWith(mention));
+      return exactMatch || mention;
+    });
+
+    return Array.from(new Set(resolved)).slice(0, 3);
+  }
+
+  const keywords = extractWorkflowKeywords(latestUserMessage);
+  if (keywords.length > 0) {
+    const keywordMatches = contextFiles.filter((file) =>
+      keywords.some((keyword) => file.toLowerCase().includes(keyword.toLowerCase())),
+    );
+    if (keywordMatches.length > 0) {
+      return Array.from(new Set(keywordMatches)).slice(0, 3);
+    }
+  }
+
+  const fallbackFiles = [
+    ...entryPoints.slice(0, 3),
+    contextFiles.includes('package.json') ? 'package.json' : null,
+  ].filter((entry): entry is string => Boolean(entry));
+
+  if (fallbackFiles.length > 0) {
+    return Array.from(new Set(fallbackFiles)).slice(0, 3);
+  }
+
+  return contextFiles.slice(0, 3);
+}
+
+function uniqueWorkflowFiles(values: Array<string | null | undefined>, limit = 5): string[] {
+  return Array.from(
+    new Set(
+      values
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .map((value) => value.trim()),
+    ),
+  ).slice(0, limit);
+}
+
+function selectRepoAuditFiles(contextFiles: string[], entryPoints: string[], manifestFiles: string[], readmeFiles: string[]) {
+  const architectureCandidates = [
+    ...readmeFiles,
+    ...manifestFiles,
+    ...entryPoints,
+    ...contextFiles.filter((file) =>
+      /(^|\/)(src|app|lib|server|main|index|routes|pages|components|modules|docs|config)\//.test(file) ||
+      /(^|\/)(AGENTS|README|ARCHITECTURE|CHANGELOG)\.(md|txt)$/i.test(file) ||
+      /(app|server|main|index)\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(file),
+    ),
+  ];
+
+  const testConfigCandidates = contextFiles.filter((file) =>
+    /(^|\/)(__tests__|test|tests|spec|__specs__)\/.+\.(ts|tsx|js|jsx|mjs|cjs|json)$/i.test(file) ||
+    /\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(file) ||
+    /(^|\/)tsconfig(\.[^.]+)?\.json$/i.test(file) ||
+    /(^|\/)(vitest|jest|playwright|cypress|eslint|prettier|babel|webpack|rollup|vite|mocha|ava|tap)\.config\.(ts|js|mjs|cjs|json)$/i.test(file) ||
+    /(^|\/)(vitest|jest|playwright|cypress|eslint|prettier|babel|webpack|rollup|vite|mocha|ava|tap)(\.[^.]+)?\.(ts|js|mjs|cjs)$/i.test(file) ||
+    /(^|\/)package\.json$/i.test(file),
+  );
+
+  return {
+    architectureFiles: uniqueWorkflowFiles(architectureCandidates, 6),
+    testConfigFiles: uniqueWorkflowFiles(testConfigCandidates, 6),
+  };
+}
+
+function summarizeRepoAuditFile(filePath: string, raw: string): string {
+  if (filePath.endsWith('.json')) {
+    return summarizeWorkflowManifest(filePath, raw);
+  }
+
+  if (/README|AGENTS/i.test(filePath)) {
+    return summarizeWorkflowReadme(filePath, raw);
+  }
+
+  return `${filePath}: ${compactContextLine(raw, 180)}`;
 }
 
 function mergeSkills(base: string[], additional: string[]): string[] {
@@ -554,6 +786,8 @@ export class CoreEngine extends EventEmitter {
   private readonly traceLog: TraceEvent[] = [];
   private currentSession: SessionMetadata | null = null;
   private workspaceChangedNotice: string | null = null;
+  private readonly heavyModelLock: HeavyModelLock;
+  private lastModelRouteSelection: ModelRouteSelection | null = null;
 
   constructor(config: Partial<EngineConfig> = {}) {
     super();
@@ -583,6 +817,7 @@ export class CoreEngine extends EventEmitter {
     });
     this.sessionStore = new FileSessionStore(sessionDataDir);
     this.traceBus = new TraceBus();
+    this.heavyModelLock = new HeavyModelLock((type, data) => this.traceBus.emitEvent({ type, data }));
     this.approvalQueue = new ApprovalQueueManager(this.traceBus);
     this.planner = new Planner(this.traceBus);
     this.repoIndexer = new RepoIndexer(this.config.workspaceRoot);
@@ -648,6 +883,10 @@ export class CoreEngine extends EventEmitter {
     return {
       baseUrl: this.config.baseUrl,
       model: this.config.model,
+      agentModel: this.config.agentModel,
+      summaryModel: this.config.summaryModel,
+      agentProtocol: this.config.agentProtocol,
+      agentKeepAlive: this.config.agentKeepAlive,
       profile: this.config.profile,
       workspaceRoot: this.config.workspaceRoot,
       mode: this.config.mode,
@@ -722,6 +961,7 @@ export class CoreEngine extends EventEmitter {
 
   private buildPlannerRuntimeContext() {
     return {
+      agentProtocol: this.config.agentProtocol,
       workspaceRoot: this.config.workspaceRoot,
       internetAccessEnabled: this.config.internetAccessEnabled,
       contextBudget: this.config.contextBudget,
@@ -843,6 +1083,18 @@ export class CoreEngine extends EventEmitter {
       ...config,
       workspaceRoot: config.workspaceRoot ? path.resolve(config.workspaceRoot) : this.config.workspaceRoot,
     };
+    this.config.agentModel = typeof this.config.agentModel === 'string' && this.config.agentModel.trim()
+      ? this.config.agentModel.trim()
+      : DEFAULT_ENGINE_CONFIG.agentModel;
+    this.config.summaryModel = typeof this.config.summaryModel === 'string' && this.config.summaryModel.trim()
+      ? this.config.summaryModel.trim()
+      : DEFAULT_ENGINE_CONFIG.summaryModel;
+    this.config.agentProtocol = this.config.agentProtocol === 'native_tools' || this.config.agentProtocol === 'workflow_runner'
+      ? this.config.agentProtocol
+      : 'action_dsl';
+    this.config.agentKeepAlive = typeof this.config.agentKeepAlive === 'string' && this.config.agentKeepAlive.trim()
+      ? this.config.agentKeepAlive.trim()
+      : DEFAULT_ENGINE_CONFIG.agentKeepAlive;
     this.config.contextBudget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000);
     this.config.toolRetryMax = normalizeIntegerSetting(this.config.toolRetryMax, DEFAULT_ENGINE_CONFIG.toolRetryMax, 0, 8);
     this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
@@ -922,7 +1174,81 @@ export class CoreEngine extends EventEmitter {
   }
 
   async getModelRuntime(): Promise<ModelRuntimeState> {
-    return this.modelAdapter.getRuntimeState();
+    const runtime = await this.modelAdapter.getRuntimeState();
+    return {
+      ...runtime,
+      agentModel: this.config.agentModel,
+      summaryModel: this.config.summaryModel,
+      agentProtocol: this.config.agentProtocol,
+      agentModelActive: runtime.activeModel === this.config.agentModel,
+      heavyModelLock: this.heavyModelLock.snapshot(),
+      lastRouteSelection: this.lastModelRouteSelection ? { ...this.lastModelRouteSelection } : undefined,
+    };
+  }
+
+  private createAgentRouteSelection(): ModelRouteSelection {
+    const router = new ModelRouter({
+      fastModel: this.config.model,
+      agentModel: this.config.agentModel,
+      codingModel: this.config.agentModel,
+      reviewModel: this.config.agentModel,
+      summaryModel: this.config.summaryModel,
+      agentProtocol: this.config.agentProtocol,
+      agentKeepAlive: this.config.agentKeepAlive,
+    });
+    return router.selectRoute({
+      role: 'agent',
+      purpose: `agentic run with ${this.config.agentProtocol}`,
+    });
+  }
+
+  private async acquireHeavyModelLock(runId: string): Promise<() => void> {
+    return this.heavyModelLock.acquire(runId);
+  }
+
+  private async prepareAgentModel(runId: string): Promise<ModelSwitchResult> {
+    const route = this.createAgentRouteSelection();
+    this.lastModelRouteSelection = route;
+    this.traceBus.emitEvent({
+      type: 'model_route_selected',
+      data: {
+        runId,
+        configuredModel: this.config.model,
+        agentModel: route.model,
+        protocol: route.protocol,
+        keepAlive: route.keepAlive,
+        reason: route.reason,
+      },
+    });
+
+    const runtimeBefore = await this.modelAdapter.getRuntimeState();
+    const unloadCandidates = selectUnloadCandidates(runtimeBefore.runningModels, route.model);
+
+    for (const modelName of unloadCandidates) {
+      this.traceBus.emitEvent({
+        type: 'model_unload_attempted',
+        data: {
+          runId,
+          targetModel: route.model,
+          model: modelName,
+        },
+      });
+    }
+
+    const switchResult = await this.modelAdapter.activateModel(this.config.agentModel, this.config.model, {
+      keepAlive: this.config.agentKeepAlive,
+      requireActivation: true,
+    });
+    this.traceBus.emitEvent({
+      type: 'model_warmup_completed',
+      data: {
+        runId,
+        route,
+        switchResult,
+        agentModelActive: switchResult.activeModel === route.model,
+      },
+    });
+    return switchResult;
   }
 
   private getLatestUserMessage(messages: ChatMessage[]): string {
@@ -1002,6 +1328,7 @@ export class CoreEngine extends EventEmitter {
   private async selectToolProtocol(
     toolNames: SupportedTool[],
     modelCapabilities: string[] | null,
+    modelName = this.config.model,
   ): Promise<{ manualToolProtocol: boolean; mode: ToolProtocolMode; reason?: string }> {
     if (toolNames.length === 0) {
       return { manualToolProtocol: false, mode: 'native' };
@@ -1016,7 +1343,7 @@ export class CoreEngine extends EventEmitter {
       };
     }
 
-    const canAttemptNativeTools = await this.modelAdapter.canAttemptNativeToolCalling(this.config.model, modelCapabilities);
+    const canAttemptNativeTools = await this.modelAdapter.canAttemptNativeToolCalling(modelName, modelCapabilities);
     if (canAttemptNativeTools || !Array.isArray(modelCapabilities)) {
       return { manualToolProtocol: false, mode: 'native' };
     }
@@ -1560,6 +1887,30 @@ export class CoreEngine extends EventEmitter {
     };
 
     return RECIPES.manualToolProtocol(toolNames.map((toolName) => examples[toolName]));
+  }
+
+  private buildActionDslProtocol(task: string): string {
+    return RECIPES.actionDslProtocol(task, [...ACTION_DSL_TOOL_NAMES]);
+  }
+
+  private formatActionDslToolResult(action: string, output: string): string {
+    return [
+      '[Action DSL Result]',
+      `Action: ${action}`,
+      'Output:',
+      output,
+      'Reply with exactly one JSON object using kind "action", "final", or "blocker".',
+      'Final shape: {"kind":"final","summary":"short answer","filesChanged":[],"verification":"what you checked"}.',
+    ].join('\n');
+  }
+
+  private formatActionDslBlocker(reason: string, nextSafeStep: string): string {
+    return [
+      '[Action DSL Blocker]',
+      `Reason: ${reason}`,
+      `Next safe step: ${nextSafeStep}`,
+      'The workflow stopped visibly because the model could not produce valid Action DSL twice.',
+    ].join('\n');
   }
 
   private formatManualToolResult(toolName: SupportedTool, output: string): string {
@@ -2442,6 +2793,1521 @@ export class CoreEngine extends EventEmitter {
     return this.repoIndexer.generatePromptInjection(context);
   }
 
+  private async requestWorkflowModelCompletion(
+    model: string,
+    messages: ChatMessage[],
+    maxTokens: number,
+    think = false,
+  ): Promise<string> {
+    const result = await this.modelAdapter.createChatCompletion({
+      model,
+      messages,
+      stream: false,
+      max_tokens: maxTokens,
+      think,
+    });
+    const message = result?.choices?.[0]?.message ?? {};
+    return composeAssistantContent(message as Record<string, unknown>);
+  }
+
+  private async requestActionDslDocument(
+    model: string,
+    prompt: string,
+    userMessage: string,
+    allowedActions: string[],
+    maxTokens = 1024,
+  ): Promise<ActionDslDocument> {
+    const initialResponse = await this.requestWorkflowModelCompletion(
+      model,
+      [
+        { role: 'system', content: prompt },
+        { role: 'user', content: userMessage },
+      ],
+      maxTokens,
+      false,
+    );
+    const parsed = parseActionDsl(initialResponse.replace(/<think>[\s\S]*?<\/think>/gi, '').trim());
+    if (parsed.ok) {
+      return parsed.value;
+    }
+
+    const repairPrompt = buildActionDslRepairPrompt(parsed, initialResponse, allowedActions);
+    const repairedResponse = await this.requestWorkflowModelCompletion(
+      model,
+      [
+        { role: 'system', content: repairPrompt },
+        { role: 'user', content: userMessage },
+      ],
+      maxTokens,
+      false,
+    );
+    const repaired = parseActionDsl(repairedResponse.replace(/<think>[\s\S]*?<\/think>/gi, '').trim());
+    if (!repaired.ok) {
+      throw new Error(`Action DSL parse failed twice: ${repaired.error.code} (${repaired.error.message})`);
+    }
+    return repaired.value;
+  }
+
+  private buildWorkflowActionExecutor(): ActionDslExecutor {
+    return new ActionDslExecutor(
+      {
+        readFile: (filePath: string) => this.readFile(filePath),
+        listDir: (dirPath: string) => this.listDir(dirPath),
+        searchText: (query: string, filePattern?: string) => this.searchText(query, filePattern),
+        glob: (pattern: string) => this.glob(pattern),
+        previewPatch: (filePath: string, oldContent: string, newContent: string) => this.toolRegistry.previewPatch(filePath, oldContent, newContent),
+        patchFile: (filePath: string, oldContent: string, newContent: string) => this.applyApprovedWorkflowPatch(filePath, oldContent, newContent),
+        writeFile: (filePath: string, content: string) => this.writeApprovedWorkflowFile(filePath, content),
+        runCommand: (command: string) => this.runCommand(command),
+      },
+      {
+        emitTrace: (type: string, data: unknown) => this.traceBus.emitEvent({ type, data }),
+      },
+    );
+  }
+
+  private async buildWorkflowContextPack() {
+    const [{ context }, inventory] = await Promise.all([
+      this.repoIndexer.buildContext(),
+      this.repoIndexer.buildWorkspaceInventory(),
+    ]);
+
+    const manifestEntries = Object.entries(context.manifests);
+    const readmeEntries = Object.entries(context.readmes);
+    const manifestSummaries = manifestEntries.map(([filePath, raw]) => summarizeWorkflowManifest(filePath, raw));
+    const readmeSummaries = readmeEntries.map(([filePath, raw]) => summarizeWorkflowReadme(filePath, raw));
+    const commandsDetected = Array.from(new Set(manifestEntries.flatMap(([filePath, raw]) => detectWorkflowCommands(filePath, raw)))).slice(0, 12);
+    const apiEntryFile = findLikelyApiEntryFile(context.files);
+
+    const workspaceContext = [
+      context.summary,
+      summarizeInventoryForPrompt(inventory),
+      apiEntryFile ? `Likely API entry file: ${apiEntryFile}` : 'Likely API entry file: not found',
+      manifestSummaries.length > 0 ? `Manifest preview: ${manifestSummaries.slice(0, 3).join(' | ')}` : 'Manifest preview: none',
+      readmeSummaries.length > 0 ? `README preview: ${readmeSummaries.slice(0, 2).join(' | ')}` : 'README preview: none',
+    ].join('\n');
+
+    return {
+      context,
+      inventory,
+      workspaceContext,
+      manifestSummaries,
+      readmeSummaries,
+      commandsDetected,
+      apiEntryFile,
+    };
+  }
+
+  private selectWorkflowScenario(latestUserMessage: string, intentDecision: IntentDecision): WorkflowScenario {
+    const normalized = latestUserMessage.toLowerCase();
+    const explicitMentions = extractWorkflowPathMentions(latestUserMessage);
+
+    if (
+      /\b(repo[_ -]?audit|repository audit|full audit|audit the repo|audit this repo|audit the workspace|security review|risk review|risk assessment)\b/.test(normalized) ||
+      (/\baudit\b/.test(normalized) && (/\b(repo|repository|workspace|project)\b/.test(normalized) || /\b(risk|risks|security|tests?|config|coverage)\b/.test(normalized)))
+    ) {
+      return 'repo_audit';
+    }
+
+    if (/\binspect(?:[_ -]?project)?\b/.test(normalized) || intentDecision.intent === 'workspace_overview') {
+      return 'inspect_project';
+    }
+
+    if (explicitMentions.length > 1 || /\bsmall patch\b/.test(normalized) || /\bmultiple files?\b/.test(normalized)) {
+      return 'small_patch';
+    }
+
+    if (intentDecision.intent === 'edit_code') {
+      return explicitMentions.length <= 1 ? 'fix_single_file' : 'small_patch';
+    }
+
+    if (explicitMentions.length === 1 && /\b(fix|edit|patch|update|change|modify)\b/.test(normalized)) {
+      return 'fix_single_file';
+    }
+
+    if (explicitMentions.length > 1) {
+      return 'small_patch';
+    }
+
+    return 'inspect_project';
+  }
+
+  private async applyApprovedWorkflowPatch(filePath: string, oldText: string, newText: string): Promise<ToolResult> {
+    const policy = this.workspacePolicy.checkAction('write', filePath);
+    if (!policy.allowed) {
+      return { success: false, output: `Denied: ${policy.reason}` };
+    }
+
+    const absolutePath = path.resolve(this.config.workspaceRoot, filePath);
+    let current = '';
+    try {
+      current = await fs.readFile(absolutePath, 'utf8');
+    } catch {
+      return { success: false, output: `Missing target file ${filePath}.` };
+    }
+
+    if (!current.includes(oldText)) {
+      return { success: false, output: 'Target content not found in file.' };
+    }
+
+    const patched = current.replace(oldText, newText);
+    const diff = await this.toolRegistry.previewPatch(filePath, current, patched);
+    await fs.writeFile(absolutePath, patched, 'utf8');
+    this.invalidateRepoContextCache();
+    this.workspaceChangedNotice = `WORKSPACE CHANGED: Updated ${filePath}. Use listDir(".") to inspect the new state.`;
+
+    return {
+      success: true,
+      output: `Patched ${filePath}`,
+      preview: diff.preview,
+      metadata: {
+        fileWrites: [filePath],
+        lineStats: diff.metadata?.lineStats,
+      },
+    };
+  }
+
+  private async writeApprovedWorkflowFile(filePath: string, content: string): Promise<ToolResult> {
+    const policy = this.workspacePolicy.checkAction('write', filePath);
+    if (!policy.allowed) {
+      return { success: false, output: `Denied: ${policy.reason}` };
+    }
+
+    const absolutePath = path.resolve(this.config.workspaceRoot, filePath);
+    let current = '';
+    try {
+      current = await fs.readFile(absolutePath, 'utf8');
+    } catch {
+      current = '';
+    }
+
+    const diff = await this.toolRegistry.previewPatch(filePath, current, content);
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content, 'utf8');
+    this.invalidateRepoContextCache();
+    this.workspaceChangedNotice = `WORKSPACE CHANGED: Updated ${filePath}. Use listDir(".") to inspect the new state.`;
+
+    return {
+      success: true,
+      output: `Wrote ${filePath}`,
+      preview: diff.preview,
+      metadata: {
+        fileWrites: [filePath],
+        lineStats: diff.metadata?.lineStats,
+      },
+    };
+  }
+
+  private syncWorkflowState(runBuilder: AgentRunBuilder, workflowRunner: WorkflowRunner) {
+    runBuilder.setWorkflowState(workflowRunner.snapshot());
+  }
+
+  private async runInspectProjectWorkflow(params: {
+    runId: string;
+    runBuilder: AgentRunBuilder;
+    workflowRunner: WorkflowRunner;
+    latestUserMessage: string;
+    summaryModel: string;
+    streamHandlers?: ChatStreamHandlers;
+  }): Promise<WorkflowCompletion> {
+    const {
+      runId,
+      runBuilder,
+      workflowRunner,
+      latestUserMessage,
+      summaryModel,
+      streamHandlers,
+    } = params;
+
+    this.planner.setTaskSummary('Intent: inspect_project');
+    this.planner.setPhase('planning');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Inspecting project workspace');
+    this.emitChatStatus(streamHandlers, 'inspection', 'Inspecting project workspace', 0);
+
+    const pack = await this.buildWorkflowContextPack();
+    const manifestFiles = Object.keys(pack.context.manifests).slice(0, 3);
+    const readmeFiles = Object.keys(pack.context.readmes).slice(0, 2);
+
+    const detectStep = runBuilder.startNamedStep('inventory', 'Detect project commands', 'Scan manifests and scripts');
+    workflowRunner.startStep({
+      id: `${runId}_inspect_detect_commands`,
+      type: 'inspect',
+      title: 'Detect project commands',
+      detail: 'Scan manifests and scripts',
+      action: 'detect_project_commands',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.finishStep(
+      `${runId}_inspect_detect_commands`,
+      'done',
+      pack.commandsDetected.length > 0 ? `Detected ${pack.commandsDetected.length} command(s).` : 'No commands detected.',
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(detectStep.id, {
+      detail: pack.commandsDetected.length > 0 ? pack.commandsDetected.join(' | ') : 'No commands detected.',
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const listStep = runBuilder.startNamedStep('tool', 'List top-level workspace', 'listDir(".")');
+    workflowRunner.startStep({
+      id: `${runId}_inspect_list_workspace`,
+      type: 'inspect',
+      title: 'List top-level workspace',
+      detail: 'Run listDir(".")',
+      action: 'list_dir',
+      inputSummary: '.',
+    });
+    const listResult = await this.listDir('.');
+    runBuilder.recordToolMetadata(listResult.metadata);
+    const topLevelListing = listResult.output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .slice(0, 24);
+    workflowRunner.finishStep(
+      `${runId}_inspect_list_workspace`,
+      topLevelListing.length > 0 ? 'done' : 'skipped',
+      topLevelListing.length > 0 ? topLevelListing.join(', ') : 'No top-level entries found.',
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(listStep.id, {
+      detail: topLevelListing.length > 0 ? topLevelListing.join(' | ') : 'No top-level entries found.',
+      toolName: 'listDir',
+      toolInputSummary: 'Path: .',
+      toolOutputPreview: compactContextLine(listResult.output, 240),
+    }, topLevelListing.length > 0 ? 'done' : 'skipped');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const manifestStep = runBuilder.startNamedStep('tool', 'Read package manifests', manifestFiles.length > 0 ? manifestFiles.join(', ') : 'none');
+    workflowRunner.startStep({
+      id: `${runId}_inspect_read_manifests`,
+      type: 'inspect',
+      title: 'Read package manifests',
+      detail: 'Read up to three manifests',
+      action: 'read_manifest',
+      inputSummary: manifestFiles.join(', '),
+    });
+    const manifestSummaryLines: string[] = [];
+    for (const filePath of manifestFiles) {
+      const result = await this.readFile(filePath);
+      runBuilder.recordToolMetadata(result.metadata);
+      workflowRunner.recordFileRead(filePath);
+      manifestSummaryLines.push(summarizeWorkflowManifest(filePath, result.output));
+    }
+    workflowRunner.finishStep(
+      `${runId}_inspect_read_manifests`,
+      manifestFiles.length > 0 ? 'done' : 'skipped',
+      manifestSummaryLines.length > 0 ? manifestSummaryLines.join(' | ') : 'No manifests found.',
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(manifestStep.id, {
+      detail: manifestSummaryLines.length > 0 ? manifestSummaryLines.join(' | ') : 'No manifests found.',
+      toolName: 'readFile',
+      toolInputSummary: manifestFiles.join(', '),
+      toolOutputPreview: compactContextLine(manifestSummaryLines.join(' | '), 240),
+      filePaths: [...manifestFiles],
+    }, manifestFiles.length > 0 ? 'done' : 'skipped');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const readmeStep = runBuilder.startNamedStep('tool', 'Read README files', readmeFiles.length > 0 ? readmeFiles.join(', ') : 'none');
+    workflowRunner.startStep({
+      id: `${runId}_inspect_read_readmes`,
+      type: 'inspect',
+      title: 'Read README files',
+      detail: 'Read up to two README files',
+      action: 'read_readme',
+      inputSummary: readmeFiles.join(', '),
+    });
+    const readmeSummaryLines: string[] = [];
+    for (const filePath of readmeFiles) {
+      const result = await this.readFile(filePath);
+      runBuilder.recordToolMetadata(result.metadata);
+      workflowRunner.recordFileRead(filePath);
+      readmeSummaryLines.push(summarizeWorkflowReadme(filePath, result.output));
+    }
+    workflowRunner.finishStep(
+      `${runId}_inspect_read_readmes`,
+      readmeFiles.length > 0 ? 'done' : 'skipped',
+      readmeSummaryLines.length > 0 ? readmeSummaryLines.join(' | ') : 'No README files found.',
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(readmeStep.id, {
+      detail: readmeSummaryLines.length > 0 ? readmeSummaryLines.join(' | ') : 'No README files found.',
+      toolName: 'readFile',
+      toolInputSummary: readmeFiles.join(', '),
+      toolOutputPreview: compactContextLine(readmeSummaryLines.join(' | '), 240),
+      filePaths: [...readmeFiles],
+    }, readmeFiles.length > 0 ? 'done' : 'skipped');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const contextStep = runBuilder.startNamedStep('summary', 'Build compact context pack', 'Combine inventory and selected file summaries');
+    workflowRunner.startStep({
+      id: `${runId}_inspect_build_context`,
+      type: 'inspect',
+      title: 'Build compact context pack',
+      detail: 'Combine inventory and selected file summaries',
+      action: 'build_context_pack',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.finishStep(
+      `${runId}_inspect_build_context`,
+      'done',
+      compactContextLine(pack.workspaceContext, 240),
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(contextStep.id, {
+      detail: compactContextLine(pack.workspaceContext, 240),
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const summaryStep = runBuilder.startNamedStep('model', 'Ask model for final structured summary', pack.apiEntryFile || 'No API entry hint');
+    workflowRunner.startStep({
+      id: `${runId}_inspect_summary`,
+      type: 'model',
+      title: 'Ask model for final structured summary',
+      detail: pack.apiEntryFile ? `API hint: ${pack.apiEntryFile}` : 'No API entry hint',
+      action: 'inspect_project',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.waitForModelAction('Generating final structured summary');
+    this.planner.setPhase('model');
+    this.planner.setIntendedAction('Generating project summary');
+    this.emitChatStatus(streamHandlers, 'model', 'Generating final structured summary', 0);
+
+    const summaryText = (await this.requestWorkflowModelCompletion(
+      summaryModel,
+      [
+        {
+          role: 'system',
+          content: buildInspectProjectSummaryPrompt({
+            request: latestUserMessage,
+            workspaceContext: pack.workspaceContext,
+            topLevelListing,
+            filesRead: [...manifestFiles, ...readmeFiles],
+            commandsDetected: pack.commandsDetected,
+            manifestSummaries: manifestSummaryLines,
+            readmeSummaries: readmeSummaryLines,
+            apiEntryFile: pack.apiEntryFile,
+          }),
+        },
+        { role: 'user', content: latestUserMessage },
+      ],
+      1200,
+      false,
+    )).trim();
+    const fallbackSummary = [
+      'Summary:',
+      `Detected ${pack.commandsDetected.length} command(s).`,
+      `API entry file: ${pack.apiEntryFile || 'not found'}`,
+      `Files read: ${[...manifestFiles, ...readmeFiles].join(', ') || 'none'}`,
+      `Commands detected: ${pack.commandsDetected.join(', ') || 'none'}`,
+      `Notes: Top-level entries were ${topLevelListing.join(', ') || 'not available'}.`,
+    ].join('\n');
+    const finalAnswer = summaryText || fallbackSummary;
+
+    workflowRunner.finishStep(
+      `${runId}_inspect_summary`,
+      'done',
+      compactContextLine(finalAnswer, 240),
+      'completed',
+    );
+    workflowRunner.complete('Project inspection completed.');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+    runBuilder.finishStep(summaryStep.id, {
+      detail: finalAnswer.slice(0, 240),
+    }, 'done');
+
+    this.planner.setPhase('ready');
+    this.planner.setIntendedAction('Awaiting user input');
+    this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', 0);
+
+    return { answer: finalAnswer };
+  }
+
+  private async runRepoAuditWorkflow(params: {
+    runId: string;
+    runBuilder: AgentRunBuilder;
+    workflowRunner: WorkflowRunner;
+    latestUserMessage: string;
+    summaryModel: string;
+    streamHandlers?: ChatStreamHandlers;
+  }): Promise<WorkflowCompletion> {
+    const {
+      runId,
+      runBuilder,
+      workflowRunner,
+      latestUserMessage,
+      summaryModel,
+      streamHandlers,
+    } = params;
+
+    this.planner.setTaskSummary('Intent: repo_audit');
+    this.planner.setPhase('planning');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Inspecting repository for risks');
+    this.emitChatStatus(streamHandlers, 'inspection', 'Inspecting repository for risks', 0);
+
+    const pack = await this.buildWorkflowContextPack();
+    const manifestFiles = Object.keys(pack.context.manifests).slice(0, 4);
+    const readmeFiles = Object.keys(pack.context.readmes).slice(0, 4);
+    const auditFiles = selectRepoAuditFiles(pack.context.files, pack.context.entryPoints, manifestFiles, readmeFiles);
+
+    const detectStep = runBuilder.startNamedStep('inventory', 'Detect project commands', 'Scan manifests and scripts');
+    workflowRunner.startStep({
+      id: `${runId}_audit_detect_commands`,
+      type: 'inspect',
+      title: 'Detect project commands',
+      detail: 'Scan manifests and scripts',
+      action: 'detect_commands',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.finishStep(
+      `${runId}_audit_detect_commands`,
+      'done',
+      pack.commandsDetected.length > 0 ? `Detected ${pack.commandsDetected.length} command(s).` : 'No commands detected.',
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(detectStep.id, {
+      detail: pack.commandsDetected.length > 0 ? pack.commandsDetected.join(' | ') : 'No commands detected.',
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const contextStep = runBuilder.startNamedStep('summary', 'Build compact context pack', 'Combine inventory, manifests, and README evidence');
+    workflowRunner.startStep({
+      id: `${runId}_audit_build_context`,
+      type: 'inspect',
+      title: 'Build compact context pack',
+      detail: 'Combine inventory, manifests, and README evidence',
+      action: 'build_context_pack',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.finishStep(
+      `${runId}_audit_build_context`,
+      'done',
+      compactContextLine(pack.workspaceContext, 240),
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(contextStep.id, {
+      detail: compactContextLine(pack.workspaceContext, 240),
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const architectureStep = runBuilder.startNamedStep('tool', 'Inspect architecture files', auditFiles.architectureFiles.join(', ') || 'none');
+    workflowRunner.startStep({
+      id: `${runId}_audit_architecture`,
+      type: 'inspect',
+      title: 'Inspect architecture files',
+      detail: auditFiles.architectureFiles.join(', ') || 'none',
+      action: 'inspect_architecture',
+      inputSummary: auditFiles.architectureFiles.join(', ') || 'none',
+    });
+    const architectureSummaries: string[] = [];
+    for (const filePath of auditFiles.architectureFiles) {
+      const result = await this.readFile(filePath);
+      runBuilder.recordToolMetadata(result.metadata);
+      workflowRunner.recordFileRead(filePath);
+      architectureSummaries.push(summarizeRepoAuditFile(filePath, result.output));
+    }
+    workflowRunner.finishStep(
+      `${runId}_audit_architecture`,
+      auditFiles.architectureFiles.length > 0 ? 'done' : 'skipped',
+      architectureSummaries.length > 0 ? architectureSummaries.join(' | ') : 'No architecture files found.',
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(architectureStep.id, {
+      detail: architectureSummaries.length > 0 ? architectureSummaries.join(' | ') : 'No architecture files found.',
+      toolName: 'readFile',
+      toolInputSummary: auditFiles.architectureFiles.join(', ') || 'none',
+      toolOutputPreview: architectureSummaries.join(' | '),
+      filePaths: [...auditFiles.architectureFiles],
+    }, auditFiles.architectureFiles.length > 0 ? 'done' : 'skipped');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const configStep = runBuilder.startNamedStep('tool', 'Inspect tests and config', auditFiles.testConfigFiles.join(', ') || 'none');
+    workflowRunner.startStep({
+      id: `${runId}_audit_tests_config`,
+      type: 'inspect',
+      title: 'Inspect tests and config',
+      detail: auditFiles.testConfigFiles.join(', ') || 'none',
+      action: 'inspect_tests_config',
+      inputSummary: auditFiles.testConfigFiles.join(', ') || 'none',
+    });
+    const testConfigSummaries: string[] = [];
+    for (const filePath of auditFiles.testConfigFiles) {
+      const result = await this.readFile(filePath);
+      runBuilder.recordToolMetadata(result.metadata);
+      workflowRunner.recordFileRead(filePath);
+      testConfigSummaries.push(summarizeRepoAuditFile(filePath, result.output));
+    }
+    workflowRunner.finishStep(
+      `${runId}_audit_tests_config`,
+      auditFiles.testConfigFiles.length > 0 ? 'done' : 'skipped',
+      testConfigSummaries.length > 0 ? testConfigSummaries.join(' | ') : 'No tests/config files found.',
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(configStep.id, {
+      detail: testConfigSummaries.length > 0 ? testConfigSummaries.join(' | ') : 'No tests/config files found.',
+      toolName: 'readFile',
+      toolInputSummary: auditFiles.testConfigFiles.join(', ') || 'none',
+      toolOutputPreview: testConfigSummaries.join(' | '),
+      filePaths: [...auditFiles.testConfigFiles],
+    }, auditFiles.testConfigFiles.length > 0 ? 'done' : 'skipped');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const riskHints = [
+      pack.commandsDetected.length === 0 ? 'No commands detected from package manifests.' : null,
+      auditFiles.architectureFiles.length === 0 ? 'No architecture files selected for inspection.' : null,
+      auditFiles.testConfigFiles.length === 0 ? 'No obvious tests/config files detected.' : null,
+      pack.apiEntryFile ? null : 'No likely API entry file detected.' ,
+    ].filter((entry): entry is string => Boolean(entry));
+
+    const riskStep = runBuilder.startNamedStep('summary', 'Identify repository risks', riskHints.join(' | ') || 'Summarize evidence gaps and likely follow-up work');
+    workflowRunner.startStep({
+      id: `${runId}_audit_identify_risks`,
+      type: 'model',
+      title: 'Identify repository risks',
+      detail: riskHints.join(' | ') || 'Summarize evidence gaps and likely follow-up work',
+      action: 'identify_risks',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.waitForModelAction('Generating audit report');
+    this.planner.setPhase('model');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Assessing repository risks');
+    this.emitChatStatus(streamHandlers, 'model', 'Generating audit report', 0);
+
+    const summaryText = (await this.requestWorkflowModelCompletion(
+      summaryModel,
+      [
+        {
+          role: 'system',
+          content: buildRepoAuditSummaryPrompt({
+            request: latestUserMessage,
+            workspaceContext: pack.workspaceContext,
+            commandsDetected: pack.commandsDetected,
+            architectureFiles: auditFiles.architectureFiles,
+            architectureSummaries,
+            testConfigFiles: auditFiles.testConfigFiles,
+            testConfigSummaries,
+          }),
+        },
+        { role: 'user', content: latestUserMessage },
+      ],
+      1200,
+      false,
+    )).trim();
+
+    const fallbackReport = [
+      'Summary:',
+      `Repo audit completed for ${pack.context.files.length} file(s).`,
+      `Commands detected: ${pack.commandsDetected.join(', ') || 'none'}`,
+      `Architecture evidence: ${architectureSummaries.join(' | ') || 'none'}`,
+      `Tests/config evidence: ${testConfigSummaries.join(' | ') || 'none'}`,
+      `Risks: ${riskHints.join('; ') || 'Review file coverage and verification paths.'}`,
+      'Follow-up workflows: inspect_project, fix_single_file, small_patch',
+    ].join('\n');
+    const finalAnswer = summaryText || fallbackReport;
+
+    workflowRunner.finishStep(
+      `${runId}_audit_identify_risks`,
+      'done',
+      compactContextLine(finalAnswer, 240),
+      'completed',
+    );
+    workflowRunner.complete('Repository audit completed.');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+    runBuilder.finishStep(riskStep.id, {
+      detail: finalAnswer.slice(0, 240),
+    }, 'done');
+
+    this.planner.setPhase('ready');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Awaiting user input');
+    this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', 0);
+
+    return { answer: finalAnswer };
+  }
+
+  private async runFixSingleFileWorkflow(params: {
+    runId: string;
+    runBuilder: AgentRunBuilder;
+    workflowRunner: WorkflowRunner;
+    latestUserMessage: string;
+    intentDecision: IntentDecision;
+    agentModel: string;
+    summaryModel: string;
+    streamHandlers?: ChatStreamHandlers;
+  }): Promise<WorkflowCompletion> {
+    const {
+      runId,
+      runBuilder,
+      workflowRunner,
+      latestUserMessage,
+      intentDecision,
+      agentModel,
+      summaryModel,
+      streamHandlers,
+    } = params;
+
+    this.planner.setTaskSummary('Intent: fix_single_file');
+    this.planner.setPhase('planning');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Preparing single-file fix');
+    this.emitChatStatus(streamHandlers, 'inspection', 'Preparing single-file fix', 0);
+
+    const pack = await this.buildWorkflowContextPack();
+    const manifestFiles = Object.keys(pack.context.manifests).slice(0, 3);
+    const readmeFiles = Object.keys(pack.context.readmes).slice(0, 2);
+    const candidateFiles = resolveWorkflowCandidateFiles(latestUserMessage, pack.context.files, pack.context.entryPoints);
+    const targetPath = intentDecision.targetPath || candidateFiles[0];
+    if (!targetPath) {
+      const reason = 'No target file could be resolved.';
+      workflowRunner.block(reason);
+      return { answer: `Blocked: ${reason}`, error: reason };
+    }
+
+    const targetAbsolutePath = path.resolve(this.config.workspaceRoot, targetPath);
+    const workflowActionExecutor = this.buildWorkflowActionExecutor();
+    let workflowError: string | undefined;
+    let diffSummary = 'Diff stats unavailable.';
+    let verificationSummary = 'No verification run.';
+
+    const confirmStep = runBuilder.startNamedStep('tool', 'Confirm target file exists', targetPath);
+    workflowRunner.startStep({
+      id: `${runId}_fix_confirm_target`,
+      type: 'inspect',
+      title: 'Confirm target file exists',
+      detail: targetPath,
+      action: 'confirm_target_file',
+      inputSummary: targetPath,
+    });
+    try {
+      await fs.stat(targetAbsolutePath);
+    } catch {
+      const reason = `Target file not found: ${targetPath}`;
+      runBuilder.finishStep(confirmStep.id, { detail: reason }, 'error');
+      workflowRunner.finishStep(`${runId}_fix_confirm_target`, 'failed', reason, 'blocked');
+      workflowRunner.block(reason);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      return { answer: `Blocked: ${reason}`, error: reason };
+    }
+    runBuilder.finishStep(confirmStep.id, { detail: `Confirmed ${targetPath}` }, 'done');
+    workflowRunner.finishStep(`${runId}_fix_confirm_target`, 'done', `Confirmed ${targetPath}`, 'waiting_for_model_action');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const checkpointStep = runBuilder.startNamedStep('summary', 'Create checkpoint', targetPath);
+    workflowRunner.startStep({
+      id: `${runId}_fix_checkpoint`,
+      type: 'checkpoint',
+      title: 'Create checkpoint',
+      detail: `Snapshot before editing ${targetPath}`,
+      action: 'create_checkpoint',
+      inputSummary: targetPath,
+    });
+    workflowRunner.finishStep(
+      `${runId}_fix_checkpoint`,
+      'done',
+      `Snapshot recorded before editing ${targetPath}.`,
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(checkpointStep.id, { detail: `Snapshot recorded before editing ${targetPath}.` }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const readStep = runBuilder.startNamedStep('tool', 'Read target file', targetPath);
+    workflowRunner.startStep({
+      id: `${runId}_fix_read_target`,
+      type: 'tool',
+      title: 'Read target file',
+      detail: targetPath,
+      action: 'read_file',
+      inputSummary: targetPath,
+    });
+    const readResult = await this.readFile(targetPath);
+    runBuilder.recordToolMetadata(readResult.metadata);
+    workflowRunner.recordFileRead(targetPath);
+    const fileContent = readResult.output;
+    workflowRunner.finishStep(
+      `${runId}_fix_read_target`,
+      'done',
+      compactContextLine(fileContent, 240),
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(readStep.id, {
+      detail: compactContextLine(fileContent, 240),
+      toolName: 'readFile',
+      toolInputSummary: `Path: ${targetPath}`,
+      toolOutputPreview: compactContextLine(fileContent, 240),
+      filePaths: [targetPath],
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const patchStep = runBuilder.startNamedStep('model', 'Ask model for Action DSL patch proposal', targetPath);
+    workflowRunner.startStep({
+      id: `${runId}_fix_patch_proposal`,
+      type: 'model',
+      title: 'Ask model for Action DSL patch proposal',
+      detail: targetPath,
+      action: 'propose_patch',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.waitForModelAction('Generating patch proposal');
+    this.planner.setPhase('model');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction(`Drafting patch for ${targetPath}`);
+    this.emitChatStatus(streamHandlers, 'model', `Generating patch proposal for ${targetPath}`, 0);
+
+    const patchDocument = await this.requestActionDslDocument(
+      agentModel,
+      buildFixSingleFilePatchPrompt({
+        request: latestUserMessage,
+        workspaceContext: pack.workspaceContext,
+        targetPath,
+        fileContent: trimPromptBlock(fileContent, 12_000),
+      }),
+      latestUserMessage,
+      ['propose_patch', 'final', 'blocker'],
+      1200,
+    );
+
+    if (patchDocument.kind === 'blocker') {
+      const reason = patchDocument.reason;
+      const nextSafeStep = patchDocument.nextSafeStep;
+      const blockerAnswer = `Blocked: ${reason}\nNext safe step: ${nextSafeStep}`;
+      runBuilder.finishStep(patchStep.id, { detail: reason }, 'error');
+      workflowRunner.finishStep(`${runId}_fix_patch_proposal`, 'blocked', reason, 'blocked');
+      workflowRunner.block(reason);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      this.planner.setPhase('blocked');
+      this.planner.setCurrentTool(undefined);
+      this.planner.setIntendedAction(nextSafeStep);
+      this.emitChatStatus(streamHandlers, 'warning', reason, 0);
+      return { answer: blockerAnswer, error: reason };
+    }
+
+    if (patchDocument.kind === 'final') {
+      const finalAnswer = patchDocument.summary;
+      runBuilder.finishStep(patchStep.id, { detail: finalAnswer.slice(0, 240) }, 'done');
+      workflowRunner.finishStep(`${runId}_fix_patch_proposal`, 'done', compactContextLine(finalAnswer, 240), 'completed');
+      workflowRunner.complete('No patch was needed.');
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      this.planner.setPhase('ready');
+      this.planner.setCurrentTool(undefined);
+      this.planner.setIntendedAction('Awaiting user input');
+      this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', 0);
+      return { answer: finalAnswer };
+    }
+
+    const proposalResult = await workflowActionExecutor.execute(patchDocument);
+    if (proposalResult.kind !== 'tool' || !proposalResult.result.success) {
+      const reason = proposalResult.kind === 'tool' ? proposalResult.result.output : 'Unexpected Action DSL result.';
+      runBuilder.finishStep(patchStep.id, { detail: reason }, 'error');
+      workflowRunner.finishStep(`${runId}_fix_patch_proposal`, 'failed', reason, 'failed');
+      workflowRunner.fail(reason);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      return { answer: `Failed to prepare patch preview: ${reason}`, error: reason };
+    }
+
+    runBuilder.recordToolMetadata(proposalResult.result.metadata);
+    const proposalPreview = proposalResult.result.preview || proposalResult.result.output;
+    const proposalStats = proposalResult.result.metadata?.lineStats;
+    diffSummary = proposalStats
+      ? `Changed files: ${proposalStats.changedFiles} (+${proposalStats.addedLines} / -${proposalStats.removedLines})`
+      : `Patch preview prepared for ${targetPath}.`;
+
+    runBuilder.finishStep(patchStep.id, {
+      detail: compactContextLine(proposalPreview, 240),
+      toolName: 'propose_patch',
+      toolInputSummary: targetPath,
+      toolOutputPreview: compactContextLine(proposalPreview, 240),
+      filePaths: [targetPath],
+    }, 'done');
+    workflowRunner.finishStep(`${runId}_fix_patch_proposal`, 'done', compactContextLine(proposalPreview, 240), 'waiting_for_approval');
+    workflowRunner.waitForApproval(`Awaiting approval for ${targetPath}`);
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    this.planner.setPhase('approval');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction(`Awaiting approval for ${targetPath}`);
+    this.emitChatStatus(streamHandlers, 'approval', `Awaiting approval for ${targetPath}`, 0);
+
+    const approval = this.approvalQueue.requestApproval({
+      target: targetPath,
+      changeType: 'modify_file',
+      severity: 'warning',
+      diffPreview: proposalPreview,
+      metadata: {
+        workflow: 'fix_single_file',
+      },
+    });
+    workflowRunner.recordApproval(approval.id);
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const approvalResult = await approval;
+    if (!approvalResult.approved) {
+      const reason = 'User rejected patch preview.';
+      workflowRunner.block(reason);
+      runBuilder.finishStep(patchStep.id, { detail: reason }, 'error');
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      return { answer: `Blocked: ${reason}`, error: reason };
+    }
+
+    const applyStep = runBuilder.startNamedStep('tool', 'Apply approved patch', targetPath);
+    workflowRunner.startStep({
+      id: `${runId}_fix_apply_patch`,
+      type: 'tool',
+      title: 'Apply approved patch',
+      detail: targetPath,
+      action: 'apply_approved_change',
+      inputSummary: targetPath,
+    });
+    this.planner.setPhase('execution');
+    this.planner.setCurrentTool('patchFile');
+    this.planner.setIntendedAction(`Applying patch to ${targetPath}`);
+    this.emitChatStatus(streamHandlers, 'execution', `Applying patch to ${targetPath}`, 0);
+
+    const applyDocument: ActionDslDocument = {
+      kind: 'action',
+      action: 'apply_approved_change',
+      args: {
+        path: targetPath,
+        oldText: (patchDocument.args as { oldText: string }).oldText,
+        newText: (patchDocument.args as { newText: string }).newText,
+      },
+    };
+    const applyResult = await workflowActionExecutor.execute(applyDocument);
+    if (applyResult.kind !== 'tool' || !applyResult.result.success) {
+      const reason = applyResult.kind === 'tool' ? applyResult.result.output : 'Unexpected Action DSL result.';
+      runBuilder.finishStep(applyStep.id, { detail: reason }, 'error');
+      workflowRunner.finishStep(`${runId}_fix_apply_patch`, 'failed', reason, 'failed');
+      workflowRunner.fail(reason);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      return { answer: `Failed to apply patch: ${reason}`, error: reason };
+    }
+
+    runBuilder.recordToolMetadata(applyResult.result.metadata);
+    workflowRunner.recordFileChanged(targetPath);
+    const structuredPreview = applyResult.result.preview || proposalPreview;
+    workflowRunner.finishStep(
+      `${runId}_fix_apply_patch`,
+      'done',
+      compactContextLine(structuredPreview, 240),
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(applyStep.id, {
+      detail: compactContextLine(applyResult.result.output, 240),
+      toolName: 'patchFile',
+      toolInputSummary: targetPath,
+      toolOutputPreview: compactContextLine(structuredPreview, 240),
+      filePaths: [targetPath],
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const verificationSelectStep = runBuilder.startNamedStep('model', 'Select verification command', targetPath);
+    workflowRunner.startStep({
+      id: `${runId}_fix_select_verification`,
+      type: 'model',
+      title: 'Select verification command',
+      detail: targetPath,
+      action: 'select_verification',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.verify(`Selecting verification command for ${targetPath}`);
+    this.planner.setPhase('verification');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction(`Selecting verification command for ${targetPath}`);
+    this.emitChatStatus(streamHandlers, 'verification', `Selecting verification command for ${targetPath}`, 0);
+
+    const verificationDocument = await this.requestActionDslDocument(
+      agentModel,
+      buildFixSingleFileVerificationPrompt({
+        request: latestUserMessage,
+        workspaceContext: pack.workspaceContext,
+        targetPath,
+        changedFiles: [targetPath],
+        diffSummary,
+      }),
+      latestUserMessage,
+      ['run_selected_command', 'final', 'blocker'],
+      900,
+    );
+
+    if (verificationDocument.kind === 'blocker') {
+      const reason = verificationDocument.reason;
+      runBuilder.finishStep(verificationSelectStep.id, { detail: reason }, 'error');
+      workflowRunner.finishStep(`${runId}_fix_select_verification`, 'blocked', reason, 'blocked');
+      workflowRunner.block(reason);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      const blockedAnswer = `Blocked: ${reason}\nNext safe step: ${verificationDocument.nextSafeStep}`;
+      this.planner.setPhase('blocked');
+      this.planner.setCurrentTool(undefined);
+      this.planner.setIntendedAction(verificationDocument.nextSafeStep);
+      this.emitChatStatus(streamHandlers, 'warning', reason, 0);
+      return { answer: blockedAnswer, error: reason };
+    }
+
+    if (verificationDocument.kind === 'final') {
+      verificationSummary = verificationDocument.verification;
+      runBuilder.finishStep(verificationSelectStep.id, { detail: compactContextLine(verificationSummary, 240) }, 'done');
+      workflowRunner.finishStep(
+        `${runId}_fix_select_verification`,
+        'done',
+        compactContextLine(verificationSummary, 240),
+        'waiting_for_model_action',
+      );
+    } else {
+      const verificationCommand = (verificationDocument.args as { command: string }).command;
+      const verificationRunStep = runBuilder.startNamedStep('tool', 'Run verification command', verificationCommand);
+      workflowRunner.recordCommand(verificationCommand);
+      const verificationResult = await workflowActionExecutor.execute(verificationDocument);
+      if (verificationResult.kind !== 'tool') {
+        const reason = 'Unexpected verification result.';
+        verificationSummary = reason;
+        workflowError = reason;
+        workflowRunner.recordError(reason);
+        runBuilder.finishStep(verificationRunStep.id, { detail: reason }, 'error');
+      } else {
+        runBuilder.recordToolMetadata(verificationResult.result.metadata);
+        verificationSummary = verificationResult.result.success
+          ? verificationResult.result.output
+          : `Verification failed: ${verificationResult.result.output}`;
+        if (!verificationResult.result.success) {
+          workflowError = verificationSummary;
+          workflowRunner.recordError(verificationSummary);
+        }
+        runBuilder.finishStep(verificationRunStep.id, {
+          detail: compactContextLine(verificationSummary, 240),
+          toolName: 'runCommand',
+          toolInputSummary: `Command: ${verificationCommand}`,
+          toolOutputPreview: compactContextLine(verificationSummary, 240),
+          command: verificationCommand,
+        }, verificationResult.result.success ? 'done' : 'error');
+      }
+      workflowRunner.finishStep(
+        `${runId}_fix_select_verification`,
+        verificationSummary.startsWith('Verification failed:') || workflowError ? 'failed' : 'done',
+        compactContextLine(verificationSummary, 240),
+        'waiting_for_model_action',
+      );
+      this.syncWorkflowState(runBuilder, workflowRunner);
+    }
+
+    const summaryStep = runBuilder.startNamedStep('summary', 'Summarize fix_single_file workflow', targetPath);
+    workflowRunner.startStep({
+      id: `${runId}_fix_summary`,
+      type: 'summary',
+      title: 'Summarize fix_single_file workflow',
+      detail: targetPath,
+      action: 'summarize_workflow',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    const filesRead = [targetPath, ...manifestFiles, ...readmeFiles];
+    const summaryText = (await this.requestWorkflowModelCompletion(
+      summaryModel,
+      [
+        {
+          role: 'system',
+          content: buildFixSingleFileSummaryPrompt({
+            request: latestUserMessage,
+            targetPath,
+            changedFiles: [targetPath],
+            verificationSummary,
+            diffSummary,
+            filesRead,
+          }),
+        },
+        { role: 'user', content: latestUserMessage },
+      ],
+      1000,
+      false,
+    )).trim();
+    const fallbackSummary = [
+      `Fixed ${targetPath}.`,
+      `Diff summary: ${diffSummary}`,
+      `Verification: ${verificationSummary}`,
+      `Files read: ${filesRead.join(', ') || 'none'}`,
+    ].join('\n');
+    const finalAnswer = summaryText || fallbackSummary;
+
+    runBuilder.finishStep(summaryStep.id, {
+      detail: finalAnswer.slice(0, 240),
+    }, 'done');
+    workflowRunner.finishStep(
+      `${runId}_fix_summary`,
+      'done',
+      compactContextLine(finalAnswer, 240),
+      workflowError ? 'waiting_for_model_action' : 'completed',
+    );
+    if (workflowError) {
+      workflowRunner.fail(workflowError);
+    } else {
+      workflowRunner.complete('Single-file fix completed.');
+    }
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    this.planner.setPhase('ready');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Awaiting user input');
+    this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', 0);
+
+    return {
+      answer: finalAnswer,
+      error: workflowError,
+    };
+  }
+
+  private async runSmallPatchWorkflow(params: {
+    runId: string;
+    runBuilder: AgentRunBuilder;
+    workflowRunner: WorkflowRunner;
+    latestUserMessage: string;
+    intentDecision: IntentDecision;
+    agentModel: string;
+    summaryModel: string;
+    streamHandlers?: ChatStreamHandlers;
+  }): Promise<WorkflowCompletion> {
+    const {
+      runId,
+      runBuilder,
+      workflowRunner,
+      latestUserMessage,
+      intentDecision,
+      agentModel,
+      summaryModel,
+      streamHandlers,
+    } = params;
+
+    this.planner.setTaskSummary('Intent: small_patch');
+    this.planner.setPhase('planning');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Preparing multi-file patch');
+    this.emitChatStatus(streamHandlers, 'inspection', 'Preparing multi-file patch', 0);
+
+    const pack = await this.buildWorkflowContextPack();
+    const candidateFiles = resolveWorkflowCandidateFiles(latestUserMessage, pack.context.files, pack.context.entryPoints).slice(0, 3);
+    if (candidateFiles.length === 0) {
+      const reason = 'No relevant files could be resolved.';
+      workflowRunner.block(reason);
+      return { answer: `Blocked: ${reason}`, error: reason };
+    }
+
+    const workflowActionExecutor = this.buildWorkflowActionExecutor();
+    let workflowError: string | undefined;
+    let verificationSummary = 'No verification run.';
+    let diffSummary = 'Diff stats unavailable.';
+    const changedFiles: string[] = [];
+    const fileContents = new Map<string, string>();
+    const patchPlans: Array<{
+      filePath: string;
+      document: Extract<ActionDslDocument, { kind: 'action' }>;
+      preview: string;
+      lineStats?: AgentRunLineStats;
+    }> = [];
+
+    const findStep = runBuilder.startNamedStep('inventory', 'Find relevant files', candidateFiles.join(', '));
+    workflowRunner.startStep({
+      id: `${runId}_small_find_files`,
+      type: 'inspect',
+      title: 'Find relevant files',
+      detail: candidateFiles.join(', '),
+      action: 'find_relevant_files',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.finishStep(
+      `${runId}_small_find_files`,
+      'done',
+      candidateFiles.join(', '),
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(findStep.id, {
+      detail: candidateFiles.join(' | '),
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const readStep = runBuilder.startNamedStep('tool', 'Read target files', candidateFiles.join(', '));
+    workflowRunner.startStep({
+      id: `${runId}_small_read_files`,
+      type: 'tool',
+      title: 'Read target files',
+      detail: candidateFiles.join(', '),
+      action: 'read_file',
+      inputSummary: candidateFiles.join(', '),
+    });
+    for (const filePath of candidateFiles) {
+      const result = await this.readFile(filePath);
+      runBuilder.recordToolMetadata(result.metadata);
+      workflowRunner.recordFileRead(filePath);
+      fileContents.set(filePath, result.output);
+    }
+    workflowRunner.finishStep(
+      `${runId}_small_read_files`,
+      'done',
+      candidateFiles.join(', '),
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(readStep.id, {
+      detail: candidateFiles.join(' | '),
+      toolName: 'readFile',
+      toolInputSummary: candidateFiles.join(', '),
+      toolOutputPreview: candidateFiles.map((filePath) => `${filePath}: ${compactContextLine(fileContents.get(filePath) || '', 160)}`).join(' | '),
+      filePaths: [...candidateFiles],
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const checkpointStep = runBuilder.startNamedStep('summary', 'Create checkpoint', candidateFiles.join(', '));
+    workflowRunner.startStep({
+      id: `${runId}_small_checkpoint`,
+      type: 'checkpoint',
+      title: 'Create checkpoint',
+      detail: `Snapshot before editing ${candidateFiles.join(', ')}`,
+      action: 'create_checkpoint',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.finishStep(
+      `${runId}_small_checkpoint`,
+      'done',
+      `Snapshot recorded before editing ${candidateFiles.join(', ')}.`,
+      'waiting_for_model_action',
+    );
+    runBuilder.finishStep(checkpointStep.id, {
+      detail: `Snapshot recorded before editing ${candidateFiles.join(', ')}.`,
+    }, 'done');
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    const patchStep = runBuilder.startNamedStep('model', 'Ask model for patch actions', candidateFiles.join(', '));
+    workflowRunner.startStep({
+      id: `${runId}_small_patch_actions`,
+      type: 'model',
+      title: 'Ask model for patch actions',
+      detail: candidateFiles.join(', '),
+      action: 'propose_patch',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.waitForModelAction('Generating patch proposals');
+    this.planner.setPhase('model');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Drafting multi-file patch');
+    this.emitChatStatus(streamHandlers, 'model', 'Generating patch proposals', 0);
+
+    for (const filePath of candidateFiles) {
+      const relatedFiles = candidateFiles.filter((entry) => entry !== filePath);
+      const patchDocument = await this.requestActionDslDocument(
+        agentModel,
+        buildSmallPatchPatchPrompt({
+          request: latestUserMessage,
+          workspaceContext: pack.workspaceContext,
+          targetPath: filePath,
+          fileContent: trimPromptBlock(fileContents.get(filePath) || '', 12_000),
+          relatedFiles,
+        }),
+        latestUserMessage,
+        ['propose_patch', 'final', 'blocker'],
+        1200,
+      );
+
+      if (patchDocument.kind === 'blocker') {
+        const reason = patchDocument.reason;
+        const nextSafeStep = patchDocument.nextSafeStep;
+        const blockerAnswer = `Blocked: ${reason}\nNext safe step: ${nextSafeStep}`;
+        runBuilder.finishStep(patchStep.id, { detail: reason }, 'error');
+        workflowRunner.finishStep(`${runId}_small_patch_actions`, 'blocked', reason, 'blocked');
+        workflowRunner.block(reason);
+        this.syncWorkflowState(runBuilder, workflowRunner);
+        this.planner.setPhase('blocked');
+        this.planner.setCurrentTool(undefined);
+        this.planner.setIntendedAction(nextSafeStep);
+        this.emitChatStatus(streamHandlers, 'warning', reason, 0);
+        return { answer: blockerAnswer, error: reason };
+      }
+
+      if (patchDocument.kind === 'action') {
+        const proposalResult = await workflowActionExecutor.execute(patchDocument);
+        if (proposalResult.kind !== 'tool' || !proposalResult.result.success) {
+          const reason = proposalResult.kind === 'tool' ? proposalResult.result.output : 'Unexpected Action DSL result.';
+          runBuilder.finishStep(patchStep.id, { detail: reason }, 'error');
+          workflowRunner.finishStep(`${runId}_small_patch_actions`, 'failed', reason, 'failed');
+          workflowRunner.fail(reason);
+          this.syncWorkflowState(runBuilder, workflowRunner);
+          return { answer: `Failed to prepare patch preview: ${reason}`, error: reason };
+        }
+
+        runBuilder.recordToolMetadata(proposalResult.result.metadata);
+        const preview = proposalResult.result.preview || proposalResult.result.output;
+        const lineStats = proposalResult.result.metadata?.lineStats;
+        patchPlans.push({
+          filePath,
+          document: patchDocument,
+          preview,
+          lineStats,
+        });
+      }
+    }
+
+    const combinedPreview = patchPlans.length > 0
+      ? patchPlans.map((plan) => `${plan.filePath}\n${compactContextLine(plan.preview, 400)}`).join('\n\n')
+      : 'No patch proposals were generated.';
+    const combinedStats = patchPlans.reduce(
+      (acc, plan) => {
+        const stats = plan.lineStats;
+        if (!stats) {
+          return acc;
+        }
+        acc.changedFiles += stats.changedFiles;
+        acc.addedLines += stats.addedLines;
+        acc.removedLines += stats.removedLines;
+        return acc;
+      },
+      { changedFiles: 0, addedLines: 0, removedLines: 0 },
+    );
+    diffSummary = patchPlans.length > 0
+      ? `Changed files: ${combinedStats.changedFiles} (+${combinedStats.addedLines} / -${combinedStats.removedLines})`
+      : 'No changes proposed.';
+
+    runBuilder.finishStep(patchStep.id, {
+      detail: compactContextLine(combinedPreview, 240),
+    }, patchPlans.length > 0 ? 'done' : 'skipped');
+    workflowRunner.finishStep(
+      `${runId}_small_patch_actions`,
+      patchPlans.length > 0 ? 'done' : 'skipped',
+      compactContextLine(combinedPreview, 240),
+      patchPlans.length > 0 ? 'waiting_for_approval' : 'waiting_for_model_action',
+    );
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    if (patchPlans.length > 0) {
+      workflowRunner.waitForApproval(`Awaiting approval for ${patchPlans.length} file(s)`);
+      this.planner.setPhase('approval');
+      this.planner.setCurrentTool(undefined);
+      this.planner.setIntendedAction(`Awaiting approval for ${patchPlans.length} file(s)`);
+      this.emitChatStatus(streamHandlers, 'approval', `Awaiting approval for ${patchPlans.length} file(s)`, 0);
+
+      const approval = this.approvalQueue.requestApproval({
+        target: candidateFiles.join(', '),
+        changeType: 'modify_file',
+        severity: 'warning',
+        diffPreview: combinedPreview,
+        metadata: {
+          workflow: 'small_patch',
+        },
+      });
+      workflowRunner.recordApproval(approval.id);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+
+      const approvalResult = await approval;
+      if (!approvalResult.approved) {
+        const reason = 'User rejected patch preview.';
+        workflowRunner.block(reason);
+        this.syncWorkflowState(runBuilder, workflowRunner);
+        return { answer: `Blocked: ${reason}`, error: reason };
+      }
+
+      const applyStep = runBuilder.startNamedStep('tool', 'Apply approved patches', candidateFiles.join(', '));
+      workflowRunner.startStep({
+        id: `${runId}_small_apply_patches`,
+        type: 'tool',
+        title: 'Apply approved patches',
+        detail: candidateFiles.join(', '),
+        action: 'apply_approved_change',
+        inputSummary: candidateFiles.join(', '),
+      });
+      this.planner.setPhase('execution');
+      this.planner.setCurrentTool('patchFile');
+      this.planner.setIntendedAction('Applying approved patches');
+      this.emitChatStatus(streamHandlers, 'execution', 'Applying approved patches', 0);
+
+      for (const plan of patchPlans) {
+        const patchArgs = plan.document.args as { oldText: string; newText: string };
+        const applyDocument: ActionDslDocument = {
+          kind: 'action',
+          action: 'apply_approved_change',
+          args: {
+            path: plan.filePath,
+            oldText: patchArgs.oldText,
+            newText: patchArgs.newText,
+          },
+        };
+        const applyResult = await workflowActionExecutor.execute(applyDocument);
+        if (applyResult.kind !== 'tool' || !applyResult.result.success) {
+          const reason = applyResult.kind === 'tool' ? applyResult.result.output : 'Unexpected Action DSL result.';
+          workflowRunner.finishStep(`${runId}_small_apply_patches`, 'failed', reason, 'failed');
+          workflowRunner.fail(reason);
+          runBuilder.finishStep(applyStep.id, { detail: reason }, 'error');
+          this.syncWorkflowState(runBuilder, workflowRunner);
+          return { answer: `Failed to apply patch: ${reason}`, error: reason };
+        }
+
+        runBuilder.recordToolMetadata(applyResult.result.metadata);
+        changedFiles.push(plan.filePath);
+        workflowRunner.recordFileChanged(plan.filePath);
+      }
+
+      workflowRunner.finishStep(
+        `${runId}_small_apply_patches`,
+        'done',
+        changedFiles.join(', '),
+        'waiting_for_model_action',
+      );
+      runBuilder.finishStep(applyStep.id, {
+        detail: changedFiles.join(' | '),
+        toolName: 'patchFile',
+        toolInputSummary: candidateFiles.join(', '),
+        filePaths: [...changedFiles],
+      }, 'done');
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      diffSummary = `Changed files: ${combinedStats.changedFiles} (+${combinedStats.addedLines} / -${combinedStats.removedLines})`;
+    }
+
+    const verificationSelectStep = runBuilder.startNamedStep('model', 'Select verification command', changedFiles.join(', ') || candidateFiles.join(', '));
+    workflowRunner.startStep({
+      id: `${runId}_small_select_verification`,
+      type: 'model',
+      title: 'Select verification command',
+      detail: changedFiles.join(', ') || candidateFiles.join(', '),
+      action: 'select_verification',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    workflowRunner.verify('Selecting verification command for multi-file patch');
+    this.planner.setPhase('verification');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Selecting verification command for multi-file patch');
+    this.emitChatStatus(streamHandlers, 'verification', 'Selecting verification command for multi-file patch', 0);
+
+    const verificationDocument = await this.requestActionDslDocument(
+      agentModel,
+      buildSmallPatchVerificationPrompt({
+        request: latestUserMessage,
+        workspaceContext: pack.workspaceContext,
+        changedFiles,
+        diffSummary,
+      }),
+      latestUserMessage,
+      ['run_selected_command', 'final', 'blocker'],
+      900,
+    );
+
+    if (verificationDocument.kind === 'blocker') {
+      const reason = verificationDocument.reason;
+      runBuilder.finishStep(verificationSelectStep.id, { detail: reason }, 'error');
+      workflowRunner.finishStep(`${runId}_small_select_verification`, 'blocked', reason, 'blocked');
+      workflowRunner.block(reason);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      const blockedAnswer = `Blocked: ${reason}\nNext safe step: ${verificationDocument.nextSafeStep}`;
+      this.planner.setPhase('blocked');
+      this.planner.setCurrentTool(undefined);
+      this.planner.setIntendedAction(verificationDocument.nextSafeStep);
+      this.emitChatStatus(streamHandlers, 'warning', reason, 0);
+      return { answer: blockedAnswer, error: reason };
+    }
+
+    if (verificationDocument.kind === 'final') {
+      verificationSummary = verificationDocument.verification;
+      runBuilder.finishStep(verificationSelectStep.id, { detail: compactContextLine(verificationSummary, 240) }, 'done');
+      workflowRunner.finishStep(
+        `${runId}_small_select_verification`,
+        'done',
+        compactContextLine(verificationSummary, 240),
+        'waiting_for_model_action',
+      );
+    } else {
+      const verificationCommand = (verificationDocument.args as { command: string }).command;
+      const verificationRunStep = runBuilder.startNamedStep('tool', 'Run verification command', verificationCommand);
+      workflowRunner.recordCommand(verificationCommand);
+      const verificationResult = await workflowActionExecutor.execute(verificationDocument);
+      if (verificationResult.kind !== 'tool') {
+        const reason = 'Unexpected verification result.';
+        verificationSummary = reason;
+        workflowError = reason;
+        workflowRunner.recordError(reason);
+        runBuilder.finishStep(verificationRunStep.id, { detail: reason }, 'error');
+      } else {
+        runBuilder.recordToolMetadata(verificationResult.result.metadata);
+        verificationSummary = verificationResult.result.success
+          ? verificationResult.result.output
+          : `Verification failed: ${verificationResult.result.output}`;
+        if (!verificationResult.result.success) {
+          workflowError = verificationSummary;
+          workflowRunner.recordError(verificationSummary);
+        }
+        runBuilder.finishStep(verificationRunStep.id, {
+          detail: compactContextLine(verificationSummary, 240),
+          toolName: 'runCommand',
+          toolInputSummary: `Command: ${verificationCommand}`,
+          toolOutputPreview: compactContextLine(verificationSummary, 240),
+          command: verificationCommand,
+        }, verificationResult.result.success ? 'done' : 'error');
+      }
+      workflowRunner.finishStep(
+        `${runId}_small_select_verification`,
+        verificationSummary.startsWith('Verification failed:') || workflowError ? 'failed' : 'done',
+        compactContextLine(verificationSummary, 240),
+        'waiting_for_model_action',
+      );
+      this.syncWorkflowState(runBuilder, workflowRunner);
+    }
+
+    const summaryStep = runBuilder.startNamedStep('summary', 'Summarize small_patch workflow', changedFiles.join(', ') || candidateFiles.join(', '));
+    workflowRunner.startStep({
+      id: `${runId}_small_summary`,
+      type: 'summary',
+      title: 'Summarize small_patch workflow',
+      detail: changedFiles.join(', ') || candidateFiles.join(', '),
+      action: 'summarize_workflow',
+      inputSummary: latestUserMessage.slice(0, 160),
+    });
+    const filesRead = [...candidateFiles];
+    const summaryText = (await this.requestWorkflowModelCompletion(
+      summaryModel,
+      [
+        {
+          role: 'system',
+          content: buildSmallPatchSummaryPrompt({
+            request: latestUserMessage,
+            changedFiles,
+            verificationSummary,
+            diffSummary,
+            filesRead,
+          }),
+        },
+        { role: 'user', content: latestUserMessage },
+      ],
+      1000,
+      false,
+    )).trim();
+    const fallbackSummary = [
+      `Patched ${changedFiles.length > 0 ? changedFiles.join(', ') : 'no files'}.`,
+      `Diff summary: ${diffSummary}`,
+      `Verification: ${verificationSummary}`,
+      `Files read: ${filesRead.join(', ') || 'none'}`,
+    ].join('\n');
+    const finalAnswer = summaryText || fallbackSummary;
+
+    runBuilder.finishStep(summaryStep.id, {
+      detail: finalAnswer.slice(0, 240),
+    }, 'done');
+    workflowRunner.finishStep(
+      `${runId}_small_summary`,
+      'done',
+      compactContextLine(finalAnswer, 240),
+      workflowError ? 'waiting_for_model_action' : 'completed',
+    );
+    if (workflowError) {
+      workflowRunner.fail(workflowError);
+    } else {
+      workflowRunner.complete('Small patch completed.');
+    }
+    this.syncWorkflowState(runBuilder, workflowRunner);
+
+    this.planner.setPhase('ready');
+    this.planner.setCurrentTool(undefined);
+    this.planner.setIntendedAction('Awaiting user input');
+    this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', 0);
+
+    return {
+      answer: finalAnswer,
+      error: workflowError,
+    };
+  }
+
   async chat(messages: ChatMessage[], options?: { signal?: AbortSignal; think?: boolean }): Promise<string> {
     return this.runChat(messages, undefined, options);
   }
@@ -2485,7 +4351,7 @@ export class CoreEngine extends EventEmitter {
     this.planner.setIntendedAction('Generating assistant response');
     this.emitChatStatus(handlers, 'mode', 'Direct chat mode', 0);
     this.emitChatStatus(handlers, 'model', 'Generating assistant response', 0);
-    let response = '';
+    let directResponse = '';
     let continuationCount = 0;
 
     while (true) {
@@ -2499,12 +4365,14 @@ export class CoreEngine extends EventEmitter {
           undefined,
           4096,
           undefined,
+          this.config.model,
           options?.signal,
           options?.think,
         ) as EngineChatMessage | undefined;
         finishReason = typeof message?.finish_reason === 'string' ? message.finish_reason : undefined;
       } else {
         const result = await this.modelAdapter.createChatCompletion({
+          model: this.config.model,
           messages: currentMessages,
           stream: false,
           max_tokens: 4096,
@@ -2519,7 +4387,7 @@ export class CoreEngine extends EventEmitter {
       }
 
       const content = composeAssistantContent((message ?? {}) as Record<string, unknown>);
-      response += content;
+      directResponse += content;
 
       if (!content) {
         break;
@@ -2552,7 +4420,7 @@ export class CoreEngine extends EventEmitter {
     this.planner.setPhase('ready');
     this.planner.setIntendedAction('Awaiting user input');
     this.emitChatStatus(handlers, 'ready', 'Awaiting user input', continuationCount);
-    return response;
+    return directResponse;
   }
 
   private emitChatStatus(handlers: ChatStreamHandlers | undefined, phase: string, action: string, loop: number) {
@@ -2596,11 +4464,14 @@ export class CoreEngine extends EventEmitter {
     tools: any[] | undefined,
     maxTokens: number,
     reasoningEffort: ReasoningEffort | undefined,
+    model?: string,
     signal?: AbortSignal,
     think?: boolean,
     onFirstToken?: () => void,
   ): Promise<any> {
+    const targetModel = model || this.config.model;
     const stream = await this.modelAdapter.createChatCompletion({
+      model: targetModel,
       messages: currentMessages,
       stream: true,
       tools,
@@ -2612,6 +4483,7 @@ export class CoreEngine extends EventEmitter {
 
     if (!stream || typeof (stream as ReadableStream<Uint8Array>).getReader !== 'function') {
       const result = await this.modelAdapter.createChatCompletion({
+        model: targetModel,
         messages: currentMessages,
         stream: false,
         tools,
@@ -2829,6 +4701,7 @@ export class CoreEngine extends EventEmitter {
     const workspaceBound = !browserFolderContextActive;
     const workspaceSource = workspaceBound ? 'backend' as const : 'browser_snapshot' as const;
     const promptMode = this.choosePromptMode(messages);
+    const agentRunModel = this.config.agentModel || this.config.model;
     const requestMessages = this.compactConversationMessages(
       messages as EngineChatMessage[],
       Math.max(5_000, Math.floor(this.config.contextBudget * 0.55)),
@@ -2854,7 +4727,8 @@ export class CoreEngine extends EventEmitter {
       executionMode: 'agentic',
       workspaceRoot: this.config.workspaceRoot,
       workspaceSource,
-      model: this.config.model,
+      model: agentRunModel,
+      agentProtocol: this.config.agentProtocol,
       promptMode,
       intent: intentDecision.intent,
       browserContextActive: browserFolderContextActive,
@@ -2875,51 +4749,13 @@ export class CoreEngine extends EventEmitter {
       metrics: {
         classificationMs,
       },
+      workflow: undefined,
     });
     const runId = runBuilder.snapshot().id;
-    this.planner.startRun(runId);
-    this.planner.setTaskSummary(`Intent: ${intentDecision.intent}`);
-    this.planner.setPhase('planning');
-    this.planner.setRuntimeContext({
-      ...this.buildPlannerRuntimeContext(),
-      workspaceSource,
-      workspaceBound,
-    });
-    this.planner.setActiveSkills(mergeSkills(this.currentSession?.skillsActive ?? [], this.selectOperationalSkills(intentDecision.intent, promptMode)));
-    this.planner.setIntendedAction('Classifying request');
-
-    this.emitChatStatus(
-      streamHandlers,
-      'mode',
-      workspaceBound ? 'Agentic coding mode' : 'Snapshot-only analysis mode',
-      0,
-    );
-    this.emitRunStarted(streamHandlers, {
-      type: 'run_started',
-      runId,
-      sessionId: this.currentSession!.id,
-      intent: intentDecision.intent,
-      workspaceBound,
-      browserContextActive: browserFolderContextActive,
-      workspaceSource,
-      executionMode: 'agentic',
-    });
+    let releaseHeavyModelLock: (() => void) | undefined;
 
     const classifyStep = runBuilder.startNamedStep('classify', 'Classify request', intentDecision.reasons.join(' '));
-    runBuilder.finishStep(classifyStep.id, {
-      detail: `${intentDecision.intent} (${intentDecision.confidence})`,
-    });
-    const classified = runBuilder.snapshot().steps.find((entry) => entry.id === classifyStep.id);
-    if (classified) {
-      this.planner.upsertRunStep({
-        id: classified.id,
-        type: classified.type,
-        title: classified.title,
-        status: classified.status,
-        detail: classified.detail,
-      });
-      this.emitRunStep(streamHandlers, runId, classified);
-    }
+    let classified: AgentRunStep | undefined;
 
     let loopCount = 0;
     const traceListener = (event: TraceEvent) => {
@@ -2998,6 +4834,59 @@ export class CoreEngine extends EventEmitter {
     };
 
     try {
+      releaseHeavyModelLock = await this.acquireHeavyModelLock(runId);
+      const agentModelSwitch = await this.prepareAgentModel(runId);
+      this.planner.startRun(runId);
+      this.planner.setTaskSummary(`Intent: ${intentDecision.intent}`);
+      this.planner.setPhase('planning');
+      this.planner.setRuntimeContext({
+        ...this.buildPlannerRuntimeContext(),
+        workspaceSource,
+        workspaceBound,
+      });
+      this.planner.setActiveSkills(mergeSkills(this.currentSession?.skillsActive ?? [], this.selectOperationalSkills(intentDecision.intent, promptMode)));
+      this.planner.setIntendedAction('Classifying request');
+
+      this.emitChatStatus(
+        streamHandlers,
+        'mode',
+        workspaceBound ? 'Agentic coding mode' : 'Snapshot-only analysis mode',
+        0,
+      );
+      this.emitRunStarted(streamHandlers, {
+        type: 'run_started',
+        runId,
+        sessionId: this.currentSession!.id,
+        intent: intentDecision.intent,
+        agentProtocol: this.config.agentProtocol,
+        workspaceBound,
+        browserContextActive: browserFolderContextActive,
+        workspaceSource,
+        executionMode: 'agentic',
+      });
+      this.traceBus.emitEvent({
+        type: 'agent_model_ready',
+        data: {
+          runId,
+          agentModel: agentModelSwitch.activeModel,
+          agentProtocol: this.config.agentProtocol,
+        },
+      });
+      runBuilder.finishStep(classifyStep.id, {
+        detail: `${intentDecision.intent} (${intentDecision.confidence})`,
+      });
+      classified = runBuilder.snapshot().steps.find((entry) => entry.id === classifyStep.id);
+      if (classified) {
+        this.planner.upsertRunStep({
+          id: classified.id,
+          type: classified.type,
+          title: classified.title,
+          status: classified.status,
+          detail: classified.detail,
+        });
+        this.emitRunStep(streamHandlers, runId, classified);
+      }
+
       if (!browserFolderContextActive && this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
         const localAnswer = await this.tryAnswerFromLocalState(latestUserMessage);
         if (localAnswer !== null) {
@@ -3020,83 +4909,204 @@ export class CoreEngine extends EventEmitter {
         return await finalizeRun(bindingAnswer);
       }
 
-      const directWorkspaceAnswer = workspaceBound
-        ? await this.tryAnswerFromDirectWorkspaceTools(latestUserMessage)
-        : null;
-      if (directWorkspaceAnswer !== null) {
-        this.completeImmediateResponse(streamHandlers, directWorkspaceAnswer);
-        return await finalizeRun(directWorkspaceAnswer.content);
-      }
-
-      const localRepoOverviewAnswer = workspaceBound
-        ? await this.tryAnswerFromLocalRepoOverview(latestUserMessage)
-        : null;
-      if (localRepoOverviewAnswer !== null) {
-        this.completeImmediateResponse(streamHandlers, localRepoOverviewAnswer);
-        return await finalizeRun(localRepoOverviewAnswer.content);
-      }
-
       const includeWorkspaceContext = workspaceBound && this.isWorkspaceQuestion(latestUserMessage, promptMode);
       const includeRepoContext = workspaceBound && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
-      const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
-      const modelCapabilities = await this.modelAdapter.getModelCapabilities(this.config.model);
-      const toolProtocol = await this.selectToolProtocol(selectedToolNames, modelCapabilities);
-      const rootManifestAnswer = workspaceBound && !['workspace_overview', 'review_diff', 'find_file', 'read_file', 'search_text'].includes(intentDecision.intent)
-        ? await this.tryAnswerFromRootManifest(latestUserMessage)
-        : null;
-      if (rootManifestAnswer !== null) {
-        this.completeImmediateResponse(streamHandlers, rootManifestAnswer);
-        return await finalizeRun(rootManifestAnswer.content);
+      const workflowRunnerEnabled = this.config.agentProtocol === 'workflow_runner';
+
+      if (!workflowRunnerEnabled) {
+        const directWorkspaceAnswer = workspaceBound
+          ? await this.tryAnswerFromDirectWorkspaceTools(latestUserMessage)
+          : null;
+        if (directWorkspaceAnswer !== null) {
+          this.completeImmediateResponse(streamHandlers, directWorkspaceAnswer);
+          return await finalizeRun(directWorkspaceAnswer.content);
+        }
+
+        const localRepoOverviewAnswer = workspaceBound
+          ? await this.tryAnswerFromLocalRepoOverview(latestUserMessage)
+          : null;
+        if (localRepoOverviewAnswer !== null) {
+          this.completeImmediateResponse(streamHandlers, localRepoOverviewAnswer);
+          return await finalizeRun(localRepoOverviewAnswer.content);
+        }
+
+        const rootManifestAnswer = workspaceBound && !['workspace_overview', 'review_diff', 'find_file', 'read_file', 'search_text'].includes(intentDecision.intent)
+          ? await this.tryAnswerFromRootManifest(latestUserMessage)
+          : null;
+        if (rootManifestAnswer !== null) {
+          this.completeImmediateResponse(streamHandlers, rootManifestAnswer);
+          return await finalizeRun(rootManifestAnswer.content);
+        }
       }
 
-      let manualToolProtocol = toolProtocol.manualToolProtocol;
+      this.traceBus.emitEvent({
+        type: 'agent_protocol_selected',
+        data: {
+          runId,
+          protocol: this.config.agentProtocol,
+          model: agentRunModel,
+        },
+      });
+
+      if (this.config.agentProtocol === 'workflow_runner') {
+        const workflowScenario = this.selectWorkflowScenario(latestUserMessage, intentDecision);
+        const workflowRunner = new WorkflowRunner({
+          workflowId: `${runId}_workflow`,
+          workflowType: workflowScenario,
+          runId,
+          sessionId: this.currentSession!.id,
+          workspaceRoot: this.config.workspaceRoot,
+          modelRole: 'agent',
+          protocol: this.config.agentProtocol,
+          emitTrace: (type: string, data: unknown) => this.traceBus.emitEvent({ type, data }),
+        });
+        workflowRunner.start(`Workflow runner selected for ${workflowScenario}.`);
+        const workflowSelectionStep = runBuilder.startNamedStep('summary', 'Select workflow', workflowScenario);
+        const workflowSelection = workflowRunner.startStep({
+          id: `${runId}_workflow_select`,
+          type: 'workflow',
+          title: 'Select workflow',
+          detail: workflowScenario,
+          action: 'select_workflow',
+          inputSummary: latestUserMessage.slice(0, 160),
+        });
+        workflowRunner.finishStep(
+          workflowSelection.id,
+          'done',
+          workflowScenario,
+          'waiting_for_model_action',
+        );
+        runBuilder.finishStep(workflowSelectionStep.id, {
+          detail: workflowScenario,
+        }, 'done');
+        runBuilder.setWorkflowState(workflowRunner.snapshot());
+        this.planner.setPhase('planning');
+        this.planner.setCurrentTool(undefined);
+        this.planner.setIntendedAction(`Running ${workflowScenario}`);
+        this.emitChatStatus(streamHandlers, 'mode', `Workflow runner: ${workflowScenario}`, 0);
+
+        let workflowResult: WorkflowCompletion;
+        switch (workflowScenario) {
+          case 'repo_audit':
+            workflowResult = await this.runRepoAuditWorkflow({
+              runId,
+              runBuilder,
+              workflowRunner,
+              latestUserMessage,
+              summaryModel: this.config.summaryModel || this.config.model,
+              streamHandlers,
+            });
+            break;
+          case 'inspect_project':
+            workflowResult = await this.runInspectProjectWorkflow({
+              runId,
+              runBuilder,
+              workflowRunner,
+              latestUserMessage,
+              summaryModel: this.config.summaryModel || this.config.model,
+              streamHandlers,
+            });
+            break;
+          case 'fix_single_file':
+            workflowResult = await this.runFixSingleFileWorkflow({
+              runId,
+              runBuilder,
+              workflowRunner,
+              latestUserMessage,
+              intentDecision,
+              agentModel: agentRunModel,
+              summaryModel: this.config.summaryModel || this.config.model,
+              streamHandlers,
+            });
+            break;
+          case 'small_patch':
+          default:
+            workflowResult = await this.runSmallPatchWorkflow({
+              runId,
+              runBuilder,
+              workflowRunner,
+              latestUserMessage,
+              intentDecision,
+              agentModel: agentRunModel,
+              summaryModel: this.config.summaryModel || this.config.model,
+              streamHandlers,
+            });
+            break;
+        }
+
+        return await finalizeRun(workflowResult.answer, workflowResult.error);
+      }
+
+      const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
+      const modelCapabilities = await this.modelAdapter.getModelCapabilities(agentRunModel);
+      const useActionDsl = this.config.agentProtocol === 'action_dsl';
+      const toolProtocol = useActionDsl
+        ? { manualToolProtocol: false, mode: 'native' as ToolProtocolMode }
+        : await this.selectToolProtocol(selectedToolNames, modelCapabilities, agentRunModel);
+
+      let manualToolProtocol = !useActionDsl && toolProtocol.manualToolProtocol;
       let manualProtocolPromptInjected = manualToolProtocol;
       this.planner.setRuntimeContext({
+        agentProtocol: this.config.agentProtocol,
         toolProtocol: manualToolProtocol ? 'manual' : 'native',
       });
-      let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol
+      let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol && !useActionDsl
         ? this.getToolDefinitions(selectedToolNames)
         : undefined;
-      const maxTokens = manualToolProtocol
-        ? Math.min(256, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
-        : this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0);
-      const reasoningEffort = manualToolProtocol
+      const maxTokens = useActionDsl
+        ? Math.min(512, this.selectMaxTokens(latestUserMessage, promptMode, false))
+        : manualToolProtocol
+          ? Math.min(256, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
+          : this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0);
+      const reasoningEffort = useActionDsl
         ? 'none'
-        : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
+        : manualToolProtocol
+          ? 'none'
+          : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
 
-      if (toolProtocol.mode !== 'native') {
+      if (!useActionDsl && toolProtocol.mode !== 'native') {
         runBuilder.markManualFallback(toolProtocol.reason);
       }
 
-      if (toolProtocol.mode === 'manual_fallback') {
+      if (!useActionDsl && toolProtocol.mode === 'manual_fallback') {
         this.traceBus.emitEvent({
           type: 'manual_tool_fallback',
           data: {
-            model: this.config.model,
+            model: agentRunModel,
             reason: toolProtocol.reason,
             manualToolProtocol: true,
             selectedTools: selectedToolNames,
           },
         });
         this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', 0);
-      } else if (toolProtocol.mode === 'manual_preferred') {
+      } else if (!useActionDsl && toolProtocol.mode === 'manual_preferred') {
         this.traceBus.emitEvent({
           type: 'manual_tool_strategy_selected',
           data: {
-            model: this.config.model,
+            model: agentRunModel,
             reason: toolProtocol.reason,
             manualToolProtocol: true,
             selectedTools: selectedToolNames,
           },
         });
         this.emitChatStatus(streamHandlers, 'mode', 'Manual tool protocol forced', 0);
+      } else if (useActionDsl) {
+        this.traceBus.emitEvent({
+          type: 'action_dsl_protocol_selected',
+          data: {
+            model: agentRunModel,
+            protocol: this.config.agentProtocol,
+            selectedTools: selectedToolNames,
+          },
+        });
+        this.emitChatStatus(streamHandlers, 'mode', 'Action DSL protocol selected', 0);
       }
 
       if (options?.think === true && !this.supportsThinking(modelCapabilities)) {
         this.traceBus.emitEvent({
           type: 'thinking_unsupported',
           data: {
-            model: this.config.model,
+            model: agentRunModel,
             reason: 'Current model does not report thinking capability.',
             requestedThink: true,
             modelCapabilities: modelCapabilities ?? [],
@@ -3109,6 +5119,7 @@ export class CoreEngine extends EventEmitter {
         type: 'chat_execution_plan',
         data: {
           executionMode: 'agentic',
+          agentProtocol: this.config.agentProtocol,
           promptMode,
           toolNames: selectedToolNames,
           nativeTools: Boolean(nativeToolDefinitions),
@@ -3125,19 +5136,27 @@ export class CoreEngine extends EventEmitter {
         },
       });
 
-      if (manualToolProtocol) {
+      if (manualToolProtocol || useActionDsl) {
         this.traceBus.emitEvent({
           type: 'prompt_recipe_selected',
           data: {
             mode: promptMode,
             taskPreview: latestUserMessage.slice(0, 120),
-            manualToolProtocol: true,
-            recipe: 'manual_tool_plan',
+            manualToolProtocol: manualToolProtocol,
+            recipe: useActionDsl ? 'action_dsl_protocol' : 'manual_tool_plan',
           },
         });
       }
 
-      const promptMessages = manualToolProtocol
+      const promptMessages = useActionDsl
+        ? [
+            {
+              role: 'system' as const,
+              content: this.buildActionDslProtocol(latestUserMessage),
+            },
+            ...requestMessages,
+          ]
+        : manualToolProtocol
         ? [
             {
               role: 'system' as const,
@@ -3164,7 +5183,7 @@ export class CoreEngine extends EventEmitter {
           `Workspace source: ${workspaceSource}`,
           `Workspace bound: ${workspaceBound ? 'yes' : 'no'}`,
           `Available tools: ${selectedToolNames.length > 0 ? selectedToolNames.join(', ') : 'none'}`,
-          `Tool protocol: ${manualToolProtocol ? 'manual' : 'native'}`,
+          `Tool protocol: ${useActionDsl ? 'action_dsl' : manualToolProtocol ? 'manual' : 'native'}`,
           `Context budget: ${this.config.contextBudget} chars`,
           `Retry budget: ${this.config.toolRetryMax}`,
           `Session memory: ${this.config.sessionMemoryEnabled ? `${this.config.sessionMemoryTurns} recent turns` : 'off'}`,
@@ -3178,7 +5197,7 @@ export class CoreEngine extends EventEmitter {
       const currentMessages: EngineChatMessage[] = [
         ...(await this.buildContextMessages(requestMessages, promptMode, includeWorkspaceContext, includeRepoContext)) as EngineChatMessage[],
         runtimeContract,
-        ...(manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),
+        ...(useActionDsl ? [] : manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),
         ...promptMessages,
       ];
 
@@ -3209,6 +5228,24 @@ export class CoreEngine extends EventEmitter {
       let firstModelCallRecorded = false;
       let firstTokenRecorded = false;
       const toolRetryMax = Math.max(1, this.config.toolRetryMax);
+      const actionDslExecutor = useActionDsl
+        ? new ActionDslExecutor(
+          {
+            readFile: (filePath: string) => this.readFile(filePath),
+            listDir: (dirPath: string) => this.listDir(dirPath),
+            searchText: (query: string, filePattern?: string) => this.searchText(query, filePattern),
+            glob: (pattern: string) => this.glob(pattern),
+            previewPatch: (filePath: string, oldContent: string, newContent: string) => this.toolRegistry.previewPatch(filePath, oldContent, newContent),
+            patchFile: (filePath: string, oldContent: string, newContent: string) => this.patchFile(filePath, oldContent, newContent),
+            writeFile: (filePath: string, content: string) => this.writeFile(filePath, content),
+            runCommand: (command: string) => this.runCommand(command),
+          },
+          {
+            emitTrace: (type: string, data: unknown) => this.traceBus.emitEvent({ type, data }),
+          },
+        )
+        : null;
+      let actionDslRepairCount = 0;
 
       while (loopCount < MAX_LOOPS) {
         if (manualToolProtocol && manualBootstrapTool) {
@@ -3232,7 +5269,7 @@ export class CoreEngine extends EventEmitter {
           this.traceBus.emitEvent({
             type: 'manual_tool_bootstrap_selected',
             data: {
-              model: this.config.model,
+              model: agentRunModel,
               promptMode,
               action: bootstrapDecision.name,
               args: bootstrapDecision.args,
@@ -3357,6 +5394,7 @@ export class CoreEngine extends EventEmitter {
               nativeToolDefinitions,
               maxTokens,
               reasoningEffort,
+              agentRunModel,
               options?.signal,
               options?.think,
               () => {
@@ -3371,6 +5409,7 @@ export class CoreEngine extends EventEmitter {
             );
           } else {
             result = await this.modelAdapter.createChatCompletion({
+              model: agentRunModel,
               messages: currentMessages,
               stream: false,
               tools: nativeToolDefinitions,
@@ -3391,12 +5430,12 @@ export class CoreEngine extends EventEmitter {
             }
             this.traceBus.emitEvent({
               type: 'tools_unsupported',
-              data: { model: this.config.model, reason: errorMessage },
+              data: { model: agentRunModel, reason: errorMessage },
             });
             this.traceBus.emitEvent({
               type: 'manual_tool_fallback',
               data: {
-                model: this.config.model,
+                model: agentRunModel,
                 reason: errorMessage,
                 manualToolProtocol,
                 selectedTools: selectedToolNames,
@@ -3435,13 +5474,232 @@ export class CoreEngine extends EventEmitter {
           break;
         }
 
-        message.content = composeAssistantContent(message as Record<string, unknown>);
+        const assistantResponse = composeAssistantContent(message as Record<string, unknown>);
+        message.content = assistantResponse;
         const finishReason = typeof (message as { finish_reason?: unknown }).finish_reason === 'string'
           ? (message as { finish_reason: string }).finish_reason
           : typeof result?.choices?.[0]?.finish_reason === 'string'
             ? result.choices[0].finish_reason
             : undefined;
         currentMessages.push(message);
+
+        if (useActionDsl && actionDslExecutor) {
+          const actionDslResponse = assistantResponse.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+          const parsedActionDsl = parseActionDsl(actionDslResponse);
+          if (!parsedActionDsl.ok) {
+            this.traceBus.emitEvent({
+              type: 'action_dsl_parse_failed',
+              data: {
+                runId,
+                error: parsedActionDsl.error,
+                response: actionDslResponse.slice(0, 240),
+              },
+            });
+
+            if (actionDslRepairCount < 1) {
+              actionDslRepairCount += 1;
+              this.traceBus.emitEvent({
+                type: 'action_dsl_repair_started',
+                data: {
+                  runId,
+                  attempt: actionDslRepairCount,
+                  error: parsedActionDsl.error,
+                },
+              });
+              currentMessages.push({
+                role: 'system',
+                content: buildActionDslRepairPrompt(parsedActionDsl, actionDslResponse, [...ACTION_DSL_TOOL_NAMES]),
+              });
+              continue;
+            }
+
+            const blockerReason = `Action DSL parse failed twice: ${parsedActionDsl.error.code}`;
+            const blockerMessage = this.formatActionDslBlocker(
+              parsedActionDsl.error.message,
+              'Switch to native_tools or fix the Action DSL response shape.',
+            );
+            this.planner.setPhase('blocked');
+            this.planner.setCurrentTool(undefined);
+            this.planner.setIntendedAction('Awaiting valid Action DSL response');
+            this.emitChatStatus(streamHandlers, 'warning', 'Action DSL parse failed twice; stopping run', loopCount);
+            return await finalizeRun(blockerMessage, blockerReason);
+          }
+
+          if (actionDslRepairCount > 0) {
+            this.traceBus.emitEvent({
+              type: 'action_dsl_repair_succeeded',
+              data: {
+                runId,
+                attempt: actionDslRepairCount,
+              },
+            });
+            actionDslRepairCount = 0;
+          }
+
+          const actionStep = runBuilder.startNamedStep('tool', `Action DSL ${parsedActionDsl.value.kind === 'action' ? parsedActionDsl.value.action : parsedActionDsl.value.kind}`);
+          this.planner.setPhase('execution');
+          this.planner.setCurrentTool(parsedActionDsl.value.kind === 'action' ? parsedActionDsl.value.action : undefined);
+          this.planner.setIntendedAction(`Executing ${parsedActionDsl.value.kind}`);
+          this.planner.upsertRunStep({
+            id: actionStep.id,
+            type: actionStep.type,
+            title: actionStep.title,
+            status: actionStep.status,
+            toolName: parsedActionDsl.value.kind === 'action' ? parsedActionDsl.value.action : undefined,
+          });
+          this.emitRunStep(streamHandlers, runId, actionStep);
+          this.emitChatStatus(streamHandlers, 'execution', `Executing ${parsedActionDsl.value.kind}`, loopCount);
+
+          const actionToolEventId = nextStreamToolEventId();
+          this.emitChatToolEvent(streamHandlers, {
+            id: actionToolEventId,
+            name: parsedActionDsl.value.kind === 'action' ? parsedActionDsl.value.action : 'final',
+            state: 'start',
+            inputSummary: truncateStreamPreview(JSON.stringify(parsedActionDsl.value)),
+          });
+
+          try {
+            const actionResult = await actionDslExecutor.execute(parsedActionDsl.value);
+            if (actionResult.kind === 'tool') {
+              const streamedOutput = actionResult.result.preview
+                ? `${actionResult.result.output}\n\n${actionResult.result.preview}`
+                : actionResult.result.output;
+              this.emitChatToolEvent(streamHandlers, {
+                id: actionToolEventId,
+                name: parsedActionDsl.value.kind === 'action' ? parsedActionDsl.value.action : 'action_dsl',
+                state: 'done',
+                inputSummary: truncateStreamPreview(JSON.stringify(parsedActionDsl.value)),
+                output: truncateStreamPreview(streamedOutput),
+                success: actionResult.result.success,
+              });
+              this.recordRunToolMetadata(runBuilder, actionResult.result.metadata);
+              currentMessages.push({
+                role: 'user',
+                content: this.formatActionDslToolResult(
+                  parsedActionDsl.value.kind === 'action' ? parsedActionDsl.value.action : 'action',
+                  this.buildToolResultForModel('readFile', actionResult.result),
+                ),
+              });
+              runBuilder.finishStep(actionStep.id, {
+                toolName: parsedActionDsl.value.kind === 'action' ? parsedActionDsl.value.action : undefined,
+                toolInputSummary: truncateStreamPreview(JSON.stringify(parsedActionDsl.value)),
+                toolOutputPreview: truncateStreamPreview(streamedOutput),
+              }, actionResult.result.success ? 'done' : 'error');
+              const finishedActionStep = runBuilder.snapshot().steps.find((entry) => entry.id === actionStep.id);
+              if (finishedActionStep) {
+                this.planner.upsertRunStep({
+                  id: finishedActionStep.id,
+                  type: finishedActionStep.type,
+                  title: finishedActionStep.title,
+                  status: finishedActionStep.status,
+                  detail: finishedActionStep.detail,
+                  toolName: finishedActionStep.toolName,
+                });
+                this.emitRunStep(streamHandlers, runId, finishedActionStep);
+              }
+              this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+              continue;
+            }
+
+            if (actionResult.kind === 'blocker') {
+              this.emitChatToolEvent(streamHandlers, {
+                id: actionToolEventId,
+                name: 'blocker',
+                state: 'done',
+                inputSummary: truncateStreamPreview(JSON.stringify(parsedActionDsl.value)),
+                output: truncateStreamPreview(`${actionResult.reason}\n${actionResult.nextSafeStep}`),
+                success: false,
+              });
+              runBuilder.finishStep(actionStep.id, {
+                detail: actionResult.reason,
+              }, 'error');
+              const finishedActionStep = runBuilder.snapshot().steps.find((entry) => entry.id === actionStep.id);
+              if (finishedActionStep) {
+                this.planner.upsertRunStep({
+                  id: finishedActionStep.id,
+                  type: finishedActionStep.type,
+                  title: finishedActionStep.title,
+                  status: finishedActionStep.status,
+                  detail: finishedActionStep.detail,
+                  toolName: finishedActionStep.toolName,
+                });
+                this.emitRunStep(streamHandlers, runId, finishedActionStep);
+              }
+              this.planner.setPhase('blocked');
+              this.planner.setCurrentTool(undefined);
+              this.planner.setIntendedAction(actionResult.nextSafeStep);
+              this.emitChatStatus(streamHandlers, 'warning', actionResult.reason, loopCount);
+              return await finalizeRun(
+                `Blocked: ${actionResult.reason}\nNext safe step: ${actionResult.nextSafeStep}`,
+                actionResult.reason,
+              );
+            }
+
+            const finalActionAnswer = [
+              actionResult.summary,
+              actionResult.verification ? `Verification: ${actionResult.verification}` : null,
+            ].filter((entry): entry is string => Boolean(entry)).join('\n\n');
+            if (selfCheckPromptCount < toolRetryMax && this.needsPostActionSelfCheck(runBuilder.snapshot())) {
+              selfCheckPromptCount += 1;
+              this.traceBus.emitEvent({
+                type: 'self_check_requested',
+                data: {
+                  runId,
+                  manualToolProtocol: false,
+                  touchedPaths: [...runBuilder.snapshot().filesWritten, ...runBuilder.snapshot().filesDeleted, ...runBuilder.snapshot().directoriesCreated],
+                },
+              });
+              this.planner.setPhase('verification');
+              this.planner.setCurrentTool(undefined);
+              this.planner.setIntendedAction('Verifying changes before final answer');
+              this.emitChatStatus(streamHandlers, 'verification', 'Verifying changes before final answer', loopCount);
+              currentMessages.push({
+                role: 'system',
+                content: this.buildSelfCheckPrompt(runBuilder.snapshot(), false),
+              });
+              continue;
+            }
+
+            this.planner.setPhase('ready');
+            this.planner.setCurrentTool(undefined);
+            this.planner.setIntendedAction('Awaiting user input');
+            this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
+            this.traceBus.emitEvent({
+              type: 'chat_response',
+              data: { length: finalActionAnswer.length, agentProtocol: this.config.agentProtocol },
+            });
+            return await finalizeRun(finalActionAnswer);
+          } catch (error: any) {
+            this.emitChatToolEvent(streamHandlers, {
+              id: actionToolEventId,
+              name: parsedActionDsl.value.kind === 'action' ? parsedActionDsl.value.action : 'action_dsl',
+              state: 'done',
+              inputSummary: truncateStreamPreview(JSON.stringify(parsedActionDsl.value)),
+              output: truncateStreamPreview(`Error: ${error.message}`),
+              success: false,
+            });
+            runBuilder.finishStep(actionStep.id, {
+              detail: error.message,
+            }, 'error');
+            const finishedActionStep = runBuilder.snapshot().steps.find((entry) => entry.id === actionStep.id);
+            if (finishedActionStep) {
+              this.planner.upsertRunStep({
+                id: finishedActionStep.id,
+                type: finishedActionStep.type,
+                title: finishedActionStep.title,
+                status: finishedActionStep.status,
+                detail: finishedActionStep.detail,
+                toolName: finishedActionStep.toolName,
+              });
+              this.emitRunStep(streamHandlers, runId, finishedActionStep);
+            }
+            currentMessages.push({
+              role: 'user',
+              content: this.formatActionDslBlocker(error.message, 'Fix the Action DSL response and retry.'),
+            });
+            continue;
+          }
+        }
 
         if (nativeToolDefinitions && message.tool_calls && message.tool_calls.length > 0) {
           responseContinuationCount = 0;
@@ -3604,7 +5862,7 @@ export class CoreEngine extends EventEmitter {
             this.traceBus.emitEvent({
               type: 'native_tool_retry_requested',
               data: {
-                model: this.config.model,
+                model: agentRunModel,
                 reason: retryReason,
                 promptMode,
                 selectedTools: selectedToolNames,
@@ -3624,7 +5882,7 @@ export class CoreEngine extends EventEmitter {
             this.traceBus.emitEvent({
               type: 'manual_tool_fallback',
               data: {
-                model: this.config.model,
+                model: agentRunModel,
                 reason: retryReason,
                 manualToolProtocol: true,
                 selectedTools: selectedToolNames,
@@ -3686,7 +5944,7 @@ export class CoreEngine extends EventEmitter {
             this.traceBus.emitEvent({
               type: 'tool_simulation_detected',
               data: {
-                model: this.config.model,
+                model: agentRunModel,
                 attempt: simulatedToolReplyCount,
                 preview: response.slice(0, 240),
                 manualToolProtocol: true,
@@ -3843,7 +6101,7 @@ export class CoreEngine extends EventEmitter {
           this.traceBus.emitEvent({
             type: 'tool_simulation_detected',
             data: {
-              model: this.config.model,
+              model: agentRunModel,
               attempt: simulatedToolReplyCount,
               preview: response.slice(0, 240),
             },
@@ -3919,6 +6177,7 @@ export class CoreEngine extends EventEmitter {
       this.planner.failRun(error?.message || 'Agentic run failed.');
       throw error;
     } finally {
+      releaseHeavyModelLock?.();
       this.traceBus.off('trace', traceListener);
     }
   }

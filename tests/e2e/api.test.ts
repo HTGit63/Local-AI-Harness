@@ -69,6 +69,13 @@ async function waitFor<T>(factory: () => Promise<T | null>, timeoutMs = 10000): 
 
 async function startMockModelServer(): Promise<{ server: http.Server; baseUrl: string; getChatRequests: () => any[] }> {
   const chatRequests: any[] = [];
+  const installedModels = [
+    { name: 'gemma4:e4b' },
+    { name: 'VladimirGav/gemma4-26b-16GB-VRAM:latest' },
+  ];
+  let runningModels = [
+    { name: 'gemma4:e4b', model: 'gemma4:e4b', context_length: 8192 },
+  ];
   const server = http.createServer((req, res) => {
     const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
     const chunks: Buffer[] = [];
@@ -80,13 +87,27 @@ async function startMockModelServer(): Promise<{ server: http.Server; baseUrl: s
 
       if (requestUrl.pathname === '/api/tags') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ models: [{ name: 'gemma4:e4b' }] }));
+        res.end(JSON.stringify({ models: installedModels }));
         return;
       }
 
       if (requestUrl.pathname === '/api/ps') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ models: [{ name: 'gemma4:e4b', model: 'gemma4:e4b', context_length: 8192 }] }));
+        res.end(JSON.stringify({ models: runningModels }));
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/generate') {
+        if (body.keep_alive === 0) {
+          runningModels = runningModels.filter((entry) => entry.model !== body.model);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ model: body.model, done: true, done_reason: 'unload', response: '' }));
+          return;
+        }
+
+        runningModels = [{ name: body.model, model: body.model, context_length: 8192 }];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model: body.model, done: true, done_reason: 'load', response: '' }));
         return;
       }
 
@@ -208,6 +229,13 @@ async function fetchNdjsonWithIntervention(
 
 async function startApprovalFlowMockModelServer(): Promise<{ server: http.Server; baseUrl: string; getChatRequests: () => any[] }> {
   const chatRequests: any[] = [];
+  const installedModels = [
+    { name: 'gemma4:e4b' },
+    { name: 'VladimirGav/gemma4-26b-16GB-VRAM:latest' },
+  ];
+  let runningModels = [
+    { name: 'gemma4:e4b', model: 'gemma4:e4b', context_length: 8192 },
+  ];
   const server = http.createServer((req, res) => {
     const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
     const chunks: Buffer[] = [];
@@ -219,13 +247,27 @@ async function startApprovalFlowMockModelServer(): Promise<{ server: http.Server
 
       if (requestUrl.pathname === '/api/tags') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ models: [{ name: 'gemma4:e4b' }] }));
+        res.end(JSON.stringify({ models: installedModels }));
         return;
       }
 
       if (requestUrl.pathname === '/api/ps') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ models: [{ name: 'gemma4:e4b', model: 'gemma4:e4b', context_length: 8192 }] }));
+        res.end(JSON.stringify({ models: runningModels }));
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/generate') {
+        if (body.keep_alive === 0) {
+          runningModels = runningModels.filter((entry) => entry.model !== body.model);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ model: body.model, done: true, done_reason: 'unload', response: '' }));
+          return;
+        }
+
+        runningModels = [{ name: body.model, model: body.model, context_length: 8192 }];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ model: body.model, done: true, done_reason: 'load', response: '' }));
         return;
       }
 

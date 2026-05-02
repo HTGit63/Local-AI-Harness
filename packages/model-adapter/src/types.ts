@@ -71,6 +71,25 @@ export interface ModelSwitchResult {
   message: string;
 }
 
+export interface ModelActivationOptions {
+  keepAlive?: string | number;
+  requireActivation?: boolean;
+}
+
+export interface HeavyModelLockState {
+  held: boolean;
+  ownerRunId: string | null;
+  queued: number;
+}
+
+export interface ModelRouteSelection {
+  role: 'fast' | 'agent' | 'coding' | 'review' | 'summary';
+  model: string;
+  protocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
+  keepAlive?: string | number;
+  reason?: string;
+}
+
 export interface ModelRuntimeState {
   configuredModel: string;
   activeModel: string | null;
@@ -80,4 +99,10 @@ export interface ModelRuntimeState {
   supportsLifecycle: boolean;
   configuredModelCapabilities?: string[];
   lastSwitchResult?: ModelSwitchResult;
+  agentModel?: string;
+  summaryModel?: string;
+  agentProtocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
+  agentModelActive?: boolean;
+  heavyModelLock?: HeavyModelLockState;
+  lastRouteSelection?: ModelRouteSelection;
 }

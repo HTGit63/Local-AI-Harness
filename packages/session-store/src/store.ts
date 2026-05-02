@@ -57,7 +57,38 @@ export class FileSessionStore implements SessionStorageEngine {
       skillsActive: [...session.skillsActive],
       toolsAllowlist: [...session.toolsAllowlist],
       turnHistory: Array.isArray(session.turnHistory)
-        ? session.turnHistory.map((turn) => ({ ...turn }))
+        ? session.turnHistory.map((turn) => ({
+            ...turn,
+            runSummary: turn.runSummary
+              ? {
+                  ...turn.runSummary,
+                  steps: turn.runSummary.steps.map((step) => ({ ...step })),
+                  filesRead: [...turn.runSummary.filesRead],
+                  directoriesRead: [...turn.runSummary.directoriesRead],
+                  filesWritten: [...turn.runSummary.filesWritten],
+                  filesDeleted: [...turn.runSummary.filesDeleted],
+                  directoriesCreated: [...turn.runSummary.directoriesCreated],
+                  searches: turn.runSummary.searches.map((entry) => ({ ...entry })),
+                  webSearches: turn.runSummary.webSearches.map((entry) => ({ ...entry })),
+                  webFetches: turn.runSummary.webFetches.map((entry) => ({ ...entry })),
+                  commands: turn.runSummary.commands.map((entry) => ({ ...entry })),
+                  approvals: turn.runSummary.approvals.map((entry) => ({ ...entry })),
+                  git: turn.runSummary.git ? { ...turn.runSummary.git } : undefined,
+                  metrics: turn.runSummary.metrics ? { ...turn.runSummary.metrics } : undefined,
+                  workflow: turn.runSummary.workflow
+                    ? {
+                        ...turn.runSummary.workflow,
+                        steps: turn.runSummary.workflow.steps.map((step) => ({ ...step })),
+                        filesRead: [...turn.runSummary.workflow.filesRead],
+                        filesChanged: [...turn.runSummary.workflow.filesChanged],
+                        approvals: [...turn.runSummary.workflow.approvals],
+                        commands: [...turn.runSummary.workflow.commands],
+                        errors: [...turn.runSummary.workflow.errors],
+                      }
+                    : undefined,
+                }
+              : undefined,
+          }))
         : undefined,
     };
   }

@@ -515,6 +515,10 @@ apps/web/src/app/HarnessApp.tsx
 - `/api/config` returns the new protocol/model fields.
 - Existing direct chat still works.
 
+### Current status
+
+- TASK-01 done: config/API/UI/CLI expose protocol and agent/summary model fields; direct chat remains separate; `agent-smoke` defaults to `action_dsl` while `native_tools` remains the compatibility baseline.
+
 ---
 
 ## TASK-02 — Add the model-router package
@@ -546,6 +550,10 @@ packages/model-router/src/index.ts
 - Agentic mode can ask router for the correct model.
 - The selected route is visible in trace.
 - Tests prove no two heavy agentic runs execute concurrently.
+
+### Current status
+
+- TASK-02 done: `packages/model-router` now owns model role selection, unload candidate selection, and serialized heavy-model locking; core uses it for agentic route/lock behavior and unit tests prove lock serialization.
 
 ---
 
@@ -654,6 +662,13 @@ packages/tool-runtime/src/registry.ts
 
 ## TASK-06 — Add Action DSL repair loop
 
+### Current status
+
+- TASK-03 done: agentic runs warm 26B, unload unrelated heavy models, expose active agent/runtime state in UI/API, and emit lifecycle traces.
+- TASK-04 done: `packages/action-dsl` exists with strict JSON parser, validator, and unit coverage for valid, malformed, unknown, missing-arg, multiple-action, and fenced JSON cases.
+- TASK-05 done: `ActionDslExecutor` maps reads, list, search, diff preview, patch preview, write/apply, and command actions through the tool runtime with trace events.
+- TASK-06 done: malformed Action DSL now repairs once, then stops visibly with parse-failure traces and UI-safe blocker text.
+
 ### Goal
 
 Make malformed model actions recover once, then fail visibly.
@@ -712,6 +727,10 @@ apps/web/src/app/HarnessApp.tsx
 - UI shows protocol for each run.
 - Existing native path remains available for comparison.
 
+### Current status
+
+- TASK-07 done: agentic runs now switch by protocol, direct chat stays untouched, traces record the selected protocol, and the UI surfaces the run protocol.
+
 ---
 
 ## TASK-08 — Create workflow-runner package
@@ -742,6 +761,10 @@ packages/workflow-runner/src/index.ts
 - A workflow can start, advance steps, block, fail, and complete.
 - Workflow state can be serialized and resumed.
 
+### Current status
+
+- TASK-08 done: `packages/workflow-runner` now owns workflow state, validates transitions, emits workflow events, and round-trips workflow data through run/session summaries.
+
 ---
 
 ## TASK-09 — Implement `inspect_project` workflow
@@ -766,6 +789,10 @@ Create the safest first workflow.
 - It can summarize a repo without editing files.
 - It produces a final answer with files read and commands detected.
 - It avoids reading the entire repo.
+
+### Current status
+
+- TASK-09 done: `inspect_project` now detects commands, reads top-level files plus manifests/README, builds the compact context pack, and returns a final structured summary.
 
 ---
 
@@ -795,6 +822,10 @@ Create a reliable edit workflow for one target file.
 - The workflow can modify one file safely.
 - The user sees the diff before applying.
 - The final summary does not claim unverified work.
+
+### Current status
+
+- TASK-10 done: `fix_single_file` now confirms one target, checkpoints, previews diff, waits for approval, applies the approved patch, runs verification, and summarizes the result.
 
 ---
 
@@ -827,6 +858,10 @@ Support realistic coding tasks that touch one to three files.
 - The model cannot rewrite the repo.
 - All changed files appear in the run ledger.
 
+### Current status
+
+- TASK-11 done: `small_patch` now handles one to three files, builds per-file patch actions, previews combined diffs, gates approval, runs verification, and summarizes the change set.
+
 ---
 
 ## TASK-12 — Implement `repo_audit` workflow
@@ -851,6 +886,7 @@ Support broad inspection without accidental broad editing.
 - Repo audit never writes files by default.
 - It reports evidence and file paths.
 - It can suggest follow-up workflows instead of editing immediately.
+- Status: done.
 
 ---
 
@@ -883,6 +919,7 @@ apps/web/src/types/run.ts
 - User can tell whether the model is thinking, acting, waiting, blocked, or done.
 - User can tell whether 26B is active.
 - User can tell what files changed.
+- Status: done.
 
 ---
 
@@ -930,6 +967,7 @@ node apps/cli/dist/cli.js agent-smoke \
   - tool count
   - parse failures
   - memory/routing notes when available
+- Status: done.
 
 ---
 
@@ -958,6 +996,13 @@ docs/experiments/results-template.md
 
 - The branch produces a decision, not just code.
 - The user can choose whether to merge the whole experiment or only part of it.
+
+### Current status
+
+- Status: done.
+- TASK-15 done: `docs/experiments/action-dsl-workflow-26b.md` documents what changed, compares `native_tools` vs `action_dsl` vs `workflow_runner`, records 26B RAM behavior, records smoke results, and recommends the merge/default path.
+- TASK-15 template done: `docs/experiments/results-template.md` gives a repeatable evidence format for future protocol/model runs.
+- Live 26B smoke status: blocked by current RAM, with Ollama reporting `model requires more system memory (14.9 GiB) than is available (14.1 GiB)`; smaller-model live smoke verified workflow/read and approval/write paths.
 
 ---
 
@@ -1034,21 +1079,21 @@ Do not jump to Rust or a full rewrite until these three questions are answered.
 Use this sequence:
 
 ```text
-TASK-01 config
-TASK-02 model-router
-TASK-03 RAM governor
-TASK-04 Action DSL schema/parser
-TASK-05 Action DSL executor
-TASK-06 Action DSL repair
-TASK-07 protocol-selected agentic loop
-TASK-08 workflow-runner base
-TASK-09 inspect_project workflow
-TASK-10 fix_single_file workflow
-TASK-11 small_patch workflow
-TASK-12 repo_audit workflow
-TASK-13 UI run console
-TASK-14 smoke tests
-TASK-15 experiment report
+TASK-01 [done] config
+TASK-02 [done] model-router
+TASK-03 [done] RAM governor
+TASK-04 [done] Action DSL schema/parser
+TASK-05 [done] Action DSL executor
+TASK-06 [done] Action DSL repair
+TASK-07 [done] protocol-selected agentic loop
+TASK-08 [done] workflow-runner base
+TASK-09 [done] inspect_project workflow
+TASK-10 [done] fix_single_file workflow
+TASK-11 [done] small_patch workflow
+TASK-12 [done] repo_audit workflow
+TASK-13 [done] UI run console
+TASK-14 [done] smoke tests
+TASK-15 [done] experiment report
 ```
 
 Do not build UI first. Do not build workflows before the Action DSL parser/executor works.
