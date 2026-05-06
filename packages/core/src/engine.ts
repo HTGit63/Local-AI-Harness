@@ -6521,7 +6521,8 @@ export class CoreEngine extends EventEmitter {
           `Task complexity: ${taskPlan?.complexity || 'unknown'}`,
           `Local budget profile: ${this.config.localModelBudgetProfile}`,
           `Context budget: ${this.config.contextBudget} chars target`,
-          `Output budget for this step: ${maxTokens}`,          `Retry budget: ${this.config.toolRetryMax}`,
+          `Output budget for this step: ${maxTokens}`,
+          `Retry budget: ${this.config.toolRetryMax}`,
           `Session memory: ${this.config.sessionMemoryEnabled ? `${this.config.sessionMemoryTurns} recent turns` : 'off'}`,
           `Self-check: ${this.config.selfCheckEnabled ? 'required after edits or commands' : 'off'}`,
           'If workspace tools are available and the request is about repo behavior, inspect workspace facts before asking the user for more detail.',
@@ -6537,7 +6538,8 @@ export class CoreEngine extends EventEmitter {
         ...(await this.buildContextMessages(requestMessages, promptMode, includeWorkspaceContext, includeRepoContext)) as EngineChatMessage[],
         runtimeContract,
         ...(taskPlan ? [{ role: 'system' as const, content: buildStepScopedPrompt(taskPlan, currentTaskStep, taskContext) }] : []),
-        ...(useActionDsl ? [] : manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),        ...promptMessages,
+        ...(useActionDsl ? [] : manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),
+        ...promptMessages,
       ];
 
       if (workspaceBound) {

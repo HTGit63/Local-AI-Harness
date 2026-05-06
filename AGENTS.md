@@ -367,11 +367,6 @@ list_dir
 read_file
 search_text
 glob
-build_context_pack
-find_symbol
-find_function
-get_structured_diff
-create_checkpoint
 propose_patch
 write_file_preview
 apply_approved_change
@@ -380,6 +375,8 @@ run_selected_command
 final_answer
 blocker
 ```
+
+`build_context_pack`, `find_symbol`, `find_function`, `get_structured_diff`, and `create_checkpoint` are not Action DSL v1 actions. They remain real harness/runtime capabilities through native tools and workflow-runner steps only. Do not re-add them to Action DSL unless they are wired end-to-end with honest failure behavior and tests.
 
 ## 6.3 Parser requirements
 

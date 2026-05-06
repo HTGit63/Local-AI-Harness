@@ -57,6 +57,11 @@ function outputWithPreview(result: ToolResult, preview: string): ToolResult {
   };
 }
 
+function isMissingFileResult(result: ToolResult): boolean {
+  const text = `${result.error || ''}\n${result.output || ''}`;
+  return /\bENOENT\b|no such file or directory/i.test(text);
+}
+
 export class ActionDslExecutor {
   constructor(
     private readonly runtime: ActionDslRuntime,
@@ -108,7 +113,10 @@ export class ActionDslExecutor {
         return this.runtime.previewPatch(String(args.path), String(args.oldText), String(args.newText));
       case 'write_file_preview': {
         const current = await this.runtime.readFile(String(args.path));
-        return this.runtime.previewPatch(String(args.path), current.output, String(args.content));
+        if (!current.success && !isMissingFileResult(current)) {
+          return current;
+        }
+        return this.runtime.previewPatch(String(args.path), current.success ? current.output : '', String(args.content));
       }
       case 'apply_approved_change':
         if (typeof args.content === 'string' && args.content.length > 0) {

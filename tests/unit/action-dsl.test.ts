@@ -111,6 +111,12 @@ async function testExecutor() {
     assert.strictEqual(patchResult.kind, 'tool');
     assert.ok(patchResult.result.preview?.includes('agent'));
 
+    const newFilePreview = await executor.execute(assertParseOk(parseActionDsl('{"kind":"action","action":"write_file_preview","args":{"path":"src/new-file.ts","content":"export const created = true;\\n"}}')).value);
+    assert.strictEqual(newFilePreview.kind, 'tool');
+    assert.strictEqual(newFilePreview.action, 'write_file_preview');
+    assert.ok(newFilePreview.result.success);
+    assert.ok(newFilePreview.result.preview?.includes('created'));
+
     for (const action of ['find_symbol', 'find_function', 'get_structured_diff', 'create_checkpoint']) {
       const removed = parseActionDsl(JSON.stringify({ kind: 'action', action, args: {} }));
       assert.ok(!removed.ok);
