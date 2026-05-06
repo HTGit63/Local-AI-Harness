@@ -1,8 +1,6 @@
 import {
-  ACTION_DSL_ALLOWED_NAMES,
   ACTION_DSL_TOOL_NAMES,
   type ActionDslAction,
-  type ActionDslAllowedName,
   type ActionDslBlocker,
   type ActionDslDocument,
   type ActionDslFinalAnswer,
@@ -109,20 +107,6 @@ function coerceToolArgs(action: ActionDslToolName, args: Record<string, unknown>
       }
       return { ok: true, source, value: { kind: 'action', action, args: { pattern } } };
     }
-    case 'build_context_pack': {
-      const root = coerceField(args, ['root', 'path', 'dirPath']);
-      return { ok: true, source, value: { kind: 'action', action, args: root ? { root } : {} } };
-    }
-    case 'find_symbol':
-    case 'find_function': {
-      const name = coerceField(args, ['name', 'query', 'symbol']);
-      if (!name) {
-        return makeError('MISSING_REQUIRED_ARGUMENT', `Missing required argument "name" for ${action}.`, source, 'name');
-      }
-      const path = coerceField(args, ['path', 'filePattern', 'pattern', 'filePath']);
-      return { ok: true, source, value: { kind: 'action', action, args: path ? { name, path } : { name } } };
-    }
-    case 'get_structured_diff':
     case 'propose_patch': {
       const path = coerceField(args, ['path', 'filePath']);
       const oldText = toTrimmedString(args.oldText) ?? toTrimmedString(args.old_content);
@@ -137,10 +121,6 @@ function coerceToolArgs(action: ActionDslToolName, args: Record<string, unknown>
         return makeError('MISSING_REQUIRED_ARGUMENT', `Missing required argument "newText" for ${action}.`, source, 'newText');
       }
       return { ok: true, source, value: { kind: 'action', action, args: { path, oldText, newText } } };
-    }
-    case 'create_checkpoint': {
-      const label = toTrimmedString(args.label);
-      return { ok: true, source, value: { kind: 'action', action, args: label ? { label } : {} } };
     }
     case 'write_file_preview': {
       const path = coerceField(args, ['path', 'filePath']);
@@ -179,7 +159,7 @@ function coerceToolArgs(action: ActionDslToolName, args: Record<string, unknown>
       if (newText) {
         normalized.newText = newText;
       }
-      return { ok: true, source, value: { kind: 'action', action, args: normalized as ActionDslAction['args'] } };
+      return { ok: true, source, value: { kind: 'action', action, args: normalized as unknown as ActionDslAction['args'] } };
     }
     case 'run_command_preview':
     case 'run_selected_command': {
@@ -229,7 +209,7 @@ export function validateActionDslDocument(raw: unknown, source: 'json' | 'markdo
   }
 
   const kind = toTrimmedString(raw.kind);
-  const actionName = toTrimmedString(raw.action) as ActionDslAllowedName | null;
+  const actionName = toTrimmedString(raw.action);
 
   if (!kind && !actionName) {
     return makeError('MISSING_REQUIRED_ARGUMENT', 'Missing required "kind" or "action" field.', source, 'kind');

@@ -3,11 +3,6 @@ export const ACTION_DSL_TOOL_NAMES = [
   'read_file',
   'search_text',
   'glob',
-  'build_context_pack',
-  'find_symbol',
-  'find_function',
-  'get_structured_diff',
-  'create_checkpoint',
   'propose_patch',
   'write_file_preview',
   'apply_approved_change',
@@ -40,30 +35,6 @@ export interface ActionDslSearchTextArgs {
 
 export interface ActionDslGlobArgs {
   pattern: string;
-}
-
-export interface ActionDslBuildContextPackArgs {
-  root?: string;
-}
-
-export interface ActionDslFindSymbolArgs {
-  name: string;
-  path?: string;
-}
-
-export interface ActionDslFindFunctionArgs {
-  name: string;
-  path?: string;
-}
-
-export interface ActionDslStructuredDiffArgs {
-  path: string;
-  oldText: string;
-  newText: string;
-}
-
-export interface ActionDslCreateCheckpointArgs {
-  label?: string;
 }
 
 export interface ActionDslProposePatchArgs {
@@ -106,11 +77,6 @@ export interface ActionDslToolArgsMap {
   read_file: ActionDslReadFileArgs;
   search_text: ActionDslSearchTextArgs;
   glob: ActionDslGlobArgs;
-  build_context_pack: ActionDslBuildContextPackArgs;
-  find_symbol: ActionDslFindSymbolArgs;
-  find_function: ActionDslFindFunctionArgs;
-  get_structured_diff: ActionDslStructuredDiffArgs;
-  create_checkpoint: ActionDslCreateCheckpointArgs;
   propose_patch: ActionDslProposePatchArgs;
   write_file_preview: ActionDslWriteFilePreviewArgs;
   apply_approved_change: ActionDslApplyApprovedChangeArgs;

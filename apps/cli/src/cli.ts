@@ -137,7 +137,10 @@ function formatAgentSmokeRuntimeError(error: unknown, details: {
   return new Error(lines.join('\n'));
 }
 
-function createSmokeEngine(agentProtocol: 'native_tools' | 'action_dsl' | 'workflow_runner') {
+function createSmokeEngine(
+  agentProtocol: 'native_tools' | 'action_dsl' | 'workflow_runner',
+  options: { shortcutAnswersEnabled?: boolean } = {},
+) {
   const baseUrl = process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1';
   return new CoreEngine({
     workspaceRoot: process.cwd(),
@@ -148,6 +151,7 @@ function createSmokeEngine(agentProtocol: 'native_tools' | 'action_dsl' | 'workf
     summaryModel: process.env.HARNESS_SUMMARY_MODEL || process.env.HARNESS_MODEL || process.env.OPENAI_MODEL || 'gemma4:e4b',
     agentProtocol,
     agentKeepAlive: process.env.HARNESS_AGENT_KEEP_ALIVE || '90s',
+    shortcutAnswersEnabled: options.shortcutAnswersEnabled ?? true,
   });
 }
 
@@ -357,13 +361,12 @@ async function handleAgentSmoke() {
   const requireWorkflow = getArgValue('--workflow');
   const requireApproval = hasArg('--require-approval');
   const requireDiff = hasArg('--require-diff');
-  const normalizedRequireAction = requireAction ? normalizeActionName(requireAction) : '';
   const agentProtocol: 'native_tools' | 'action_dsl' | 'workflow_runner' = requireWorkflow
     ? 'workflow_runner'
-    : normalizedRequireAction === 'readfile'
-      ? 'workflow_runner'
     : (process.env.HARNESS_AGENT_PROTOCOL as 'native_tools' | 'action_dsl' | 'workflow_runner' | undefined) || 'action_dsl';
-  const smokeEngine = createSmokeEngine(agentProtocol);
+  const smokeEngine = createSmokeEngine(agentProtocol, {
+    shortcutAnswersEnabled: !requireAction,
+  });
   const startedAt = Date.now();
   const toolEvents: Array<{ id: string; name: string; state: 'start' | 'done'; inputSummary: string; output?: string; success?: boolean }> = [];
   const approvalEvents: Array<{ id: string; target: string; preview: string }> = [];

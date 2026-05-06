@@ -9,8 +9,9 @@ import { ModelAdapter, ModelRuntimeState, ModelSwitchResult } from '@local-harne
 import { HeavyModelLock, ModelRouter, type AgentProtocol, type ModelRouteSelection, selectUnloadCandidates } from '@local-harness/model-router';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
-import { RepoIndexer, ProjectContext } from '@local-harness/repo-indexer';
+import { RepoIndexer, ProjectContext, TaskContext } from '@local-harness/repo-indexer';
 import { AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
+import { LOCAL_MODEL_BUDGET_PROFILES, LocalModelBudgetProfile, TaskOrchestrator, TaskPlan, TaskStep } from '@local-harness/task-orchestrator';
 import { ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
@@ -37,10 +38,32 @@ const SUPPORTED_TOOLS = [
   'listDir',
   'webSearch',
   'fetchUrl',
+  'findSymbol',
+  'findFunction',
+  'findComponent',
+  'whatDoesThisImport',
+  'whoImports',
+  'affectedFiles',
+  'selectTestsForChangedFiles',
+  'detectProjectCommands',
+  'buildContextPack',
   'writeFile',
   'patchFile',
+  'replaceFunction',
+  'insertImport',
+  'addTypeProperty',
+  'renameIdentifier',
+  'replaceRange',
+  'insertAfter',
+  'insertBefore',
+  'replaceBlock',
+  'applyUnifiedPatch',
+  'previewPatch',
   'makeDir',
   'deleteFile',
+  'getStructuredDiff',
+  'createCheckpoint',
+  'rollbackToCheckpoint',
   'runCommand',
   'gitStatus',
   'gitDiff',
@@ -54,6 +77,7 @@ type TurnExecutionMode = 'direct' | 'agentic';
 type WorkflowScenario = 'inspect_project' | 'fix_single_file' | 'small_patch' | 'repo_audit';
 type WorkflowCompletion = { answer: string; error?: string };
 type ReasoningEffort = 'high' | 'medium' | 'low' | 'none';
+type LocalModelBudgetProfileName = keyof typeof LOCAL_MODEL_BUDGET_PROFILES;
 type StreamIdleTimeoutError = Error & {
   code: 'stream_idle_timeout';
   receivedContent: boolean;
@@ -63,6 +87,10 @@ type ManualToolDecision =
   | { kind: 'final'; content: string };
 type ImmediateChatAnswer = { content: string; action: string; source: string };
 type ToolProtocolMode = 'native' | 'manual_preferred' | 'manual_fallback';
+type ExecutionProfile = 'fast_local' | 'balanced_local' | 'deep_review' | 'api_frontier';
+type ProviderProfile = 'ollama_local' | 'openai_compatible' | 'openrouter' | 'together' | 'groq' | 'qwen_api' | 'kimi_api';
+type PromptProfile = 'gemma-local-fast' | 'qwen-coder-local' | 'deepseek-coder-local' | 'kimi-api-long-context' | 'frontier-mini-api';
+type ModelRoutePurpose = 'classify' | 'direct' | 'inspect' | 'code' | 'summarize' | 'review';
 type BootstrapPlanStep =
   | { type: 'inventory'; title: string }
   | { type: 'tool'; title: string; toolName: SupportedTool; args: Record<string, unknown> };
@@ -138,6 +166,33 @@ export interface RunSummaryEvent {
   summary: AgentRun;
 }
 
+export interface RunCheckpoint {
+  runId: string;
+  sessionId: string;
+  taskPlan: TaskPlan;
+  currentStepId?: string;
+  completedSteps: string[];
+  failedSteps: string[];
+  blockedSteps: string[];
+  filesRead: string[];
+  filesWritten: string[];
+  filesDeleted: string[];
+  commandsRun: string[];
+  approvals: Array<{
+    id: string;
+    target: string;
+    approved: boolean | null;
+  }>;
+  summarySoFar: string;
+  lastToolResults: Array<{
+    tool: string;
+    success: boolean;
+    outputPreview: string;
+  }>;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ChatStreamHandlers {
   onStatus?: (event: ChatStatusEvent) => void;
   onDelta?: (chunk: string) => void;
@@ -147,6 +202,7 @@ export interface ChatStreamHandlers {
   onRunStep?: (event: RunStepEvent) => void;
   onRunMetric?: (event: RunMetricEvent) => void;
   onRunSummary?: (event: RunSummaryEvent) => void;
+  onTrace?: (event: TraceEvent) => void;
 }
 
 export interface EngineConfig {
@@ -168,6 +224,15 @@ export interface EngineConfig {
   sessionMemoryEnabled: boolean;
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
+  shortcutAnswersEnabled: boolean;
+  localModelBudgetProfile: LocalModelBudgetProfileName;
+  executionProfile: ExecutionProfile;
+  providerProfile: ProviderProfile;
+  promptProfile: PromptProfile;
+  fastModel: string;
+  codingModel: string;
+  reviewModel: string;
+  apiModel: string;
 }
 
 export interface PublicEngineConfig {
@@ -188,6 +253,16 @@ export interface PublicEngineConfig {
   sessionMemoryEnabled: boolean;
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
+  shortcutAnswersEnabled: boolean;
+  localModelBudgetProfile: LocalModelBudgetProfileName;
+  localModelBudget: LocalModelBudgetProfile;
+  executionProfile: ExecutionProfile;
+  providerProfile: ProviderProfile;
+  promptProfile: PromptProfile;
+  fastModel: string;
+  codingModel: string;
+  reviewModel: string;
+  apiModel: string;
 }
 
 export interface UpdateConfigOptions {
@@ -200,7 +275,7 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   model: 'gemma4:e4b',
   agentModel: process.env.HARNESS_AGENT_MODEL || 'VladimirGav/gemma4-26b-16GB-VRAM:latest',
   summaryModel: process.env.HARNESS_SUMMARY_MODEL || 'gemma4:e4b',
-  agentProtocol: (process.env.HARNESS_AGENT_PROTOCOL as AgentProtocol) || 'native_tools',
+  agentProtocol: (process.env.HARNESS_AGENT_PROTOCOL as AgentProtocol) || 'action_dsl',
   agentKeepAlive: process.env.HARNESS_AGENT_KEEP_ALIVE || '90s',
   profile: 'fast',
   workspaceRoot: process.cwd(),
@@ -213,6 +288,15 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   sessionMemoryEnabled: process.env.HARNESS_SESSION_MEMORY !== '0',
   sessionMemoryTurns: Number(process.env.HARNESS_SESSION_MEMORY_TURNS || 3),
   selfCheckEnabled: process.env.HARNESS_SELF_CHECK !== '0',
+  shortcutAnswersEnabled: process.env.HARNESS_SHORTCUT_ANSWERS !== '0',
+  localModelBudgetProfile: (process.env.HARNESS_LOCAL_MODEL_BUDGET_PROFILE as LocalModelBudgetProfileName) || 'balanced',
+  executionProfile: (process.env.HARNESS_EXECUTION_PROFILE as ExecutionProfile) || 'balanced_local',
+  providerProfile: (process.env.HARNESS_PROVIDER_PROFILE as ProviderProfile) || 'ollama_local',
+  promptProfile: (process.env.HARNESS_PROMPT_PROFILE as PromptProfile) || 'gemma-local-fast',
+  fastModel: process.env.HARNESS_FAST_MODEL || 'gemma4:e4b',
+  codingModel: process.env.HARNESS_CODING_MODEL || process.env.HARNESS_MODEL || 'qwen3.5:9b-q4_K_M',
+  reviewModel: process.env.HARNESS_REVIEW_MODEL || 'VladimirGav/gemma4-26b-16GB-VRAM:latest',
+  apiModel: process.env.HARNESS_API_MODEL || '',
 };
 
 function resolveSessionDataDir(workspaceRoot: string, sessionDataDir: string): string {
@@ -536,6 +620,29 @@ function getOptionalStringArg(args: Record<string, unknown>, key: string): strin
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+function getOptionalNumberArg(args: Record<string, unknown>, key: string): number | undefined {
+  const value = args[key];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+  return undefined;
+}
+
+function getRequiredNumberArg(args: Record<string, unknown>, key: string, toolName: SupportedTool): number {
+  const value = args[key];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+
+  throw new Error(`Missing required ${key} numeric argument for ${toolName}.`);
+}
+
 function extractFirstUrl(value: string): string | undefined {
   return value.match(/https?:\/\/[^\s)>\]]+/i)?.[0];
 }
@@ -686,6 +793,20 @@ const AGENT_HISTORY_COMPACTION_TAIL = 8;
 const LOOP_CONTEXT_COMPACTION_TAIL = 12;
 const MESSAGE_COMPACTION_LINE_CHARS = 220;
 const MAX_RESPONSE_CONTINUATIONS = 2;
+const STREAM_TASK_TRACE_TYPES = new Set([
+  'task_plan_created',
+  'task_step_started',
+  'task_step_completed',
+  'task_step_failed',
+  'task_step_blocked',
+  'task_checkpoint_saved',
+  'task_budget_exceeded',
+  'task_plan_completed',
+  'tool_call_started',
+  'tool_call_completed',
+  'verification_started',
+  'verification_completed',
+]);
 
 function truncateStreamPreview(value: string): string {
   const normalized = value.trim();
@@ -744,8 +865,20 @@ function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown
     case 'readFile':
     case 'writeFile':
     case 'patchFile':
+    case 'replaceFunction':
+    case 'insertImport':
+    case 'addTypeProperty':
+    case 'renameIdentifier':
+    case 'replaceRange':
+    case 'insertAfter':
+    case 'insertBefore':
+    case 'replaceBlock':
     case 'deleteFile':
       return `Path: ${getRequiredStringArg(args, 'filePath', toolName)}`;
+    case 'applyUnifiedPatch':
+      return 'Unified patch';
+    case 'previewPatch':
+      return `Preview: ${getRequiredStringArg(args, 'filePath', toolName)}`;
     case 'listDir':
       return `Path: ${getOptionalStringArg(args, 'dirPath') || '.'}`;
     case 'glob':
@@ -759,15 +892,85 @@ function summarizeToolArgs(toolName: SupportedTool, args: Record<string, unknown
       return `Query: ${getRequiredStringArg(args, 'query', toolName)}`;
     case 'fetchUrl':
       return `URL: ${getRequiredStringArg(args, 'url', toolName)}`;
+    case 'findSymbol':
+      return `Symbol: ${getRequiredStringArg(args, 'symbolName', toolName)}`;
+    case 'findFunction':
+      return `Function: ${getRequiredStringArg(args, 'functionName', toolName)}`;
+    case 'findComponent':
+      return `Component: ${getRequiredStringArg(args, 'componentName', toolName)}`;
+    case 'whatDoesThisImport':
+    case 'whoImports':
+    case 'affectedFiles':
+      return `Path: ${getRequiredStringArg(args, 'filePath', toolName)}`;
+    case 'selectTestsForChangedFiles':
+      return 'Changed files';
+    case 'buildContextPack':
+      return `Query: ${getRequiredStringArg(args, 'query', toolName)}`;
     case 'makeDir':
       return `Path: ${getRequiredStringArg(args, 'dirPath', toolName)}`;
+    case 'rollbackToCheckpoint':
+      return `Checkpoint: ${getRequiredStringArg(args, 'checkpointId', toolName)}`;
     case 'runCommand':
       return `Command: ${getRequiredStringArg(args, 'command', toolName)}`;
     case 'gitStatus':
     case 'gitDiff':
+    case 'getStructuredDiff':
+    case 'detectProjectCommands':
+    case 'createCheckpoint':
       return 'Workspace command';
     default:
       return truncateStreamPreview(JSON.stringify(args));
+  }
+}
+
+function buildTaskContextPrompt(taskContext: TaskContext | null): string {
+  if (!taskContext) {
+    return '[Task Relevant Context]\nUnavailable. Use targeted tools only.';
+  }
+  return [
+    '[Task Relevant Context]',
+    `Area: ${taskContext.taskArea}`,
+    `Reason: ${taskContext.reason}`,
+    `Relevant files: ${taskContext.relevantFiles.length > 0 ? taskContext.relevantFiles.join(', ') : 'none detected'}`,
+    `Entry points: ${taskContext.likelyEntryPoints.length > 0 ? taskContext.likelyEntryPoints.join(', ') : 'none detected'}`,
+    `Likely tests: ${taskContext.likelyTests.length > 0 ? taskContext.likelyTests.join(', ') : 'none detected'}`,
+    taskContext.ignoredFiles.length > 0 ? `Expected but missing: ${taskContext.ignoredFiles.slice(0, 8).join(', ')}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function buildStepScopedPrompt(taskPlan: TaskPlan, currentStep: TaskStep | null, taskContext: TaskContext | null): string {
+  return [
+    '[Current Task Plan]',
+    `Plan: ${taskPlan.title}`,
+    `Complexity: ${taskPlan.complexity}`,
+    `Progress: ${taskPlan.steps.map((stepEntry) => `[${stepEntry.status}] ${stepEntry.title}`).join(' | ')}`,
+    currentStep ? [
+      '[Current Step]',
+      `ID: ${currentStep.id}`,
+      `Type: ${currentStep.type}`,
+      `Title: ${currentStep.title}`,
+      `Allowed tools: ${currentStep.toolsAllowed.length > 0 ? currentStep.toolsAllowed.join(', ') : 'none'}`,
+      `Success: ${currentStep.successCriteria.join('; ')}`,
+      `Budget: model=${currentStep.budget.maxModelCalls}, tools=${currentStep.budget.maxToolCalls}, read=${currentStep.budget.maxFilesToRead}, write=${currentStep.budget.maxFilesToWrite}, output=${currentStep.budget.maxOutputTokens}`,
+    ].join('\n') : '[Current Step]\nNone.',
+    buildTaskContextPrompt(taskContext),
+    'Rule: execute only the current step. Use one tool call at a time. Do not solve later steps in this model call.',
+  ].join('\n\n');
+}
+
+function promptProfileInstruction(profile: PromptProfile): string {
+  switch (profile) {
+    case 'qwen-coder-local':
+      return 'Local Qwen coder profile: use deterministic tools first, keep patches small, prefer AST edit tools, get structured diff, run selected tests, return one tool call or one concise final answer.';
+    case 'deepseek-coder-local':
+      return 'Local DeepSeek coder profile: inspect exact code before edits, avoid broad rewrites, use checkpoint, structured diff, and targeted verification.';
+    case 'kimi-api-long-context':
+      return 'Kimi long-context profile: synthesize compact file cards before reading long files, keep citations to file paths and line ranges.';
+    case 'frontier-mini-api':
+      return 'Frontier mini profile: plan briefly, execute with tools, verify targeted tests, summarize exact diff hunks.';
+    case 'gemma-local-fast':
+    default:
+      return 'Local Gemma fast profile: no preamble before tool use, one tool call at a time, deterministic tools first, small context, max 1-2 model loops for small tasks.';
   }
 }
 
@@ -781,7 +984,9 @@ export class CoreEngine extends EventEmitter {
   private readonly approvalQueue: ApprovalQueueManager;
   private readonly planner: Planner;
   private readonly repoIndexer: RepoIndexer;
+  private readonly taskOrchestrator: TaskOrchestrator;
   private readonly toolRegistry: ToolRegistry;
+  private readonly autoCheckpointRuns = new Set<string>();
   private sessionDataDirSetting: string;
   private readonly traceLog: TraceEvent[] = [];
   private currentSession: SessionMetadata | null = null;
@@ -809,6 +1014,22 @@ export class CoreEngine extends EventEmitter {
     this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
     this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
     this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
+    this.config.shortcutAnswersEnabled = this.config.shortcutAnswersEnabled !== false;
+    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
+    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
+    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
+    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
+    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
+    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
+    if (!LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]) {
+      this.config.localModelBudgetProfile = DEFAULT_ENGINE_CONFIG.localModelBudgetProfile;
+    }
+    if (!LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]) {
+      this.config.localModelBudgetProfile = DEFAULT_ENGINE_CONFIG.localModelBudgetProfile;
+    }
+    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
+    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
+    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
 
     this.modelAdapter = new ModelAdapter(this.config);
     this.workspacePolicy = new WorkspacePolicy({
@@ -821,6 +1042,7 @@ export class CoreEngine extends EventEmitter {
     this.approvalQueue = new ApprovalQueueManager(this.traceBus);
     this.planner = new Planner(this.traceBus);
     this.repoIndexer = new RepoIndexer(this.config.workspaceRoot);
+    this.taskOrchestrator = new TaskOrchestrator();
     this.toolRegistry = new ToolRegistry({
       cwd: this.config.workspaceRoot,
       internetAccessEnabled: this.config.internetAccessEnabled,
@@ -898,7 +1120,75 @@ export class CoreEngine extends EventEmitter {
       sessionMemoryEnabled: this.config.sessionMemoryEnabled,
       sessionMemoryTurns: this.config.sessionMemoryTurns,
       selfCheckEnabled: this.config.selfCheckEnabled,
+      shortcutAnswersEnabled: this.config.shortcutAnswersEnabled,
+      localModelBudgetProfile: this.config.localModelBudgetProfile,
+      localModelBudget: LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile],
+      executionProfile: this.config.executionProfile,
+      providerProfile: this.config.providerProfile,
+      promptProfile: this.config.promptProfile,
+      fastModel: this.config.fastModel,
+      codingModel: this.config.codingModel,
+      reviewModel: this.config.reviewModel,
+      apiModel: this.config.apiModel,
     };
+  }
+
+  private normalizeExecutionProfile(value: string): ExecutionProfile {
+    return ['fast_local', 'balanced_local', 'deep_review', 'api_frontier'].includes(value)
+      ? value as ExecutionProfile
+      : DEFAULT_ENGINE_CONFIG.executionProfile;
+  }
+
+  private normalizeProviderProfile(value: string): ProviderProfile {
+    return ['ollama_local', 'openai_compatible', 'openrouter', 'together', 'groq', 'qwen_api', 'kimi_api'].includes(value)
+      ? value as ProviderProfile
+      : DEFAULT_ENGINE_CONFIG.providerProfile;
+  }
+
+  private normalizePromptProfile(value: string): PromptProfile {
+    return ['gemma-local-fast', 'qwen-coder-local', 'deepseek-coder-local', 'kimi-api-long-context', 'frontier-mini-api'].includes(value)
+      ? value as PromptProfile
+      : DEFAULT_ENGINE_CONFIG.promptProfile;
+  }
+
+  private selectModelForPurpose(purpose: ModelRoutePurpose): string {
+    const fallback = this.config.model;
+    if (this.config.executionProfile === 'api_frontier' && this.config.apiModel) {
+      return this.config.apiModel;
+    }
+
+    if (purpose === 'review' && this.config.reviewModel) {
+      return this.config.reviewModel;
+    }
+
+    if (this.config.executionProfile === 'deep_review' && purpose === 'summarize' && this.config.reviewModel) {
+      return this.config.reviewModel;
+    }
+
+    if (this.config.executionProfile === 'fast_local') {
+      return this.config.fastModel || fallback;
+    }
+
+    if (purpose === 'code' && this.config.codingModel) {
+      return this.config.codingModel;
+    }
+    if ((purpose === 'direct' || purpose === 'classify' || purpose === 'inspect' || purpose === 'summarize') && this.config.fastModel) {
+      return this.config.fastModel;
+    }
+    return fallback;
+  }
+
+  private traceModelRoute(purpose: ModelRoutePurpose, model: string) {
+    this.traceBus.emitEvent({
+      type: 'model_route_selected',
+      data: {
+        purpose,
+        model,
+        executionProfile: this.config.executionProfile,
+        providerProfile: this.config.providerProfile,
+        promptProfile: this.config.promptProfile,
+      },
+    });
   }
 
   private async persistCurrentSession(): Promise<void> {
@@ -908,6 +1198,80 @@ export class CoreEngine extends EventEmitter {
 
     this.currentSession.updatedAt = Date.now();
     await this.sessionStore.saveSession(this.currentSession);
+  }
+
+  private getRunDataDir(): string {
+    return path.resolve(this.config.workspaceRoot, '.gamma-harness', 'runs');
+  }
+
+  private getRunCheckpointPath(runId: string): string {
+    return path.join(this.getRunDataDir(), `${runId}.json`);
+  }
+
+  private async readRunCheckpointFile(runId: string): Promise<RunCheckpoint | null> {
+    try {
+      return JSON.parse(await fs.readFile(this.getRunCheckpointPath(runId), 'utf8')) as RunCheckpoint;
+    } catch {
+      return null;
+    }
+  }
+
+  private async saveRunCheckpoint(checkpoint: RunCheckpoint): Promise<string> {
+    const checkpointPath = this.getRunCheckpointPath(checkpoint.runId);
+    await fs.mkdir(path.dirname(checkpointPath), { recursive: true });
+    const previous = await this.readRunCheckpointFile(checkpoint.runId);
+    const createdAt = previous?.createdAt ?? checkpoint.createdAt;
+    const nextCheckpoint = {
+      ...checkpoint,
+      createdAt,
+      updatedAt: Date.now(),
+    };
+    await fs.writeFile(checkpointPath, `${JSON.stringify(nextCheckpoint, null, 2)}\n`, 'utf8');
+    return checkpointPath;
+  }
+
+  async listRuns(): Promise<RunCheckpoint[]> {
+    const runDataDir = this.getRunDataDir();
+    try {
+      const entries = await fs.readdir(runDataDir, { withFileTypes: true });
+      const checkpoints = await Promise.all(
+        entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+          .map(async (entry) => {
+            try {
+              return JSON.parse(await fs.readFile(path.join(runDataDir, entry.name), 'utf8')) as RunCheckpoint;
+            } catch {
+              return null;
+            }
+          }),
+      );
+      return checkpoints
+        .filter((entry): entry is RunCheckpoint => entry !== null)
+        .sort((left, right) => right.updatedAt - left.updatedAt);
+    } catch {
+      return [];
+    }
+  }
+
+  async getRun(runId: string): Promise<RunCheckpoint | null> {
+    return this.readRunCheckpointFile(runId);
+  }
+
+  async getRunCheckpoint(runId: string): Promise<RunCheckpoint | null> {
+    return this.readRunCheckpointFile(runId);
+  }
+
+  async resumeRun(runId: string): Promise<RunCheckpoint | null> {
+    const checkpoint = await this.readRunCheckpointFile(runId);
+    if (!checkpoint) {
+      return null;
+    }
+    this.planner.setTaskPlan(runId, checkpoint.taskPlan);
+    this.traceBus.emitEvent({
+      type: 'task_run_resumed',
+      data: { runId, checkpoint },
+    });
+    return checkpoint;
   }
 
   async recordTurnExecution(
@@ -969,6 +1333,8 @@ export class CoreEngine extends EventEmitter {
       sessionMemoryEnabled: this.config.sessionMemoryEnabled,
       sessionMemoryTurns: this.config.sessionMemoryTurns,
       selfCheckEnabled: this.config.selfCheckEnabled,
+      executionProfile: this.config.executionProfile,
+      promptProfile: this.config.promptProfile,
     };
   }
 
@@ -1089,7 +1455,7 @@ export class CoreEngine extends EventEmitter {
     this.config.summaryModel = typeof this.config.summaryModel === 'string' && this.config.summaryModel.trim()
       ? this.config.summaryModel.trim()
       : DEFAULT_ENGINE_CONFIG.summaryModel;
-    this.config.agentProtocol = this.config.agentProtocol === 'native_tools' || this.config.agentProtocol === 'workflow_runner'
+    this.config.agentProtocol = this.config.agentProtocol === 'native_tools' || this.config.agentProtocol === 'action_dsl' || this.config.agentProtocol === 'workflow_runner'
       ? this.config.agentProtocol
       : 'action_dsl';
     this.config.agentKeepAlive = typeof this.config.agentKeepAlive === 'string' && this.config.agentKeepAlive.trim()
@@ -1100,6 +1466,7 @@ export class CoreEngine extends EventEmitter {
     this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
     this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
     this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
+    this.config.shortcutAnswersEnabled = this.config.shortcutAnswersEnabled !== false;
 
     if (config.sessionDataDir) {
       this.sessionDataDirSetting = config.sessionDataDir;
@@ -1543,6 +1910,93 @@ export class CoreEngine extends EventEmitter {
     };
   }
 
+  private isProjectHealthInspectionQuestion(latestUserMessage: string): boolean {
+    const normalized = latestUserMessage.toLowerCase();
+    const projectTarget = /\b(app|application|codebase|project|repo|repository|site|website|workspace)\b/.test(normalized);
+    const asksProjectType = /\b(what kind|what type|kind of project|type of project|what is this project|what kind of app)\b/.test(normalized);
+    const asksBugReview = /\b(any bugs?|bugs?|broken|issues?|problems?|working at (its )?best)\b/.test(normalized);
+    return projectTarget && (asksProjectType || asksBugReview);
+  }
+
+  private async tryAnswerFromLocalProjectInspection(latestUserMessage: string): Promise<ImmediateChatAnswer | null> {
+    if (!this.isProjectHealthInspectionQuestion(latestUserMessage)) {
+      return null;
+    }
+
+    const readText = async (relativePath: string): Promise<string | null> => {
+      try {
+        return await fs.readFile(path.join(this.config.workspaceRoot, relativePath), 'utf8');
+      } catch {
+        return null;
+      }
+    };
+
+    const packageRaw = await readText('package.json');
+    let manifest: { name?: unknown; scripts?: Record<string, unknown>; dependencies?: Record<string, unknown>; devDependencies?: Record<string, unknown> } = {};
+    if (packageRaw) {
+      try {
+        manifest = JSON.parse(packageRaw) as typeof manifest;
+      } catch {
+        manifest = {};
+      }
+    }
+    const deps = new Set([
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.devDependencies ?? {}),
+    ]);
+    const scripts = manifest.scripts ?? {};
+    const entryCandidates = ['server.js', 'app.js', 'index.js', 'main.js', 'src/index.js', 'src/main.js'];
+    const entryReads = await Promise.all(entryCandidates.map(async (entry) => [entry, await readText(entry)] as const));
+    const entry = entryReads.find(([, content]) => Boolean(content));
+    const viewFiles = await fs.readdir(path.join(this.config.workspaceRoot, 'views')).catch(() => [] as string[]);
+    const publicFiles = await fs.readdir(path.join(this.config.workspaceRoot, 'public')).catch(() => [] as string[]);
+
+    const typeSignals: string[] = [];
+    if (deps.has('express')) typeSignals.push('Express server');
+    if (deps.has('ejs')) typeSignals.push('EJS server-rendered views');
+    if (deps.has('bootstrap')) typeSignals.push('Bootstrap styling');
+    if (deps.has('axios')) typeSignals.push('Axios HTTP fetches');
+    if (!typeSignals.length && packageRaw) typeSignals.push('Node.js package');
+
+    const findings: string[] = [];
+    const testScript = typeof scripts.test === 'string' ? scripts.test : '';
+    if (!testScript || /no test specified/i.test(testScript)) {
+      findings.push('No real test script is configured.');
+    }
+    if (!entry) {
+      findings.push('No common server/client entry file found at root.');
+    }
+    if (entry?.[1] && deps.has('axios') && /https?:\/\//.test(entry[1]) && !/process\.env/.test(entry[1])) {
+      findings.push('External API URL appears hard-coded instead of env-configured.');
+    }
+    if (entry?.[1] && /app\.listen\((?:3000|["']3000["'])/.test(entry[1]) && !/process\.env\.PORT/.test(entry[1])) {
+      findings.push('Server port appears hard-coded instead of using process.env.PORT.');
+    }
+    if (!findings.length) {
+      findings.push('No obvious static bug found from manifest and entry-file inspection.');
+    }
+
+    const projectName = typeof manifest.name === 'string' && manifest.name.trim() ? manifest.name.trim() : 'this workspace';
+    const inspected = [
+      packageRaw ? 'package.json' : null,
+      entry ? entry[0] : null,
+      viewFiles.length ? `views (${viewFiles.slice(0, 4).join(', ')})` : null,
+      publicFiles.length ? 'public assets' : null,
+    ].filter((value): value is string => Boolean(value));
+    const answer = [
+      `${projectName} looks like this kind of web app: ${typeSignals.join(' + ')}.`,
+      `Inspected: ${inspected.join(', ') || 'workspace metadata only'}.`,
+      `Potential issues: ${findings.join(' ')}`,
+      'Runtime bugs still need app start/test verification.',
+    ].join('\n');
+
+    return {
+      content: answer,
+      action: 'Summarizing project type and static bug risks',
+      source: 'local_project_inspection',
+    };
+  }
+
   private async tryAnswerFromRootManifest(latestUserMessage: string): Promise<ImmediateChatAnswer | null> {
     const normalized = latestUserMessage.toLowerCase();
     const writeIntent = /\b(create|write|add|update|modify|change|edit|fix|implement|generate|save|insert|replace|append|remove|delete)\b/.test(normalized);
@@ -1647,17 +2101,64 @@ export class CoreEngine extends EventEmitter {
       selected.add('searchText');
     }
 
+    if (/\b(symbol|function|component|definition|where is|jump to)\b/.test(normalized)) {
+      selected.add('findSymbol');
+      selected.add('findFunction');
+      selected.add('findComponent');
+    }
+
+    if (/\b(imports?|dependency|dependencies|affected files?|who imports|what does.*import)\b/.test(normalized)) {
+      selected.add('whatDoesThisImport');
+      selected.add('whoImports');
+      selected.add('affectedFiles');
+    }
+
+    if (/\b(test selection|select tests|targeted tests|changed files)\b/.test(normalized)) {
+      selected.add('selectTestsForChangedFiles');
+    }
+
+    if (/\b(package manager|project commands|build command|test command|dev command|detect commands)\b/.test(normalized)) {
+      selected.add('detectProjectCommands');
+    }
+
+    if (/\b(context pack|file card|relevance|relevant snippets|context budget)\b/.test(normalized)) {
+      selected.add('buildContextPack');
+    }
+
     if (this.shouldIncludeWriteTools(latestUserMessage, promptMode)) {
       selected.add('writeFile');
       selected.add('patchFile');
+      selected.add('replaceFunction');
+      selected.add('insertImport');
+      selected.add('addTypeProperty');
+      selected.add('renameIdentifier');
+      selected.add('replaceRange');
+      selected.add('insertAfter');
+      selected.add('insertBefore');
+      selected.add('replaceBlock');
+      selected.add('applyUnifiedPatch');
+      selected.add('previewPatch');
       selected.add('makeDir');
       selected.add('deleteFile');
       selected.add('searchText');
+      selected.add('findSymbol');
+      selected.add('findFunction');
+      selected.add('whatDoesThisImport');
+      selected.add('affectedFiles');
+      selected.add('createCheckpoint');
+      selected.add('getStructuredDiff');
+      selected.add('selectTestsForChangedFiles');
     }
 
     if (this.shouldIncludeGitTools(latestUserMessage, promptMode)) {
       selected.add('gitStatus');
       selected.add('gitDiff');
+      selected.add('getStructuredDiff');
+    }
+
+    if (/\b(checkpoint|rollback|roll back|restore checkpoint)\b/.test(normalized)) {
+      selected.add('createCheckpoint');
+      selected.add('rollbackToCheckpoint');
     }
 
     if (this.shouldIncludeCommandTool(latestUserMessage)) {
@@ -1780,6 +2281,60 @@ export class CoreEngine extends EventEmitter {
     return [];
   }
 
+  private buildTaskBootstrapPlan(
+    taskPlan: TaskPlan,
+    taskContext: TaskContext | null,
+    toolNames: SupportedTool[],
+  ): BootstrapPlanStep[] {
+    if (taskPlan.complexity !== 'repo_wide_audit' || !taskContext) {
+      return [];
+    }
+
+    const plan: BootstrapPlanStep[] = [];
+    if (toolNames.includes('listDir')) {
+      plan.push({ type: 'tool', title: 'List workspace root', toolName: 'listDir', args: { dirPath: '.' } });
+    }
+
+    if (!toolNames.includes('readFile')) {
+      return plan;
+    }
+
+    const candidateFiles = Array.from(new Set([
+      ...taskContext.relevantFiles,
+      ...taskContext.likelyEntryPoints,
+      ...taskContext.likelyTests,
+    ])).slice(0, 4);
+
+    for (const filePath of candidateFiles) {
+      plan.push({
+        type: 'tool',
+        title: `Inspect ${filePath}`,
+        toolName: 'readFile',
+        args: { filePath },
+      });
+    }
+
+    return plan;
+  }
+
+  private mergeBootstrapPlans(...plans: BootstrapPlanStep[][]): BootstrapPlanStep[] {
+    const seen = new Set<string>();
+    const merged: BootstrapPlanStep[] = [];
+
+    for (const step of plans.flat()) {
+      const key = step.type === 'inventory'
+        ? `inventory:${step.title}`
+        : `tool:${step.toolName}:${JSON.stringify(step.args)}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(step);
+    }
+
+    return merged;
+  }
+
   private emitRunStarted(handlers: ChatStreamHandlers | undefined, event: RunStartedEvent) {
     handlers?.onRunStarted?.(event);
   }
@@ -1820,6 +2375,7 @@ export class CoreEngine extends EventEmitter {
   }
 
   private selectMaxTokens(latestUserMessage: string, promptMode: RunMode, usingTools: boolean): number {
+    const budget = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile] ?? LOCAL_MODEL_BUDGET_PROFILES.lean;
     const normalized = latestUserMessage.toLowerCase();
     const terseReplyRequested =
       /\b(exactly|just|only|one line|single sentence|yes or no)\b/.test(normalized) ||
@@ -1830,15 +2386,15 @@ export class CoreEngine extends EventEmitter {
 
     switch (promptMode) {
       case 'quick_inspect':
-        return usingTools ? 320 : 192;
+        return usingTools ? Math.min(768, budget.outputBudgetInspect) : Math.min(384, budget.outputBudgetDirect);
       case 'code_review':
-        return usingTools ? 512 : 320;
+        return usingTools ? Math.min(1024, budget.outputBudgetInspect) : Math.min(640, budget.outputBudgetDirect);
       case 'targeted_edit':
-        return usingTools ? 640 : 384;
+        return usingTools ? budget.outputBudgetEdit : Math.min(768, budget.outputBudgetDirect);
       case 'doc_generation':
-        return usingTools ? 768 : 512;
+        return usingTools ? budget.outputBudgetFinalReport : Math.min(900, budget.outputBudgetFinalReport);
       default:
-        return usingTools ? 512 : 256;
+        return usingTools ? Math.min(1024, budget.outputBudgetInspect) : budget.outputBudgetDirect;
     }
   }
 
@@ -1877,10 +2433,32 @@ export class CoreEngine extends EventEmitter {
       listDir: '{"action":"listDir","args":{"dirPath":"src"}}',
       webSearch: '{"action":"webSearch","args":{"query":"latest ollama gemma4 tool calling docs"}}',
       fetchUrl: '{"action":"fetchUrl","args":{"url":"https://example.com/docs"}}',
+      findSymbol: '{"action":"findSymbol","args":{"symbolName":"CoreEngine"}}',
+      findFunction: '{"action":"findFunction","args":{"functionName":"chatStream"}}',
+      findComponent: '{"action":"findComponent","args":{"componentName":"RunConsole"}}',
+      whatDoesThisImport: '{"action":"whatDoesThisImport","args":{"filePath":"src/index.ts"}}',
+      whoImports: '{"action":"whoImports","args":{"filePath":"src/types.ts"}}',
+      affectedFiles: '{"action":"affectedFiles","args":{"filePath":"src/types.ts"}}',
+      selectTestsForChangedFiles: '{"action":"selectTestsForChangedFiles","args":{"changedFiles":["packages/tool-runtime/src/registry.ts"]}}',
+      detectProjectCommands: '{"action":"detectProjectCommands","args":{}}',
+      buildContextPack: '{"action":"buildContextPack","args":{"query":"fix RunConsole diff panel","maxFiles":5}}',
       writeFile: '{"action":"writeFile","args":{"filePath":"README.md","content":"# Title\\n"}}',
       patchFile: '{"action":"patchFile","args":{"filePath":"src/index.ts","oldContent":"before","newContent":"after"}}',
+      replaceFunction: '{"action":"replaceFunction","args":{"filePath":"src/index.ts","functionName":"main","newBody":"return 1;"}}',
+      insertImport: '{"action":"insertImport","args":{"filePath":"src/index.ts","importStatement":"import { x } from \\"./x\\";"}}',
+      addTypeProperty: '{"action":"addTypeProperty","args":{"filePath":"src/types.ts","interfaceName":"RunState","property":"fileChanges?: string[];"}}',
+      renameIdentifier: '{"action":"renameIdentifier","args":{"filePath":"src/index.ts","oldName":"oldName","newName":"newName"}}',
+      replaceRange: '{"action":"replaceRange","args":{"filePath":"src/index.ts","startLine":10,"endLine":12,"newContent":"replacement\\n"}}',
+      insertAfter: '{"action":"insertAfter","args":{"filePath":"src/index.ts","anchorText":"export {};","newContent":"\\nconst x = 1;\\n"}}',
+      insertBefore: '{"action":"insertBefore","args":{"filePath":"src/index.ts","anchorText":"export {};","newContent":"const x = 1;\\n"}}',
+      replaceBlock: '{"action":"replaceBlock","args":{"filePath":"src/index.ts","anchorStart":"// start","anchorEnd":"// end","newContent":"// start\\nupdated\\n// end"}}',
+      applyUnifiedPatch: '{"action":"applyUnifiedPatch","args":{"patchText":"--- a/file.txt\\n+++ b/file.txt\\n@@ -1 +1 @@\\n-old\\n+new\\n"}}',
+      previewPatch: '{"action":"previewPatch","args":{"filePath":"src/index.ts","before":"old","after":"new"}}',
       makeDir: '{"action":"makeDir","args":{"dirPath":"src/new-folder"}}',
       deleteFile: '{"action":"deleteFile","args":{"filePath":"old.txt"}}',
+      getStructuredDiff: '{"action":"getStructuredDiff","args":{}}',
+      createCheckpoint: '{"action":"createCheckpoint","args":{"label":"before editing 3 files"}}',
+      rollbackToCheckpoint: '{"action":"rollbackToCheckpoint","args":{"checkpointId":"cp-..."}}',
       runCommand: '{"action":"runCommand","args":{"command":"npm test"}}',
       gitStatus: '{"action":"gitStatus","args":{}}',
       gitDiff: '{"action":"gitDiff","args":{}}',
@@ -2075,7 +2653,12 @@ export class CoreEngine extends EventEmitter {
     return [
       {
         role: 'system',
-        content: `Prompt recipe (${promptMode}):\n${optimizationPrompt}`,
+        content: [
+          `Prompt profile: ${this.config.promptProfile}`,
+          promptProfileInstruction(this.config.promptProfile),
+          `Prompt recipe (${promptMode}):`,
+          optimizationPrompt,
+        ].join('\n'),
       },
       ...messages,
     ];
@@ -2141,73 +2724,289 @@ export class CoreEngine extends EventEmitter {
       }
     }
 
+    this.traceBus.emitEvent({
+      type: 'context_pack_built',
+      data: {
+        contextBudgetUsed: contextMessages.reduce((sum, message) => sum + message.content.length, 0),
+        contextBudgetLimit: totalContextBudget,
+        filesIncluded: includeRepoContext ? 'repo-summary' : 0,
+        snippetsIncluded: sessionMemoryMessage ? 1 : 0,
+        memoryTurns: this.config.sessionMemoryEnabled ? this.config.sessionMemoryTurns : 0,
+      },
+    });
+
     return contextMessages;
   }
 
   private static readonly WORKSPACE_MUTATING_TOOLS: ReadonlySet<string> = new Set([
-    'writeFile', 'patchFile', 'makeDir', 'deleteFile',
+    'writeFile', 'patchFile', 'replaceFunction', 'insertImport', 'addTypeProperty', 'renameIdentifier', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'makeDir', 'deleteFile', 'createCheckpoint', 'rollbackToCheckpoint',
   ]);
 
-  private async executeToolCall(toolName: SupportedTool, args: Record<string, unknown>): Promise<any> {
+  private checkpointTargetsForTool(toolName: SupportedTool, args: Record<string, unknown>): string[] | undefined {
+    if (toolName === 'applyUnifiedPatch') {
+      const patchText = typeof args.patchText === 'string' ? args.patchText : '';
+      const files = new Set<string>();
+      for (const line of patchText.split('\n')) {
+        if (!line.startsWith('+++ ') && !line.startsWith('--- ')) continue;
+        const raw = line.slice(4).trim().split(/\s+/)[0];
+        if (!raw || raw === '/dev/null') continue;
+        files.add(raw.replace(/^a\//, '').replace(/^b\//, ''));
+      }
+      return Array.from(files);
+    }
+    if (toolName === 'makeDir') {
+      const dirPath = typeof args.dirPath === 'string' ? args.dirPath : undefined;
+      return dirPath ? [dirPath] : undefined;
+    }
+    const filePath = typeof args.filePath === 'string' ? args.filePath : undefined;
+    return filePath ? [filePath] : undefined;
+  }
+
+  private async ensureRunCheckpointBeforeMutation(runId: string | undefined, toolName: SupportedTool, args: Record<string, unknown>): Promise<ToolResult | null> {
+    if (!runId || this.autoCheckpointRuns.has(runId) || !CoreEngine.WORKSPACE_MUTATING_TOOLS.has(toolName)) {
+      return null;
+    }
+    if (toolName === 'createCheckpoint' || toolName === 'rollbackToCheckpoint') {
+      return null;
+    }
+
+    const checkpoint = await this.toolRegistry.createCheckpoint(
+      `before ${toolName} in ${runId}`,
+      this.checkpointTargetsForTool(toolName, args),
+    );
+    if (!checkpoint.success) {
+      return checkpoint;
+    }
+    this.autoCheckpointRuns.add(runId);
+    this.traceBus.emitEvent({
+      type: 'run_auto_checkpoint_created',
+      data: {
+        runId,
+        tool: toolName,
+        checkpointId: checkpoint.metadata?.checkpointId,
+      },
+    });
+    return checkpoint;
+  }
+
+  private async executeToolCall(toolName: SupportedTool, args: Record<string, unknown>, runId?: string): Promise<any> {
+    const inputSummary = summarizeToolArgs(toolName, args);
+    this.traceBus.emitEvent({
+      type: 'tool_call_started',
+      data: { runId, tool: toolName, inputSummary },
+    });
     let result: any;
-    switch (toolName) {
-      case 'readFile':
-        result = await this.readFile(getRequiredStringArg(args, 'filePath', toolName));
-        break;
-      case 'listDir':
-        result = await this.listDir(getOptionalStringArg(args, 'dirPath') || '.');
-        break;
-      case 'glob':
-        result = await this.glob(getRequiredStringArg(args, 'pattern', toolName));
-        break;
-      case 'searchText':
-        result = await this.searchText(
-          getRequiredStringArg(args, 'query', toolName),
-          getOptionalStringArg(args, 'filePattern'),
-        );
-        break;
-      case 'webSearch':
-        result = await this.webSearch(getRequiredStringArg(args, 'query', toolName));
-        break;
-      case 'fetchUrl':
-        result = await this.fetchUrl(getRequiredStringArg(args, 'url', toolName));
-        break;
-      case 'writeFile':
-        result = await this.writeFile(
-          getRequiredStringArg(args, 'filePath', toolName),
-          getRequiredStringArg(args, 'content', toolName),
-        );
-        break;
-      case 'patchFile':
-        result = await this.patchFile(
-          getRequiredStringArg(args, 'filePath', toolName),
-          getRequiredStringArg(args, 'oldContent', toolName),
-          getRequiredStringArg(args, 'newContent', toolName),
-        );
-        break;
-      case 'makeDir':
-        result = await this.makeDir(getRequiredStringArg(args, 'dirPath', toolName));
-        break;
-      case 'deleteFile':
-        result = await this.deleteFile(getRequiredStringArg(args, 'filePath', toolName));
-        break;
-      case 'gitStatus':
-        result = await this.gitStatus();
-        break;
-      case 'gitDiff':
-        result = await this.gitDiff();
-        break;
-      case 'runCommand':
-        result = await this.runCommand(getRequiredStringArg(args, 'command', toolName));
-        break;
-      default:
-        throw new Error(`Tool ${toolName} is not supported.`);
+    let checkpointResult: ToolResult | null = null;
+    try {
+      checkpointResult = await this.ensureRunCheckpointBeforeMutation(runId, toolName, args);
+      if (checkpointResult && !checkpointResult.success) {
+        this.traceBus.emitEvent({
+          type: 'tool_call_completed',
+          data: {
+            runId,
+            tool: toolName,
+            success: false,
+            outputPreview: truncateStreamPreview(checkpointResult.output || 'Checkpoint failed.'),
+          },
+        });
+        return checkpointResult;
+      }
+      switch (toolName) {
+        case 'readFile':
+          result = await this.readFile(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'listDir':
+          result = await this.listDir(getOptionalStringArg(args, 'dirPath') || '.');
+          break;
+        case 'glob':
+          result = await this.glob(getRequiredStringArg(args, 'pattern', toolName));
+          break;
+        case 'searchText':
+          result = await this.searchText(
+            getRequiredStringArg(args, 'query', toolName),
+            getOptionalStringArg(args, 'filePattern'),
+          );
+          break;
+        case 'webSearch':
+          result = await this.webSearch(getRequiredStringArg(args, 'query', toolName));
+          break;
+        case 'fetchUrl':
+          result = await this.fetchUrl(getRequiredStringArg(args, 'url', toolName));
+          break;
+        case 'findSymbol':
+          result = await this.findSymbol(getRequiredStringArg(args, 'symbolName', toolName));
+          break;
+        case 'findFunction':
+          result = await this.findFunction(getRequiredStringArg(args, 'functionName', toolName));
+          break;
+        case 'findComponent':
+          result = await this.findComponent(getRequiredStringArg(args, 'componentName', toolName));
+          break;
+        case 'whatDoesThisImport':
+          result = await this.whatDoesThisImport(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'whoImports':
+          result = await this.whoImports(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'affectedFiles':
+          result = await this.affectedFiles(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'selectTestsForChangedFiles':
+          result = await this.selectTestsForChangedFiles(args.changedFiles);
+          break;
+        case 'detectProjectCommands':
+          result = await this.detectProjectCommands();
+          break;
+        case 'buildContextPack':
+          result = await this.buildContextPack(
+            getRequiredStringArg(args, 'query', toolName),
+            getOptionalNumberArg(args, 'maxFiles'),
+          );
+          break;
+        case 'writeFile':
+          result = await this.writeFile(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'content', toolName),
+          );
+          break;
+        case 'patchFile':
+          result = await this.patchFile(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'oldContent', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'replaceFunction':
+          result = await this.replaceFunction(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'functionName', toolName),
+            getRequiredStringArg(args, 'newBody', toolName),
+          );
+          break;
+        case 'insertImport':
+          result = await this.insertImport(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'importStatement', toolName),
+          );
+          break;
+        case 'addTypeProperty':
+          result = await this.addTypeProperty(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'interfaceName', toolName),
+            getRequiredStringArg(args, 'property', toolName),
+          );
+          break;
+        case 'renameIdentifier':
+          result = await this.renameIdentifier(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'oldName', toolName),
+            getRequiredStringArg(args, 'newName', toolName),
+          );
+          break;
+        case 'replaceRange':
+          result = await this.replaceRange(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredNumberArg(args, 'startLine', toolName),
+            getRequiredNumberArg(args, 'endLine', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'insertAfter':
+          result = await this.insertAfter(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'anchorText', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'insertBefore':
+          result = await this.insertBefore(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'anchorText', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'replaceBlock':
+          result = await this.replaceBlock(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'anchorStart', toolName),
+            getRequiredStringArg(args, 'anchorEnd', toolName),
+            getRequiredStringArg(args, 'newContent', toolName),
+          );
+          break;
+        case 'applyUnifiedPatch':
+          result = await this.applyUnifiedPatch(getRequiredStringArg(args, 'patchText', toolName));
+          break;
+        case 'previewPatch':
+          result = await this.previewPatch(
+            getRequiredStringArg(args, 'filePath', toolName),
+            getRequiredStringArg(args, 'before', toolName),
+            getRequiredStringArg(args, 'after', toolName),
+          );
+          break;
+        case 'makeDir':
+          result = await this.makeDir(getRequiredStringArg(args, 'dirPath', toolName));
+          break;
+        case 'deleteFile':
+          result = await this.deleteFile(getRequiredStringArg(args, 'filePath', toolName));
+          break;
+        case 'getStructuredDiff':
+          result = await this.getStructuredDiff();
+          break;
+        case 'createCheckpoint':
+          result = await this.createCheckpoint(getOptionalStringArg(args, 'label'));
+          break;
+        case 'rollbackToCheckpoint':
+          result = await this.rollbackToCheckpoint(getRequiredStringArg(args, 'checkpointId', toolName));
+          break;
+        case 'gitStatus':
+          result = await this.gitStatus();
+          break;
+        case 'gitDiff':
+          result = await this.gitDiff();
+          break;
+        case 'runCommand':
+          result = await this.runCommand(getRequiredStringArg(args, 'command', toolName));
+          break;
+        default:
+          throw new Error(`Tool ${toolName} is not supported.`);
+      }
+    } catch (error: any) {
+      this.traceBus.emitEvent({
+        type: 'tool_call_completed',
+        data: {
+          runId,
+          tool: toolName,
+          success: false,
+          outputPreview: error?.message || 'Tool failed.',
+        },
+      });
+      throw error;
+    }
+
+    if (checkpointResult?.metadata?.checkpointId) {
+      result = {
+        ...result,
+        metadata: {
+          ...(result.metadata ?? {}),
+          checkpointId: checkpointResult.metadata.checkpointId,
+        },
+      };
     }
 
     // Invalidate repo context cache after workspace-modifying tools so next turn gets fresh context
     if (CoreEngine.WORKSPACE_MUTATING_TOOLS.has(toolName)) {
       this.invalidateRepoContextCache();
     }
+
+    this.traceBus.emitEvent({
+      type: 'tool_call_completed',
+      data: {
+        runId,
+        tool: toolName,
+        success: result?.success === true,
+        outputPreview: truncateStreamPreview(result?.output || ''),
+      },
+    });
 
     return result;
   }
@@ -2268,7 +3067,7 @@ export class CoreEngine extends EventEmitter {
       });
       this.planner.setCurrentTool(stepPlan.toolName);
 
-      const toolResult = await this.executeToolCall(stepPlan.toolName, stepPlan.args);
+      const toolResult = await this.executeToolCall(stepPlan.toolName, stepPlan.args, builder.snapshot().id);
       const toolOutput = toolResult.preview ? `${toolResult.output}\n\n${toolResult.preview}` : toolResult.output;
       this.emitChatToolEvent(handlers, {
         id: toolEventId,
@@ -2408,8 +3207,8 @@ export class CoreEngine extends EventEmitter {
       return false;
     }
 
-    const mutatingTools = new Set<SupportedTool>(['writeFile', 'patchFile', 'deleteFile', 'makeDir', 'runCommand']);
-    const verificationTools = new Set<SupportedTool>(['readFile', 'gitDiff', 'gitStatus', 'listDir', 'searchText', 'runCommand']);
+    const mutatingTools = new Set<SupportedTool>(['writeFile', 'patchFile', 'replaceFunction', 'insertImport', 'addTypeProperty', 'renameIdentifier', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'deleteFile', 'makeDir', 'runCommand']);
+    const verificationTools = new Set<SupportedTool>(['readFile', 'getStructuredDiff', 'selectTestsForChangedFiles', 'gitDiff', 'gitStatus', 'listDir', 'searchText', 'runCommand']);
     let lastMutationIndex = -1;
 
     run.steps.forEach((step, index) => {
@@ -2444,7 +3243,7 @@ export class CoreEngine extends EventEmitter {
       recentCommands.length > 0 ? `Recent commands: ${recentCommands.join(' | ')}` : null,
       manualToolProtocol
         ? 'Return exactly one JSON tool action to verify the result, then return {"final":"..."} when verification is complete.'
-        : 'Use one verification tool call now (readFile, gitDiff, gitStatus, listDir, searchText, or runCommand) before the final answer.',
+        : 'Use one verification tool call now (getStructuredDiff, selectTestsForChangedFiles, readFile, gitDiff, gitStatus, listDir, searchText, or runCommand) before the final answer.',
     ].filter(Boolean).join('\n');
   }
 
@@ -2538,7 +3337,15 @@ export class CoreEngine extends EventEmitter {
       case 'readFile':
         return Math.min(12_000, Math.max(4_500, Math.floor(budget * 0.55)));
       case 'gitDiff':
+      case 'getStructuredDiff':
       case 'searchText':
+      case 'findSymbol':
+      case 'findFunction':
+      case 'findComponent':
+      case 'whatDoesThisImport':
+      case 'whoImports':
+      case 'affectedFiles':
+      case 'buildContextPack':
       case 'fetchUrl':
       case 'webSearch':
       case 'runCommand':
@@ -2665,6 +3472,133 @@ export class CoreEngine extends EventEmitter {
       {
         type: 'function',
         function: {
+          name: 'findSymbol',
+          description: 'Find code definitions for a class, interface, type, function, method, or exported variable by symbol name.',
+          parameters: {
+            type: 'object',
+            properties: {
+              symbolName: { type: 'string', description: 'Exact symbol name, e.g. CoreEngine' }
+            },
+            required: ['symbolName']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'findFunction',
+          description: 'Find function, method, or arrow-function definitions by exact function name.',
+          parameters: {
+            type: 'object',
+            properties: {
+              functionName: { type: 'string', description: 'Exact function name, e.g. chatStream' }
+            },
+            required: ['functionName']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'findComponent',
+          description: 'Find React-style component definitions by exact component name.',
+          parameters: {
+            type: 'object',
+            properties: {
+              componentName: { type: 'string', description: 'Exact component name, e.g. RunConsole' }
+            },
+            required: ['componentName']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'whatDoesThisImport',
+          description: 'Return structured imports for one source file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'Source file path' }
+            },
+            required: ['filePath']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'whoImports',
+          description: 'Return workspace files that import a source file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'Imported file path' }
+            },
+            required: ['filePath']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'affectedFiles',
+          description: 'Return transitive source files affected by edits to a file based on reverse imports.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'Changed file path' }
+            },
+            required: ['filePath']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'selectTestsForChangedFiles',
+          description: 'Select targeted tests and commands for changed files.',
+          parameters: {
+            type: 'object',
+            properties: {
+              changedFiles: {
+                oneOf: [
+                  { type: 'array', items: { type: 'string' } },
+                  { type: 'string' }
+                ],
+                description: 'Changed file paths as array, comma list, or newline list'
+              }
+            },
+            required: ['changedFiles']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'detectProjectCommands',
+          description: 'Detect package manager and build/test/lint/dev commands from lockfiles and package.json.',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'buildContextPack',
+          description: 'Build compact file cards and snippets for a user request instead of dumping full repo context.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'User request or search query' },
+              maxFiles: { type: 'number', description: 'Maximum file cards to include' }
+            },
+            required: ['query']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'writeFile',
           description: 'Write content to a file',
           parameters: {
@@ -2696,6 +3630,165 @@ export class CoreEngine extends EventEmitter {
       {
         type: 'function',
         function: {
+          name: 'replaceFunction',
+          description: 'Replace only the body of a function/method/arrow function by AST location. Prefer this over rewriting whole files.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The source file path' },
+              functionName: { type: 'string', description: 'Exact function name to replace' },
+              newBody: { type: 'string', description: 'New function body, with or without outer braces' }
+            },
+            required: ['filePath', 'functionName', 'newBody']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'insertImport',
+          description: 'Insert an import statement in the import block if not already present.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The source file path' },
+              importStatement: { type: 'string', description: 'Complete import statement' }
+            },
+            required: ['filePath', 'importStatement']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'addTypeProperty',
+          description: 'Add a property to a TypeScript interface without rewriting the full file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The source file path' },
+              interfaceName: { type: 'string', description: 'Exact interface name' },
+              property: { type: 'string', description: 'Property declaration, e.g. fileChanges?: StructuredDiffFile[]' }
+            },
+            required: ['filePath', 'interfaceName', 'property']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'renameIdentifier',
+          description: 'Rename matching identifier tokens in one file without changing string literals.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The source file path' },
+              oldName: { type: 'string', description: 'Existing identifier' },
+              newName: { type: 'string', description: 'Replacement identifier' }
+            },
+            required: ['filePath', 'oldName', 'newName']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'replaceRange',
+          description: 'Replace inclusive 1-based line range in a file. Prefer this when exact oldContent replacement is fragile.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path to the file' },
+              startLine: { type: 'number', description: '1-based start line' },
+              endLine: { type: 'number', description: '1-based inclusive end line' },
+              newContent: { type: 'string', description: 'Replacement text for the line range' }
+            },
+            required: ['filePath', 'startLine', 'endLine', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'insertAfter',
+          description: 'Insert text after the first matching anchor text in a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path to the file' },
+              anchorText: { type: 'string', description: 'Anchor text to insert after' },
+              newContent: { type: 'string', description: 'Text to insert' }
+            },
+            required: ['filePath', 'anchorText', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'insertBefore',
+          description: 'Insert text before the first matching anchor text in a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path to the file' },
+              anchorText: { type: 'string', description: 'Anchor text to insert before' },
+              newContent: { type: 'string', description: 'Text to insert' }
+            },
+            required: ['filePath', 'anchorText', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'replaceBlock',
+          description: 'Replace text from anchorStart through anchorEnd in a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path to the file' },
+              anchorStart: { type: 'string', description: 'Start anchor included in replacement' },
+              anchorEnd: { type: 'string', description: 'End anchor included in replacement' },
+              newContent: { type: 'string', description: 'Replacement text' }
+            },
+            required: ['filePath', 'anchorStart', 'anchorEnd', 'newContent']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'applyUnifiedPatch',
+          description: 'Apply a unified diff patch after approval. Prefer small patches.',
+          parameters: {
+            type: 'object',
+            properties: {
+              patchText: { type: 'string', description: 'Unified diff text' }
+            },
+            required: ['patchText']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'previewPatch',
+          description: 'Preview a diff from before/after text without writing.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: { type: 'string', description: 'The path used in the diff label' },
+              before: { type: 'string', description: 'Original content' },
+              after: { type: 'string', description: 'Proposed content' }
+            },
+            required: ['filePath', 'before', 'after']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'makeDir',
           description: 'Create a directory',
           parameters: {
@@ -2718,6 +3811,41 @@ export class CoreEngine extends EventEmitter {
               filePath: { type: 'string', description: 'The path to delete' }
             },
             required: ['filePath']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'getStructuredDiff',
+          description: 'Return current git diff as structured files, hunks, line numbers, added lines, and removed lines.',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'createCheckpoint',
+          description: 'Create a rollback checkpoint before editing files.',
+          parameters: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: 'Optional checkpoint label' }
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'rollbackToCheckpoint',
+          description: 'Rollback workspace files to a checkpoint created earlier.',
+          parameters: {
+            type: 'object',
+            properties: {
+              checkpointId: { type: 'string', description: 'Checkpoint id returned by createCheckpoint' }
+            },
+            required: ['checkpointId']
           }
         }
       },
@@ -3505,13 +4633,36 @@ export class CoreEngine extends EventEmitter {
       action: 'create_checkpoint',
       inputSummary: targetPath,
     });
+    const checkpointResult = await this.createCheckpoint(`before fix_single_file ${targetPath}`);
+    if (!checkpointResult.success) {
+      const reason = `Checkpoint failed: ${checkpointResult.output}`;
+      runBuilder.recordToolMetadata(checkpointResult.metadata);
+      runBuilder.finishStep(checkpointStep.id, {
+        detail: reason,
+        toolName: 'createCheckpoint',
+        toolOutputPreview: truncateStreamPreview(checkpointResult.output),
+      }, 'error');
+      workflowRunner.finishStep(`${runId}_fix_checkpoint`, 'failed', reason, 'blocked');
+      workflowRunner.block(reason);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      return { answer: `Blocked: ${reason}`, error: reason };
+    }
+    runBuilder.recordToolMetadata(checkpointResult.metadata);
     workflowRunner.finishStep(
       `${runId}_fix_checkpoint`,
       'done',
-      `Snapshot recorded before editing ${targetPath}.`,
+      checkpointResult.metadata?.checkpointId
+        ? `Checkpoint ${checkpointResult.metadata.checkpointId} recorded before editing ${targetPath}.`
+        : `Checkpoint recorded before editing ${targetPath}.`,
       'waiting_for_model_action',
     );
-    runBuilder.finishStep(checkpointStep.id, { detail: `Snapshot recorded before editing ${targetPath}.` }, 'done');
+    runBuilder.finishStep(checkpointStep.id, {
+      detail: checkpointResult.metadata?.checkpointId
+        ? `Checkpoint ${checkpointResult.metadata.checkpointId} recorded before editing ${targetPath}.`
+        : `Checkpoint recorded before editing ${targetPath}.`,
+      toolName: 'createCheckpoint',
+      toolOutputPreview: truncateStreamPreview(checkpointResult.output),
+    }, 'done');
     this.syncWorkflowState(runBuilder, workflowRunner);
 
     const readStep = runBuilder.startNamedStep('tool', 'Read target file', targetPath);
@@ -3963,14 +5114,35 @@ export class CoreEngine extends EventEmitter {
       action: 'create_checkpoint',
       inputSummary: latestUserMessage.slice(0, 160),
     });
+    const checkpointResult = await this.createCheckpoint(`before small_patch ${candidateFiles.join(', ')}`);
+    if (!checkpointResult.success) {
+      const reason = `Checkpoint failed: ${checkpointResult.output}`;
+      runBuilder.recordToolMetadata(checkpointResult.metadata);
+      runBuilder.finishStep(checkpointStep.id, {
+        detail: reason,
+        toolName: 'createCheckpoint',
+        toolOutputPreview: truncateStreamPreview(checkpointResult.output),
+      }, 'error');
+      workflowRunner.finishStep(`${runId}_small_checkpoint`, 'failed', reason, 'blocked');
+      workflowRunner.block(reason);
+      this.syncWorkflowState(runBuilder, workflowRunner);
+      return { answer: `Blocked: ${reason}`, error: reason };
+    }
+    runBuilder.recordToolMetadata(checkpointResult.metadata);
     workflowRunner.finishStep(
       `${runId}_small_checkpoint`,
       'done',
-      `Snapshot recorded before editing ${candidateFiles.join(', ')}.`,
+      checkpointResult.metadata?.checkpointId
+        ? `Checkpoint ${checkpointResult.metadata.checkpointId} recorded before editing ${candidateFiles.join(', ')}.`
+        : `Checkpoint recorded before editing ${candidateFiles.join(', ')}.`,
       'waiting_for_model_action',
     );
     runBuilder.finishStep(checkpointStep.id, {
-      detail: `Snapshot recorded before editing ${candidateFiles.join(', ')}.`,
+      detail: checkpointResult.metadata?.checkpointId
+        ? `Checkpoint ${checkpointResult.metadata.checkpointId} recorded before editing ${candidateFiles.join(', ')}.`
+        : `Checkpoint recorded before editing ${candidateFiles.join(', ')}.`,
+      toolName: 'createCheckpoint',
+      toolOutputPreview: truncateStreamPreview(checkpointResult.output),
     }, 'done');
     this.syncWorkflowState(runBuilder, workflowRunner);
 
@@ -4353,6 +5525,10 @@ export class CoreEngine extends EventEmitter {
     this.emitChatStatus(handlers, 'model', 'Generating assistant response', 0);
     let directResponse = '';
     let continuationCount = 0;
+    const directOutputBudget = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]?.outputBudgetDirect
+      ?? LOCAL_MODEL_BUDGET_PROFILES.lean.outputBudgetDirect;
+    const routedDirectModel = this.selectModelForPurpose('direct');
+    this.traceModelRoute('direct', routedDirectModel);
 
     while (true) {
       let message: EngineChatMessage | undefined;
@@ -4363,7 +5539,7 @@ export class CoreEngine extends EventEmitter {
           currentMessages,
           handlers,
           undefined,
-          4096,
+          directOutputBudget,
           undefined,
           this.config.model,
           options?.signal,
@@ -4372,10 +5548,10 @@ export class CoreEngine extends EventEmitter {
         finishReason = typeof message?.finish_reason === 'string' ? message.finish_reason : undefined;
       } else {
         const result = await this.modelAdapter.createChatCompletion({
-          model: this.config.model,
+          model: routedDirectModel,
           messages: currentMessages,
           stream: false,
-          max_tokens: 4096,
+          max_tokens: directOutputBudget,
           think: options?.think,
           signal: options?.signal,
         });
@@ -4468,11 +5644,13 @@ export class CoreEngine extends EventEmitter {
     signal?: AbortSignal,
     think?: boolean,
     onFirstToken?: () => void,
+    routePurpose?: ModelRoutePurpose,
   ): Promise<any> {
-    const targetModel = model || this.config.model;
+    const purpose = routePurpose ?? (tools && tools.length > 0 ? 'code' : 'direct');
+    const targetModel = model || this.selectModelForPurpose(purpose);
+    this.traceModelRoute(purpose, targetModel);
     const stream = await this.modelAdapter.createChatCompletion({
-      model: targetModel,
-      messages: currentMessages,
+      model: targetModel,      messages: currentMessages,
       stream: true,
       tools,
       max_tokens: maxTokens,
@@ -4483,7 +5661,7 @@ export class CoreEngine extends EventEmitter {
 
     if (!stream || typeof (stream as ReadableStream<Uint8Array>).getReader !== 'function') {
       const result = await this.modelAdapter.createChatCompletion({
-        model: targetModel,
+          model: targetModel,
         messages: currentMessages,
         stream: false,
         tools,
@@ -4624,6 +5802,7 @@ export class CoreEngine extends EventEmitter {
               },
             });
             const result = await this.modelAdapter.createChatCompletion({
+              model: targetModel,
               messages: currentMessages,
               stream: false,
               tools,
@@ -4714,6 +5893,8 @@ export class CoreEngine extends EventEmitter {
       workspaceBound,
     });
     const classificationMs = Date.now() - intentStartedAt;
+    const initialRouteModel = this.selectModelForPurpose('classify');
+    this.traceModelRoute('classify', initialRouteModel);
 
     await this.recordTurnExecution('agentic', {
       promptMode,
@@ -4728,6 +5909,16 @@ export class CoreEngine extends EventEmitter {
       workspaceRoot: this.config.workspaceRoot,
       workspaceSource,
       model: agentRunModel,
+      agentModel: this.config.agentModel,
+      summaryModel: this.config.summaryModel,
+      activeModel: null,
+      heavyModelLock: this.heavyModelLock.snapshot(),
+      lastRouteSelection: this.lastModelRouteSelection ? { ...this.lastModelRouteSelection } : undefined,
+      modelRoute: {
+        role: 'fast',
+        model: initialRouteModel,
+        reason: 'classification route',
+      },
       agentProtocol: this.config.agentProtocol,
       promptMode,
       intent: intentDecision.intent,
@@ -4786,9 +5977,9 @@ export class CoreEngine extends EventEmitter {
             diffPreview: approval.preview,
           },
         });
-      } else if (event.type === 'approval_resolved') {
-        const approval = event.data as { id: string; response?: { approved?: boolean } };
-        const approved = approval.response?.approved ?? null;
+	      } else if (event.type === 'approval_resolved') {
+	        const approval = event.data as { id: string; response?: { approved?: boolean } };
+	        const approved = approval.response?.approved ?? null;
         runBuilder.recordApprovalResolved(approval.id, approved);
         this.emitChatApprovalEvent(streamHandlers, {
           type: 'approval',
@@ -4803,13 +5994,135 @@ export class CoreEngine extends EventEmitter {
           'approval',
           approved === true ? `Approval granted for ${approval.id}` : `Approval rejected for ${approval.id}`,
           loopCount,
-        );
-        this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
-      }
-    };
-    this.traceBus.on('trace', traceListener);
+	        );
+	        this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+	      }
+	      if (STREAM_TASK_TRACE_TYPES.has(event.type)) {
+	        streamHandlers?.onTrace?.(event);
+	      }
+	    };
+	    this.traceBus.on('trace', traceListener);
+
+	    let taskContext: TaskContext | null = null;
+	    let taskPlan = this.taskOrchestrator.createPlan({
+	      userRequest: latestUserMessage,
+	      intent: intentDecision.intent,
+	      workspaceRoot: this.config.workspaceRoot,
+	      knownFiles: [],
+	    });
+	    let currentTaskStep: TaskStep | null = null;
+	    const lastToolResults: RunCheckpoint['lastToolResults'] = [];
+
+	    const rememberToolResult = (tool: string, result: ToolResult) => {
+	      lastToolResults.push({
+	        tool,
+	        success: result.success,
+	        outputPreview: truncateStreamPreview(result.output || ''),
+	      });
+	      while (lastToolResults.length > 8) {
+	        lastToolResults.shift();
+	      }
+	    };
+
+	    const buildCheckpoint = (): RunCheckpoint => {
+	      const run = runBuilder.snapshot();
+	      return {
+	        runId,
+	        sessionId: this.currentSession!.id,
+	        taskPlan,
+	        currentStepId: currentTaskStep?.id,
+	        completedSteps: taskPlan.steps.filter((entry) => entry.status === 'done' || entry.status === 'skipped').map((entry) => entry.id),
+	        failedSteps: taskPlan.steps.filter((entry) => entry.status === 'failed').map((entry) => entry.id),
+	        blockedSteps: taskPlan.steps.filter((entry) => entry.status === 'blocked').map((entry) => entry.id),
+	        filesRead: run.filesRead,
+	        filesWritten: run.filesWritten,
+	        filesDeleted: run.filesDeleted,
+	        commandsRun: run.commands.map((entry) => entry.command),
+	        approvals: run.approvals,
+	        summarySoFar: this.taskOrchestrator.summarizeProgress(taskPlan),
+	        lastToolResults: [...lastToolResults],
+	        createdAt: run.startedAt,
+	        updatedAt: Date.now(),
+	      };
+	    };
+
+	    const persistCheckpoint = async () => {
+	      const checkpointPath = await this.saveRunCheckpoint(buildCheckpoint());
+	      this.planner.emitTaskCheckpoint(runId, checkpointPath);
+	    };
+
+	    const startTaskStep = async (preferredStep?: TaskStep | null): Promise<TaskStep | null> => {
+	      if (!preferredStep && currentTaskStep) {
+	        return currentTaskStep;
+	      }
+	      const nextStep = preferredStep ?? this.taskOrchestrator.getNextStep(taskPlan);
+	      if (!nextStep || nextStep.status !== 'pending') {
+	        return currentTaskStep;
+	      }
+	      taskPlan = this.taskOrchestrator.markStepRunning(taskPlan, nextStep.id);
+	      currentTaskStep = taskPlan.steps.find((entry) => entry.id === nextStep.id) ?? null;
+	      if (currentTaskStep) {
+	        this.planner.markTaskStepStarted(runId, taskPlan, currentTaskStep);
+	        this.emitChatStatus(streamHandlers, currentTaskStep.type, currentTaskStep.title, loopCount);
+	        await persistCheckpoint();
+	      }
+	      return currentTaskStep;
+	    };
+
+	    const completeCurrentTaskStep = async (detail?: string) => {
+	      if (!currentTaskStep) {
+	        return;
+	      }
+	      const stepId = currentTaskStep.id;
+	      taskPlan = this.taskOrchestrator.markStepDone(taskPlan, stepId, detail);
+	      const completedStep = taskPlan.steps.find((entry) => entry.id === stepId);
+	      if (completedStep) {
+	        this.planner.markTaskStepCompleted(runId, taskPlan, completedStep);
+	      }
+	      currentTaskStep = null;
+	      await persistCheckpoint();
+	    };
+
+	    const failCurrentTaskStep = async (error: string) => {
+	      if (!currentTaskStep) {
+	        return;
+	      }
+	      const stepId = currentTaskStep.id;
+	      taskPlan = this.taskOrchestrator.markStepFailed(taskPlan, stepId, error);
+	      const failedStep = taskPlan.steps.find((entry) => entry.id === stepId);
+	      if (failedStep) {
+	        this.planner.markTaskStepFailed(runId, taskPlan, failedStep, error);
+	      }
+	      await persistCheckpoint();
+	    };
+
+	    const finishTaskPlan = async (reason: string) => {
+	      if (currentTaskStep) {
+	        await completeCurrentTaskStep(reason);
+	      }
+	      for (const pendingStep of taskPlan.steps.filter((entry) => entry.status === 'pending')) {
+	        taskPlan = this.taskOrchestrator.markStepSkipped(taskPlan, pendingStep.id, `Skipped: ${reason}`);
+	      }
+	      this.planner.updateTaskPlan(runId, taskPlan);
+	      await persistCheckpoint();
+	    };
+
+    this.planner.setTaskPlan(runId, taskPlan);
+    taskContext = workspaceBound
+      ? await this.repoIndexer.buildTaskContext({
+          userRequest: latestUserMessage,
+          intent: intentDecision.intent,
+          complexity: taskPlan.complexity,
+        }).catch(() => null)
+      : null;
+    await persistCheckpoint();
+    const initialTaskStep = await startTaskStep();
+    if (initialTaskStep && initialTaskStep.type === 'intake') {
+      await completeCurrentTaskStep(taskContext ? `Task context selected: ${taskContext.taskArea}` : 'No backend task context available');
+    }
 
     const finalizeRun = async (baseAnswer: string, error?: string): Promise<string> => {
+      await finishTaskPlan(error ? `Run ended with error: ${error}` : 'Run finalized');
       const gitStats = await this.computeGitDiffStats(runBuilder.snapshot().git);
       runBuilder.setGitStats(gitStats);
       const summary = summarizeRun(runBuilder.snapshot());
@@ -4830,12 +6143,26 @@ export class CoreEngine extends EventEmitter {
       this.emitRunMetric(streamHandlers, runId, completedRun);
       this.emitRunSummary(streamHandlers, runId, completedRun);
       await this.persistCurrentSession();
+      this.autoCheckpointRuns.delete(runId);
       return buildFinalAnswer(baseAnswer, completedRun);
     };
 
     try {
       releaseHeavyModelLock = await this.acquireHeavyModelLock(runId);
       const agentModelSwitch = await this.prepareAgentModel(runId);
+      runBuilder.setRuntimeModels({
+        agentModel: this.config.agentModel,
+        summaryModel: this.config.summaryModel,
+        activeModel: agentModelSwitch.activeModel,
+        heavyModelLock: this.heavyModelLock.snapshot(),
+        lastRouteSelection: this.lastModelRouteSelection ? { ...this.lastModelRouteSelection } : undefined,
+      });
+      runBuilder.setModelRoute(this.lastModelRouteSelection ? { ...this.lastModelRouteSelection } : {
+        role: 'agent',
+        model: agentRunModel,
+        protocol: this.config.agentProtocol,
+        keepAlive: this.config.agentKeepAlive,
+      });
       this.planner.startRun(runId);
       this.planner.setTaskSummary(`Intent: ${intentDecision.intent}`);
       this.planner.setPhase('planning');
@@ -4887,7 +6214,9 @@ export class CoreEngine extends EventEmitter {
         this.emitRunStep(streamHandlers, runId, classified);
       }
 
-      if (!browserFolderContextActive && this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
+      const shortcutAnswersEnabled = this.config.shortcutAnswersEnabled !== false;
+
+      if (shortcutAnswersEnabled && !browserFolderContextActive && this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
         const localAnswer = await this.tryAnswerFromLocalState(latestUserMessage);
         if (localAnswer !== null) {
           this.completeImmediateResponse(streamHandlers, localAnswer);
@@ -4909,11 +6238,12 @@ export class CoreEngine extends EventEmitter {
         return await finalizeRun(bindingAnswer);
       }
 
+      const useStepScopedContext = ['multi_file', 'architecture_change', 'repo_wide_audit'].includes(taskPlan?.complexity || '');
       const includeWorkspaceContext = workspaceBound && this.isWorkspaceQuestion(latestUserMessage, promptMode);
-      const includeRepoContext = workspaceBound && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
+      const includeRepoContext = workspaceBound && !useStepScopedContext && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
       const workflowRunnerEnabled = this.config.agentProtocol === 'workflow_runner';
 
-      if (!workflowRunnerEnabled) {
+      if (shortcutAnswersEnabled && !workflowRunnerEnabled) {
         const directWorkspaceAnswer = workspaceBound
           ? await this.tryAnswerFromDirectWorkspaceTools(latestUserMessage)
           : null;
@@ -5053,13 +6383,14 @@ export class CoreEngine extends EventEmitter {
       let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol && !useActionDsl
         ? this.getToolDefinitions(selectedToolNames)
         : undefined;
+      const activeTaskStepForModel = typeof startTaskStep === 'function' ? await startTaskStep() : null;
+      const stepOutputBudget = activeTaskStepForModel?.budget?.maxOutputTokens;
       const maxTokens = useActionDsl
-        ? Math.min(512, this.selectMaxTokens(latestUserMessage, promptMode, false))
+        ? Math.min(512, stepOutputBudget ?? this.selectMaxTokens(latestUserMessage, promptMode, false))
         : manualToolProtocol
-          ? Math.min(256, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
-          : this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0);
-      const reasoningEffort = useActionDsl
-        ? 'none'
+          ? Math.min(256, stepOutputBudget ?? this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
+          : Math.min(stepOutputBudget ?? Number.MAX_SAFE_INTEGER, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0));
+      const reasoningEffort = useActionDsl        ? 'none'
         : manualToolProtocol
           ? 'none'
           : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
@@ -5073,6 +6404,7 @@ export class CoreEngine extends EventEmitter {
           type: 'manual_tool_fallback',
           data: {
             model: agentRunModel,
+            routeModel: agentRunModel,
             reason: toolProtocol.reason,
             manualToolProtocol: true,
             selectedTools: selectedToolNames,
@@ -5084,6 +6416,7 @@ export class CoreEngine extends EventEmitter {
           type: 'manual_tool_strategy_selected',
           data: {
             model: agentRunModel,
+            routeModel: agentRunModel,
             reason: toolProtocol.reason,
             manualToolProtocol: true,
             selectedTools: selectedToolNames,
@@ -5107,6 +6440,7 @@ export class CoreEngine extends EventEmitter {
           type: 'thinking_unsupported',
           data: {
             model: agentRunModel,
+            routeModel: agentRunModel,
             reason: 'Current model does not report thinking capability.',
             requestedThink: true,
             modelCapabilities: modelCapabilities ?? [],
@@ -5184,11 +6518,16 @@ export class CoreEngine extends EventEmitter {
           `Workspace bound: ${workspaceBound ? 'yes' : 'no'}`,
           `Available tools: ${selectedToolNames.length > 0 ? selectedToolNames.join(', ') : 'none'}`,
           `Tool protocol: ${useActionDsl ? 'action_dsl' : manualToolProtocol ? 'manual' : 'native'}`,
-          `Context budget: ${this.config.contextBudget} chars`,
-          `Retry budget: ${this.config.toolRetryMax}`,
+          `Task complexity: ${taskPlan?.complexity || 'unknown'}`,
+          `Local budget profile: ${this.config.localModelBudgetProfile}`,
+          `Context budget: ${this.config.contextBudget} chars target`,
+          `Output budget for this step: ${maxTokens}`,          `Retry budget: ${this.config.toolRetryMax}`,
           `Session memory: ${this.config.sessionMemoryEnabled ? `${this.config.sessionMemoryTurns} recent turns` : 'off'}`,
           `Self-check: ${this.config.selfCheckEnabled ? 'required after edits or commands' : 'off'}`,
           'If workspace tools are available and the request is about repo behavior, inspect workspace facts before asking the user for more detail.',
+          'Agentic loop: use deterministic tools first, read minimal files, create checkpoint before edits, patch minimal code, get structured diff, run selected tests only, then summarize exact files and verification.',
+          'Do not read the whole repo unless the current task is repo_wide_audit. Do not rewrite full files unnecessarily. Do not run full build before targeted checks unless needed. Do not continue after budget exceeded.',
+          'For complex tasks, do not solve the whole project in one response. Work only the current task step.',
           'Never simulate tool execution or file changes.',
           'Finish with concise answer, What I did, and Files changed.',
         ].join('\n'),
@@ -5197,17 +6536,36 @@ export class CoreEngine extends EventEmitter {
       const currentMessages: EngineChatMessage[] = [
         ...(await this.buildContextMessages(requestMessages, promptMode, includeWorkspaceContext, includeRepoContext)) as EngineChatMessage[],
         runtimeContract,
-        ...(useActionDsl ? [] : manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),
-        ...promptMessages,
+        ...(taskPlan ? [{ role: 'system' as const, content: buildStepScopedPrompt(taskPlan, currentTaskStep, taskContext) }] : []),
+        ...(useActionDsl ? [] : manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),        ...promptMessages,
       ];
 
       if (workspaceBound) {
-        await this.executeBootstrapPlan(
+        const bootstrapPlan = this.mergeBootstrapPlans(
           this.buildBootstrapPlan(intentDecision, promptMode, selectedToolNames),
+          this.buildTaskBootstrapPlan(taskPlan, taskContext, selectedToolNames),
+        );
+        await this.executeBootstrapPlan(
+          bootstrapPlan,
           currentMessages,
           streamHandlers,
           runBuilder,
         );
+        const completedBootstrapWork = runBuilder.snapshot().steps.some((step) =>
+          ['inventory', 'tool'].includes(step.type) && step.status === 'done',
+        );
+        const runningTaskStep = currentTaskStep as TaskStep | null;
+        if (completedBootstrapWork && runningTaskStep?.type === 'inspect') {
+          await completeCurrentTaskStep('Bootstrap inspection completed');
+        }
+      }
+
+      const localProjectInspection = shortcutAnswersEnabled && workspaceBound
+        ? await this.tryAnswerFromLocalProjectInspection(latestUserMessage)
+        : null;
+      if (localProjectInspection !== null) {
+        this.completeImmediateResponse(streamHandlers, localProjectInspection);
+        return await finalizeRun(localProjectInspection.content);
       }
 
       let streamedToolEventCounter = 0;
@@ -5215,11 +6573,13 @@ export class CoreEngine extends EventEmitter {
       let manualBootstrapTool = manualToolProtocol && workspaceBound
         ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, selectedToolNames)
         : null;
-      const MAX_LOOPS = intentDecision.intent === 'edit_code'
+      const budgetProfile = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile] ?? LOCAL_MODEL_BUDGET_PROFILES.lean;
+      const maxLoopTarget = intentDecision.intent === 'edit_code'
         ? 5
         : intentDecision.intent === 'run_command'
           ? 4
           : 3;
+      const MAX_LOOPS = Math.min(budgetProfile.maxModelCallsPerRun, taskPlan.complexity === 'architecture_change' ? Math.max(maxLoopTarget, 6) : maxLoopTarget);
       let manualProtocolCorrectionCount = 0;
       let planningOnlyNativeRetryCount = 0;
       let simulatedToolReplyCount = 0;
@@ -5253,6 +6613,7 @@ export class CoreEngine extends EventEmitter {
           manualBootstrapTool = null;
           loopCount += 1;
           runBuilder.setLoopCount(loopCount);
+          await startTaskStep();
           const toolStep = runBuilder.startNamedStep('tool', `Bootstrap ${bootstrapDecision.name}`);
           this.planner.upsertRunStep({
             id: toolStep.id,
@@ -5284,7 +6645,7 @@ export class CoreEngine extends EventEmitter {
             inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
           });
           try {
-            const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args);
+            const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args, runId);
             const streamedOutput = toolResult.preview
               ? `${toolResult.output}\n\n${toolResult.preview}`
               : toolResult.output;
@@ -5297,6 +6658,7 @@ export class CoreEngine extends EventEmitter {
               success: toolResult.success,
             });
             this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+            rememberToolResult(bootstrapDecision.name, toolResult);
             currentMessages.push({
               role: 'user',
               content: this.formatManualToolResult(
@@ -5310,6 +6672,9 @@ export class CoreEngine extends EventEmitter {
               toolOutputPreview: truncateStreamPreview(streamedOutput),
               command: toolResult.metadata?.command?.command,
             }, toolResult.success ? 'done' : 'error');
+            if (toolResult.success) {
+              await completeCurrentTaskStep(`${bootstrapDecision.name} completed`);
+            }
           } catch (error: any) {
             this.emitChatToolEvent(streamHandlers, {
               id: toolEventId,
@@ -5347,6 +6712,11 @@ export class CoreEngine extends EventEmitter {
 
         loopCount += 1;
         runBuilder.setLoopCount(loopCount);
+        await startTaskStep();
+        currentMessages.push({
+          role: 'system',
+          content: buildStepScopedPrompt(taskPlan, currentTaskStep, taskContext),
+        });
         this.planner.setPhase('model');
         this.planner.setCurrentTool(undefined);
         this.planner.setIntendedAction(loopCount === 1 ? 'Generating assistant response' : 'Processing tool results');
@@ -5386,6 +6756,13 @@ export class CoreEngine extends EventEmitter {
 
         let result: any;
         let message: any;
+        const routePurpose: ModelRoutePurpose = nativeToolDefinitions
+          ? 'code'
+          : promptMode === 'quick_inspect'
+            ? 'inspect'
+            : 'summarize';
+        const routedAgentModel = this.selectModelForPurpose(routePurpose);
+        this.traceModelRoute(routePurpose, routedAgentModel);
         try {
           if (streamHandlers) {
             message = await this.streamAssistantMessage(
@@ -5406,6 +6783,7 @@ export class CoreEngine extends EventEmitter {
                   this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
                 }
               },
+              routePurpose,
             );
           } else {
             result = await this.modelAdapter.createChatCompletion({
@@ -5720,6 +7098,7 @@ export class CoreEngine extends EventEmitter {
           this.emitChatStatus(streamHandlers, 'execution', 'Executing tool calls', loopCount);
 
           for (const toolCall of message.tool_calls) {
+            await startTaskStep();
             const name = toolCall.function.name as SupportedTool;
             const toolStep = runBuilder.startNamedStep('tool', `Execute ${name}`);
             const toolEventId = nextStreamToolEventId();
@@ -5766,7 +7145,7 @@ export class CoreEngine extends EventEmitter {
             });
 
             try {
-              const toolResult = await this.executeToolCall(name, args);
+              const toolResult = await this.executeToolCall(name, args, runId);
               const streamedOutput = toolResult.preview
                 ? `${toolResult.output}\n\n${toolResult.preview}`
                 : toolResult.output;
@@ -5779,6 +7158,7 @@ export class CoreEngine extends EventEmitter {
                 success: toolResult.success,
               });
               this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+              rememberToolResult(name, toolResult);
               currentMessages.push({
                 role: 'tool',
                 tool_call_id: toolCall.id,
@@ -5796,6 +7176,9 @@ export class CoreEngine extends EventEmitter {
                 ],
                 command: toolResult.metadata?.command?.command,
               }, toolResult.success ? 'done' : 'error');
+              if (toolResult.success) {
+                await completeCurrentTaskStep(`${name} completed`);
+              }
             } catch (error: any) {
               this.emitChatToolEvent(streamHandlers, {
                 id: toolEventId,
@@ -5914,6 +7297,7 @@ export class CoreEngine extends EventEmitter {
           });
           this.emitRunStep(streamHandlers, runId, finishedModelStep);
         }
+        await completeCurrentTaskStep('Model step completed');
 
         if (this.shouldContinueTruncatedResponse(finishReason, response, responseContinuationCount)) {
           responseContinuationCount += 1;
@@ -5972,6 +7356,7 @@ export class CoreEngine extends EventEmitter {
 
           const manualDecision = this.parseManualToolResponse(response, selectedToolNames);
           if (manualDecision?.kind === 'tool') {
+            await startTaskStep();
             const toolStep = runBuilder.startNamedStep('tool', `Execute ${manualDecision.name}`);
             this.planner.setPhase('execution');
             this.planner.setCurrentTool(manualDecision.name);
@@ -5994,7 +7379,7 @@ export class CoreEngine extends EventEmitter {
               inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
             });
             try {
-              const toolResult = await this.executeToolCall(manualDecision.name, manualDecision.args);
+              const toolResult = await this.executeToolCall(manualDecision.name, manualDecision.args, runId);
               const streamedOutput = toolResult.preview
                 ? `${toolResult.output}\n\n${toolResult.preview}`
                 : toolResult.output;
@@ -6007,6 +7392,7 @@ export class CoreEngine extends EventEmitter {
                 success: toolResult.success,
               });
               this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+              rememberToolResult(manualDecision.name, toolResult);
               currentMessages.push({
                 role: 'user',
                 content: this.formatManualToolResult(
@@ -6020,6 +7406,9 @@ export class CoreEngine extends EventEmitter {
                 toolOutputPreview: truncateStreamPreview(streamedOutput),
                 command: toolResult.metadata?.command?.command,
               }, toolResult.success ? 'done' : 'error');
+              if (toolResult.success) {
+                await completeCurrentTaskStep(`${manualDecision.name} completed`);
+              }
             } catch (error: any) {
               this.emitChatToolEvent(streamHandlers, {
                 id: toolEventId,
@@ -6171,9 +7560,11 @@ export class CoreEngine extends EventEmitter {
       }
 
       const limitWarning = 'Maximum tool execution loops reached or no response from model.';
+      this.planner.emitTaskBudgetExceeded(runId, 'maxModelCallsPerRun');
       this.planner.failRun(limitWarning);
       return await finalizeRun(limitWarning, limitWarning);
     } catch (error: any) {
+      await failCurrentTaskStep(error?.message || 'Agentic run failed.');
       this.planner.failRun(error?.message || 'Agentic run failed.');
       throw error;
     } finally {
@@ -6224,6 +7615,56 @@ export class CoreEngine extends EventEmitter {
     return this.runTool('fetchUrl', url);
   }
 
+  async findSymbol(symbolName: string) {
+    return this.runTool('findSymbol', symbolName);
+  }
+
+  async findFunction(functionName: string) {
+    return this.runTool('findFunction', functionName);
+  }
+
+  async findComponent(componentName: string) {
+    return this.runTool('findComponent', componentName);
+  }
+
+  async whatDoesThisImport(filePath: string) {
+    return this.runTool('whatDoesThisImport', filePath);
+  }
+
+  async whoImports(filePath: string) {
+    return this.runTool('whoImports', filePath);
+  }
+
+  async affectedFiles(filePath: string) {
+    return this.runTool('affectedFiles', filePath);
+  }
+
+  async selectTestsForChangedFiles(changedFiles: unknown) {
+    this.ensureToolAllowed('selectTestsForChangedFiles');
+    const normalized = Array.isArray(changedFiles)
+      ? changedFiles.filter((entry): entry is string => typeof entry === 'string')
+      : typeof changedFiles === 'string'
+        ? changedFiles
+        : '';
+    const result = await this.toolRegistry.selectTestsForChangedFiles(normalized);
+    await this.persistCurrentSession();
+    return result;
+  }
+
+  async detectProjectCommands() {
+    this.ensureToolAllowed('detectProjectCommands');
+    const result = await this.toolRegistry.detectProjectCommands();
+    await this.persistCurrentSession();
+    return result;
+  }
+
+  async buildContextPack(query: string, maxFiles?: number) {
+    this.ensureToolAllowed('buildContextPack');
+    const result = await this.toolRegistry.buildContextPack(query, maxFiles);
+    await this.persistCurrentSession();
+    return result;
+  }
+
   async writeFile(filePath: string, content: string) {
     return this.runTool('writeFile', filePath, content);
   }
@@ -6232,12 +7673,73 @@ export class CoreEngine extends EventEmitter {
     return this.runTool('patchFile', filePath, oldContent, newContent);
   }
 
+  async replaceFunction(filePath: string, functionName: string, newBody: string) {
+    return this.runTool('replaceFunction', filePath, functionName, newBody);
+  }
+
+  async insertImport(filePath: string, importStatement: string) {
+    return this.runTool('insertImport', filePath, importStatement);
+  }
+
+  async addTypeProperty(filePath: string, interfaceName: string, property: string) {
+    return this.runTool('addTypeProperty', filePath, interfaceName, property);
+  }
+
+  async renameIdentifier(filePath: string, oldName: string, newName: string) {
+    return this.runTool('renameIdentifier', filePath, oldName, newName);
+  }
+
+  async replaceRange(filePath: string, startLine: number, endLine: number, newContent: string) {
+    this.ensureToolAllowed('replaceRange');
+    const result = await this.toolRegistry.replaceRange(filePath, startLine, endLine, newContent);
+    await this.persistCurrentSession();
+    return result;
+  }
+
+  async insertAfter(filePath: string, anchorText: string, newContent: string) {
+    return this.runTool('insertAfter', filePath, anchorText, newContent);
+  }
+
+  async insertBefore(filePath: string, anchorText: string, newContent: string) {
+    return this.runTool('insertBefore', filePath, anchorText, newContent);
+  }
+
+  async replaceBlock(filePath: string, anchorStart: string, anchorEnd: string, newContent: string) {
+    return this.runTool('replaceBlock', filePath, anchorStart, anchorEnd, newContent);
+  }
+
+  async applyUnifiedPatch(patchText: string) {
+    return this.runTool('applyUnifiedPatch', patchText);
+  }
+
+  async previewPatch(filePath: string, before: string, after: string) {
+    return this.runTool('previewPatch', filePath, before, after);
+  }
+
   async makeDir(dirPath: string) {
     return this.runTool('makeDir', dirPath);
   }
 
   async deleteFile(filePath: string) {
     return this.runTool('deleteFile', filePath);
+  }
+
+  async getStructuredDiff() {
+    return this.runTool('getStructuredDiff');
+  }
+
+  async createCheckpoint(label?: string) {
+    this.ensureToolAllowed('createCheckpoint');
+    const result = await this.toolRegistry.createCheckpoint(label);
+    await this.persistCurrentSession();
+    return result;
+  }
+
+  async rollbackToCheckpoint(checkpointId: string) {
+    this.ensureToolAllowed('rollbackToCheckpoint');
+    const result = await this.toolRegistry.rollbackToCheckpoint(checkpointId);
+    await this.persistCurrentSession();
+    return result;
   }
 
   async gitStatus() {

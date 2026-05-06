@@ -69,6 +69,35 @@ export interface AgentRunLineStats {
   removedLines: number;
 }
 
+export type StructuredDiffLineType = 'context' | 'added' | 'removed' | 'hunk' | 'file';
+
+export interface AgentRunStructuredDiffLine {
+  type: StructuredDiffLineType;
+  oldLine?: number;
+  newLine?: number;
+  content: string;
+}
+
+export interface AgentRunStructuredDiffHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: AgentRunStructuredDiffLine[];
+}
+
+export interface AgentRunStructuredDiffFile {
+  path: string;
+  oldPath?: string;
+  addedLines: number;
+  removedLines: number;
+  hunks: AgentRunStructuredDiffHunk[];
+}
+
+export interface AgentRunStructuredDiff {
+  files: AgentRunStructuredDiffFile[];
+}
+
 export interface AgentRunSearch {
   query: string;
   pattern?: string;
@@ -99,12 +128,21 @@ export interface AgentRunApproval {
 
 export interface AgentRunMetrics {
   classificationMs?: number;
+  modelLoadMs?: number;
   firstModelCallMs?: number;
   firstTokenMs?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  tokensPerSecond?: number;
   toolsMs?: number;
+  repoIndexingMs?: number;
+  diffGenerationMs?: number;
+  testMs?: number;
   totalMs?: number;
   modelLoops?: number;
   fallbackCount?: number;
+  contextBudgetUsed?: number;
+  contextBudgetLimit?: number;
 }
 
 export interface AgentRunStep {
@@ -131,6 +169,9 @@ export interface AgentRun {
   workspaceRoot: string;
   workspaceSource: AgentWorkspaceSource;
   model: string;
+  agentModel?: string;
+  summaryModel?: string;
+  activeModel?: string | null;
   agentProtocol?: AgentProtocol;
   promptMode: string;
   intent: string;
@@ -151,6 +192,32 @@ export interface AgentRun {
   commands: AgentRunCommand[];
   approvals: AgentRunApproval[];
   git?: AgentRunLineStats;
+  structuredDiff?: AgentRunStructuredDiff;
+  fileChanges?: AgentRunStructuredDiffFile[];
+  selectedTests?: string[];
+  checkpointIds?: string[];
+  modelRoute?: {
+    role: WorkflowModelRole;
+    model: string;
+    protocol?: AgentProtocol;
+    keepAlive?: string | number;
+    reason?: string;
+  };
+  heavyModelLock?: {
+    held: boolean;
+    ownerRunId: string | null;
+    queued: number;
+  };
+  lastRouteSelection?: {
+    role: WorkflowModelRole;
+    model: string;
+    protocol?: AgentProtocol;
+    keepAlive?: string | number;
+    reason?: string;
+  };
+  parseFailureCount?: number;
+  routingNotes?: string[];
+  memoryNotes?: string[];
   metrics?: AgentRunMetrics;
   workflow?: WorkflowState;
   finalAnswer?: string;

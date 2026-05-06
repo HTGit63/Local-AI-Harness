@@ -376,6 +376,69 @@ async function stopApiServer(child: ChildProcessWithoutNullStreams) {
   await new Promise((resolve) => child.once('exit', resolve));
 }
 
+async function approveNextPendingApproval(): Promise<void> {
+  const script = `
+const base = process.argv[1];
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function main() {
+  const deadline = Date.now() + 10000;
+  let approvedCount = 0;
+  let lastApprovedAt = 0;
+  while (Date.now() < deadline) {
+    const approvalsResponse = await fetch(base + '/api/approvals');
+    if (!approvalsResponse.ok) {
+      throw new Error('Approval list failed: ' + approvalsResponse.status + ' ' + await approvalsResponse.text());
+    }
+    const approvals = await approvalsResponse.json();
+    for (const approval of approvals) {
+      const response = await fetch(base + '/api/approvals/' + approval.id, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approved: true }),
+      });
+      const body = await response.text();
+      if (!response.ok) {
+        throw new Error('Approval request failed: ' + response.status + ' ' + body);
+      }
+      const parsed = JSON.parse(body);
+      if (!parsed.resolved) {
+        throw new Error('Approval was not resolved.');
+      }
+      approvedCount += 1;
+      lastApprovedAt = Date.now();
+    }
+    if (approvedCount > 0 && Date.now() - lastApprovedAt > 1000) {
+      return;
+    }
+    await sleep(100);
+  }
+  if (approvedCount === 0) {
+    throw new Error('Timed out waiting for pending approval.');
+  }
+}
+main().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+`;
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', script, API_BASE], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const chunks: Buffer[] = [];
+    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => chunks.push(chunk));
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(Buffer.concat(chunks).toString('utf8') || `Approval resolver exited with ${code}`));
+    });
+  });
+}
+
 async function testApiWorkflow() {
   const workspaceParent = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-api-e2e-'));
   const workspaceRoot = path.join(workspaceParent, 'Gamma 4 Harness');
@@ -399,6 +462,8 @@ async function testApiWorkflow() {
       sessionMemoryEnabled: boolean;
       sessionMemoryTurns: number;
       selfCheckEnabled: boolean;
+      localModelBudgetProfile?: string;
+      localModelBudget?: { maxModelCallsPerRun: number; maxToolCallsPerRun: number };
     }>(`${API_BASE}/api/config`);
     assert.strictEqual(initialConfig.workspaceRoot, workspaceRoot);
     assert.strictEqual(initialConfig.baseUrl, mockModel.baseUrl);
@@ -407,6 +472,8 @@ async function testApiWorkflow() {
     assert.strictEqual(initialConfig.sessionMemoryEnabled, true);
     assert.strictEqual(initialConfig.sessionMemoryTurns, 3);
     assert.strictEqual(initialConfig.selfCheckEnabled, true);
+    assert.strictEqual(initialConfig.localModelBudgetProfile, 'balanced');
+    assert.strictEqual(initialConfig.localModelBudget?.maxModelCallsPerRun, 10);
 
     const updatedConfig = await fetchJson<{
       profile: string;
@@ -418,6 +485,7 @@ async function testApiWorkflow() {
       sessionMemoryEnabled: boolean;
       sessionMemoryTurns: number;
       selfCheckEnabled: boolean;
+      localModelBudgetProfile?: string;
     }>(`${API_BASE}/api/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -431,6 +499,7 @@ async function testApiWorkflow() {
         sessionMemoryEnabled: true,
         sessionMemoryTurns: 5,
         selfCheckEnabled: false,
+        localModelBudgetProfile: 'lean',
       }),
     });
     assert.strictEqual(updatedConfig.profile, 'fast');
@@ -440,6 +509,7 @@ async function testApiWorkflow() {
     assert.strictEqual(updatedConfig.sessionMemoryEnabled, true);
     assert.strictEqual(updatedConfig.sessionMemoryTurns, 5);
     assert.strictEqual(updatedConfig.selfCheckEnabled, false);
+    assert.strictEqual(updatedConfig.localModelBudgetProfile, 'lean');
 
     const session = await fetchJson<{ id: string; skillsActive: string[] }>(`${API_BASE}/api/session`, {
       method: 'POST',
@@ -519,11 +589,27 @@ async function testApiWorkflow() {
     const agenticDone = agenticEvents.find((event) => event.type === 'done');
     assert.ok(String(agenticDone?.response || '').includes('Direct stream works.'));
     assert.ok(String(agenticDone?.response || '').includes('What I did:'));
+    assert.ok(agenticEvents.some((event) => event.type === 'task_plan_created'));
+    assert.ok(agenticEvents.some((event) => event.type === 'task_step_started'));
+    assert.ok(agenticEvents.some((event) => event.type === 'task_step_completed'));
+    assert.ok(agenticEvents.some((event) => event.type === 'task_checkpoint_saved'));
     const agenticRunSummary = agenticEvents.find((event) => event.type === 'run_summary');
     assert.ok(agenticRunSummary);
     assert.strictEqual(agenticRunSummary?.summary?.workspaceSource, 'backend');
     assert.strictEqual(agenticRunSummary?.summary?.workspaceBound, true);
     assert.ok(mockModel.getChatRequests().length > chatRequestsBeforeAgentic);
+
+    const planState = await fetchJson<{ taskPlan?: { complexity?: string; steps?: unknown[] } }>(`${API_BASE}/api/plan`);
+    assert.ok(planState.taskPlan);
+    assert.ok(Array.isArray(planState.taskPlan?.steps));
+
+    const runs = await fetchJson<Array<{ runId: string; taskPlan: { id: string; complexity: string } }>>(`${API_BASE}/api/runs`);
+    assert.ok(runs.length >= 1);
+    const firstRun = await fetchJson<{ runId: string; taskPlan: { id: string } }>(`${API_BASE}/api/runs/${runs[0].runId}`);
+    assert.strictEqual(firstRun.runId, runs[0].runId);
+    const checkpoint = await fetchJson<{ runId: string; taskPlan: { id: string }; completedSteps: string[] }>(`${API_BASE}/api/runs/${runs[0].runId}/checkpoint`);
+    assert.strictEqual(checkpoint.runId, runs[0].runId);
+    assert.ok(Array.isArray(checkpoint.completedSteps));
 
     const sessionAfterAgentic = await fetchJson<SessionState>(`${API_BASE}/api/session`);
     const latestAgenticTurn = [...(sessionAfterAgentic.turnHistory || [])]
@@ -584,13 +670,18 @@ async function testApiApprovalStreamResumesComplexTask() {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-api-approval-'));
   const mockModel = await startApprovalFlowMockModelServer();
   const server = await startApiServer(workspaceRoot, mockModel.baseUrl);
-  let approvalResolved = false;
 
   await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
   await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
 
   try {
-    const events = await fetchNdjsonWithIntervention(`${API_BASE}/api/chat/stream`, {
+    await fetchJson(`${API_BASE}/api/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentProtocol: 'native_tools' }),
+    });
+
+    const eventsPromise = fetchNdjsonWithIntervention(`${API_BASE}/api/chat/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -599,18 +690,9 @@ async function testApiApprovalStreamResumesComplexTask() {
           content: 'Read src/index.ts, create notes.txt, wait for approval, then summarize result.',
         }],
       }),
-    }, async (event) => {
-      if (event.type === 'approval' && event.state === 'pending' && !approvalResolved) {
-        approvalResolved = true;
-        const approval = event.approval as { id: string };
-        const resolution = await fetchJson<{ resolved: boolean }>(`${API_BASE}/api/approvals/${approval.id}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ approved: true }),
-        });
-        assert.strictEqual(resolution.resolved, true);
-      }
     });
+    await approveNextPendingApproval();
+    const events = await eventsPromise;
 
     const firstRequest = mockModel.getChatRequests()[0];
     assert.ok(Array.isArray(firstRequest?.tools));

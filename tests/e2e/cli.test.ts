@@ -373,26 +373,20 @@ async function testAgentSmokeReadFile() {
   const server = await startMockModelServer({
     chatResponder(body, callIndex) {
       if (callIndex === 0) {
-        return [
-          'Summary:',
-          'Repo inspection completed.',
-          'API entry file:',
-          'package.json',
-          'Files read:',
-          '- package.json',
-          '- README.md',
-          'Commands detected:',
-          '- npm test',
-          'Notes:',
-          'Package metadata read from workflow summary.',
-        ].join('\n');
+        return JSON.stringify({
+          kind: 'action',
+          action: 'read_file',
+          args: {
+            path: 'package.json',
+          },
+        });
       }
 
       return JSON.stringify({
         kind: 'final',
-        summary: 'Repo inspection completed.',
+        summary: 'Package name read from package.json.',
         filesChanged: [],
-        verification: 'Summary provided.',
+        verification: 'Read package.json and reported the package name.',
       });
     },
   });
@@ -413,8 +407,8 @@ async function testAgentSmokeReadFile() {
     });
     const result = JSON.parse(output);
     assert.strictEqual(result.ok, true);
-    assert.strictEqual(result.protocol, 'workflow_runner');
-    assert.strictEqual(result.workflow, 'inspect_project');
+    assert.strictEqual(result.protocol, 'action_dsl');
+    assert.strictEqual(result.workflow, null);
     assert.ok(Array.isArray(result.observedActions));
     assert.ok(result.observedActions.includes('readfile'));
     assert.ok(typeof result.summary === 'string' && result.summary.length > 0);

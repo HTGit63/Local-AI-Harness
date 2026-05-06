@@ -219,6 +219,7 @@ export class ModelAdapter {
   private lastSwitchResult: ModelSwitchResult | undefined;
   private readonly capabilityCache = new Map<string, string[] | null>();
   private nativeChatSupported: boolean | null = null;
+  private runtimeStateCache: { value: ModelRuntimeState; expiresAt: number } | null = null;
 
   constructor(options: Partial<AdapterOptions> = {}) {
     this.baseUrl = options.baseUrl ?? DEFAULT_CONFIG.baseUrl;
@@ -234,12 +235,15 @@ export class ModelAdapter {
       this.baseUrl = options.baseUrl;
       this.capabilityCache.clear();
       this.nativeChatSupported = null;
+      this.runtimeStateCache = null;
     }
     if (options.apiKey !== undefined) {
       this.apiKey = options.apiKey;
+      this.runtimeStateCache = null;
     }
     if (options.model !== undefined) {
       this.model = options.model;
+      this.runtimeStateCache = null;
     }
     if (options.timeoutMs !== undefined) {
       this.timeoutMs = options.timeoutMs;
@@ -497,7 +501,7 @@ export class ModelAdapter {
 
   private async createOllamaChatCompletion(request: ChatCompletionRequest) {
     const profile = PROFILES[this.profileName] || PROFILES['balanced'];
-    const chatTimeout = Math.max(this.timeoutMs, 60_000);
+    const chatTimeout = Math.max(this.timeoutMs * 4, 180_000);
     const response = await this.fetchWithRetry(`${this.nativeBaseUrl}/api/chat`, {
       method: 'POST',
       headers: this.headers,
@@ -626,7 +630,12 @@ export class ModelAdapter {
     }
   }
 
-  async getRuntimeState(): Promise<ModelRuntimeState> {
+  async getRuntimeState(cacheTtlMs = 10_000): Promise<ModelRuntimeState> {
+    const now = Date.now();
+    if (cacheTtlMs > 0 && this.runtimeStateCache && this.runtimeStateCache.expiresAt > now) {
+      return this.runtimeStateCache.value;
+    }
+
     const availableModels = await this.listModels() as AvailableModel[];
     const installedModels = await this.listInstalledModels();
     const runningInfo = await this.tryListRunningModels();
@@ -634,7 +643,7 @@ export class ModelAdapter {
     const configuredModelActive = runningModels.find((entry) => entry.model === this.model || entry.name === this.model);
     const configuredModelCapabilities = await this.getModelCapabilities(this.model);
 
-    return {
+    const runtimeState = {
       configuredModel: this.model,
       activeModel: configuredModelActive?.model || (runningModels.length === 1 ? runningModels[0].model : null),
       runningModels,
@@ -644,6 +653,15 @@ export class ModelAdapter {
       configuredModelCapabilities: configuredModelCapabilities ?? undefined,
       lastSwitchResult: this.lastSwitchResult,
     };
+
+    if (cacheTtlMs > 0) {
+      this.runtimeStateCache = {
+        value: runtimeState,
+        expiresAt: Date.now() + cacheTtlMs,
+      };
+    }
+
+    return runtimeState;
   }
 
   async getModelCapabilities(modelName = this.model): Promise<string[] | null> {
@@ -737,6 +755,7 @@ export class ModelAdapter {
         message: 'Model lifecycle control is unavailable for the current provider. Configuration changed, but the active model could not be switched automatically.',
       };
       this.lastSwitchResult = result;
+      this.runtimeStateCache = null;
       return result;
     }
 
@@ -753,7 +772,8 @@ export class ModelAdapter {
     }
 
     await this.preloadModel(targetModel, options.keepAlive ?? '2m');
-    const runtime = await this.getRuntimeState();
+    this.runtimeStateCache = null;
+    const runtime = await this.getRuntimeState(0);
     const loadedTarget = runtime.runningModels.find((entry) => entry.model === targetModel || entry.name === targetModel);
 
     if (!loadedTarget) {
@@ -774,6 +794,7 @@ export class ModelAdapter {
     };
 
     this.lastSwitchResult = result;
+    this.runtimeStateCache = null;
     return result;
   }
 
@@ -781,12 +802,19 @@ export class ModelAdapter {
     const effectiveTimeout = timeoutMs ?? this.timeoutMs;
     let lastError: any;
     for (let attempt = 0; attempt <= this.retries; attempt++) {
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      let abortFromCaller: (() => void) | undefined;
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, effectiveTimeout);
         
         if (options.signal) {
-          options.signal.addEventListener('abort', () => controller.abort());
+          abortFromCaller = () => controller.abort();
+          options.signal.addEventListener('abort', abortFromCaller, { once: true });
           if (options.signal.aborted) {
             controller.abort();
           }
@@ -796,8 +824,6 @@ export class ModelAdapter {
           ...options,
           signal: controller.signal as any
         });
-        
-        clearTimeout(timeoutId);
 
         if (response.ok) {
           return response;
@@ -811,9 +837,18 @@ export class ModelAdapter {
         return response;
 
       } catch (error) {
-        lastError = error;
+        lastError = timedOut && (error as { name?: string })?.name === 'AbortError'
+          ? new Error(`Model request timed out after ${Math.round(effectiveTimeout / 1000)}s before response.`)
+          : error;
         if (attempt < this.retries) {
           await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt))); // Exponential backoff
+        }
+      } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        if (options.signal && abortFromCaller) {
+          options.signal.removeEventListener('abort', abortFromCaller);
         }
       }
     }
@@ -860,7 +895,7 @@ export class ModelAdapter {
       tools: request.tools
     };
 
-    const chatTimeout = Math.max(this.timeoutMs, 60_000);
+    const chatTimeout = Math.max(this.timeoutMs * 4, 180_000);
     const response = await this.fetchWithRetry(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: this.headers,

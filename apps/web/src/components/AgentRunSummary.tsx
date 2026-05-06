@@ -1,4 +1,5 @@
 import { summarizeWorkflowProgress } from '../lib/run-console';
+import type { StructuredDiff, StructuredDiffFile } from '../types/run';
 
 interface AgentRunLineStats {
   changedFiles: number;
@@ -37,6 +38,26 @@ interface WorkflowSummaryData {
 
 export interface AgentRunSummaryData {
   agentProtocol?: 'native_tools' | 'action_dsl' | 'workflow_runner';
+  agentModel?: string;
+  summaryModel?: string;
+  activeModel?: string | null;
+  heavyModelLock?: {
+    held: boolean;
+    ownerRunId: string | null;
+    queued: number;
+  };
+  lastRouteSelection?: {
+    role: string;
+    model: string;
+    protocol?: string;
+    reason?: string;
+  };
+  modelRoute?: {
+    role: string;
+    model: string;
+    protocol?: string;
+    reason?: string;
+  };
   workspaceSource: 'backend' | 'browser_snapshot';
   workspaceBound: boolean;
   filesRead: string[];
@@ -50,10 +71,18 @@ export interface AgentRunSummaryData {
   commands: AgentRunCommand[];
   approvals: AgentRunApproval[];
   git?: AgentRunLineStats;
+  structuredDiff?: StructuredDiff;
+  fileChanges?: StructuredDiffFile[];
+  checkpointIds?: string[];
+  currentAction?: string;
+  parseFailureCount?: number;
+  routingNotes?: string[];
+  memoryNotes?: string[];
   usedManualFallback: boolean;
   fallbackReason?: string;
   metrics?: AgentRunMetrics;
   summary?: string;
+  verification?: string;
   workflow?: WorkflowSummaryData;
 }
 
@@ -73,6 +102,37 @@ function summarizeList(values: string[], empty = 'none', limit = 3): string {
   return `${values.slice(0, limit).join(', ')} +${values.length - limit} more`;
 }
 
+function summarizeNotes(label: string, notes?: string[]): string {
+  if (!notes || notes.length === 0) {
+    return `${label}: none`;
+  }
+
+  return `${label}: ${summarizeList(notes, 'none', 2)}`;
+}
+
+function summarizeModelRouting(run: AgentRunSummaryData): string {
+  const parts: string[] = [];
+  const route = run.modelRoute || run.lastRouteSelection;
+
+  if (run.agentModel) {
+    parts.push(`Agent ${run.agentModel}${run.activeModel === run.agentModel ? ' (active)' : ''}`);
+  }
+  if (run.summaryModel) {
+    parts.push(`Summary ${run.summaryModel}`);
+  }
+  if (run.activeModel && run.activeModel !== run.agentModel) {
+    parts.push(`Active ${run.activeModel}`);
+  }
+  if (run.heavyModelLock) {
+    parts.push(`${run.heavyModelLock.held ? 'Held' : 'Free'} · queued ${run.heavyModelLock.queued}${run.heavyModelLock.ownerRunId ? ` · owner ${run.heavyModelLock.ownerRunId}` : ''}`);
+  }
+  if (route) {
+    parts.push(`Route ${route.role} -> ${route.model}`);
+  }
+
+  return parts.length > 0 ? parts.join(' · ') : 'No model routing data';
+}
+
 export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
   const changedSummary = run.git && run.git.changedFiles > 0
     ? `${run.git.changedFiles} file${run.git.changedFiles === 1 ? '' : 's'} (+${run.git.addedLines} / -${run.git.removedLines})`
@@ -87,6 +147,12 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
     ...run.filesDeleted,
     ...run.directoriesCreated,
   ];
+  const fileChangesCount = run.fileChanges?.length ?? run.structuredDiff?.files.length ?? run.workflow?.filesChanged.length ?? 0;
+  const notesSummary = [
+    summarizeNotes('Routing', run.routingNotes),
+    summarizeNotes('Memory', run.memoryNotes),
+  ].join(' · ');
+  const verificationSummary = run.verification || run.workflow?.status || 'none';
 
   return (
     <div className="tool-execution-tracker">
@@ -103,6 +169,13 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
             <span className="tool-call-state">{run.agentProtocol || 'native_tools'}</span>
           </div>
           <div className="tool-call-input">Selected protocol for this run.</div>
+        </div>
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Model routing</span>
+            <span className="tool-call-state">{run.agentModel || run.activeModel || 'none'}</span>
+          </div>
+          <div className="tool-call-input">{summarizeModelRouting(run)}</div>
         </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
@@ -134,8 +207,8 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
         </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
-            <span className="tool-call-name">Changed</span>
-            <span className="tool-call-state">{changedSummary}</span>
+            <span className="tool-call-name">Files changed</span>
+            <span className="tool-call-state">{fileChangesCount > 0 ? `${fileChangesCount} file${fileChangesCount === 1 ? '' : 's'}` : changedSummary}</span>
           </div>
           <div className="tool-call-input">{summarizeList(touchedPaths)}</div>
         </div>
@@ -152,6 +225,37 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
             <span className="tool-call-state">{run.approvals.length}</span>
           </div>
           <div className="tool-call-input">{approvalsApproved} approved · {run.workspaceBound ? 'bound' : 'snapshot only'}</div>
+        </div>
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Action DSL</span>
+            <span className="tool-call-state">{run.currentAction || `${run.parseFailureCount ?? 0} failures`}</span>
+          </div>
+          <div className="tool-call-input">
+            {run.currentAction ? `Current action: ${run.currentAction}` : 'No current action'}
+            {typeof run.parseFailureCount === 'number' ? ` · Parse failures: ${run.parseFailureCount}` : ''}
+          </div>
+        </div>
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Notes</span>
+            <span className="tool-call-state">{(run.routingNotes?.length || 0) + (run.memoryNotes?.length || 0)}</span>
+          </div>
+          <div className="tool-call-input">{notesSummary}</div>
+        </div>
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Verification</span>
+            <span className="tool-call-state">{verificationSummary}</span>
+          </div>
+          <div className="tool-call-input">{run.verification || 'No explicit verification recorded'}</div>
+        </div>
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Checkpoint</span>
+            <span className="tool-call-state">{run.checkpointIds?.length ? 'created' : 'none'}</span>
+          </div>
+          <div className="tool-call-input">{run.checkpointIds?.slice(-1)[0] || 'No rollback checkpoint recorded'}</div>
         </div>
         <div className={`tool-call-card ${run.usedManualFallback ? 'tool-call-card-error' : 'tool-call-card-done'}`}>
           <div className="tool-call-card-top">

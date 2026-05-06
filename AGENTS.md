@@ -20,6 +20,23 @@
 
 The current harness is not failing because TypeScript is inherently bad. It is failing because the agentic path has too many soft contracts. The model is asked to behave like an autonomous coding agent, but the runtime does not force enough structure.
 
+# 0.1 2026-04-28 smart-agent tool ledger
+
+- `TASK-11 [done]` Deterministic code-structure tools added: `findSymbol`, `findFunction`, `findComponent`, import graph queries, affected-file discovery, context packs, project command detection, and targeted test selection.
+- `TASK-12 [done]` Precision edit tools added: `replaceFunction`, `insertImport`, `addTypeProperty`, and `renameIdentifier`, all routed through existing policy/approval/diff paths instead of whole-file rewrites.
+- `TASK-13 [done]` Structured diff and rollback trust path added: `getStructuredDiff`, structured run summary fields, checkpoint creation, rollback-to-checkpoint, and API endpoints for UI/runtime use.
+- `TASK-14 [done]` Run console now shows inline diff hunks with old/new line numbers, file-level change totals, why-file-selected notes, context-budget telemetry, and richer tool transparency with duration/output previews.
+- `TASK-15 [done]` Model routing foundation added: execution profiles, provider profile labels, prompt profiles, fast/code/review/API model slots, route selection traces, and model-per-purpose calls for direct/code/summarize paths.
+- `TASK-16 [done]` Regression coverage added for deterministic repo tools, AST edits, import graph, targeted test selection, command detection, checkpoint rollback, and full `npm test` passes.
+
+Status: complete as of 2026-04-30; all checklist items in sections 0 and 0.1 are marked [done].
+
+Implementation audit note:
+- `qwe-qwe` mechanisms selectively ported: response continuation, context compaction mindset, bounded retry/continuation loop, compacted tool reinjection.
+- `osaurus` ideas selectively ported: clearer direct-vs-agent posture, stronger live command-center framing, better visible session/activity shell.
+- Official Codex docs influence applied selectively: explicit runtime/status surfaces, approval/state clarity, local-first constraints preserved.
+- Manual-only residual remains: live Ollama smoke with the operator’s preferred Gemma/Qwen models on this exact machine is still recommended after code/test completion.
+
 The existing codebase already contains the important pieces:
 
 - web UI

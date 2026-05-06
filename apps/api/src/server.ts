@@ -3,6 +3,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { CoreEngine } from '@local-harness/core';
 import { ModelAdapter } from '@local-harness/model-adapter';
+import type { ModelRuntimeState } from '@local-harness/model-adapter';
 
 const PORT = parseInt(process.env.API_PORT || '3001', 10);
 const HOST = process.env.API_HOST || '127.0.0.1';
@@ -15,6 +16,10 @@ const MAX_CHAT_IMAGE_BYTES = 1024 * 1024;
 const WORKSPACE_RESOLVE_MAX_DEPTH = 3;
 const WORKSPACE_RESOLVE_MAX_VISITS = 2000;
 const WORKSPACE_RESOLVE_MAX_CANDIDATES = 64;
+const modelRuntimeCacheTtlSetting = Number(process.env.HARNESS_MODEL_RUNTIME_CACHE_MS);
+const MODEL_RUNTIME_CACHE_TTL_MS = Number.isFinite(modelRuntimeCacheTtlSetting)
+  ? Math.max(5_000, Math.min(15_000, modelRuntimeCacheTtlSetting))
+  : 10_000;
 const WORKSPACE_RESOLVE_IGNORES = new Set([
   '.git',
   '.next',
@@ -53,6 +58,25 @@ const ALLOWED_ORIGINS = new Set([
 const engine = new CoreEngine({
   workspaceRoot: WORKSPACE_ROOT,
 });
+let modelRuntimeCache: { value: ModelRuntimeState; expiresAt: number } | null = null;
+
+async function getCachedModelRuntime(force = false): Promise<ModelRuntimeState> {
+  const now = Date.now();
+  if (!force && modelRuntimeCache && modelRuntimeCache.expiresAt > now) {
+    return modelRuntimeCache.value;
+  }
+
+  const value = await engine.getModelRuntime();
+  modelRuntimeCache = {
+    value,
+    expiresAt: Date.now() + MODEL_RUNTIME_CACHE_TTL_MS,
+  };
+  return value;
+}
+
+function clearModelRuntimeCache() {
+  modelRuntimeCache = null;
+}
 
 function getApiGuide() {
   const localHost = HOST === '0.0.0.0' ? 'localhost' : HOST;
@@ -98,6 +122,15 @@ function writeNdjson(res: http.ServerResponse, event: unknown) {
   if (!res.writableEnded) {
     res.write(`${JSON.stringify(event)}\n`);
   }
+}
+
+function writeTraceNdjson(res: http.ServerResponse, event: { type: string; id?: string; timestamp?: number; data?: unknown }) {
+  writeNdjson(res, {
+    type: event.type,
+    id: event.id,
+    timestamp: event.timestamp,
+    data: event.data,
+  });
 }
 
 async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
@@ -447,6 +480,10 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const validModes = new Set(['read-only', 'workspace-write', 'danger']);
       const validProfiles = new Set(['fast', 'balanced', 'deep']);
+      const validBudgetProfiles = new Set(['lean', 'balanced', 'deep']);
+      const validExecutionProfiles = new Set(['fast_local', 'balanced_local', 'deep_review', 'api_frontier']);
+      const validProviderProfiles = new Set(['ollama_local', 'openai_compatible', 'openrouter', 'together', 'groq', 'qwen_api', 'kimi_api']);
+      const validPromptProfiles = new Set(['gemma-local-fast', 'qwen-coder-local', 'deepseek-coder-local', 'kimi-api-long-context', 'frontier-mini-api']);
       if (body.baseUrl !== undefined && typeof body.baseUrl !== 'string') {
         sendBadRequest(req, res, 'baseUrl must be a string.');
         return;
@@ -489,6 +526,28 @@ const server = http.createServer(async (req, res) => {
       if (body.profile !== undefined && (typeof body.profile !== 'string' || !validProfiles.has(body.profile))) {
         sendBadRequest(req, res, 'profile must be one of fast, balanced, or deep.');
         return;
+      }
+      if (body.localModelBudgetProfile !== undefined && (typeof body.localModelBudgetProfile !== 'string' || !validBudgetProfiles.has(body.localModelBudgetProfile))) {
+        sendBadRequest(req, res, 'localModelBudgetProfile must be one of lean, balanced, or deep.');
+        return;
+      }
+      if (body.executionProfile !== undefined && (typeof body.executionProfile !== 'string' || !validExecutionProfiles.has(body.executionProfile))) {
+        sendBadRequest(req, res, 'executionProfile must be one of fast_local, balanced_local, deep_review, or api_frontier.');
+        return;
+      }
+      if (body.providerProfile !== undefined && (typeof body.providerProfile !== 'string' || !validProviderProfiles.has(body.providerProfile))) {
+        sendBadRequest(req, res, 'providerProfile is not supported.');
+        return;
+      }
+      if (body.promptProfile !== undefined && (typeof body.promptProfile !== 'string' || !validPromptProfiles.has(body.promptProfile))) {
+        sendBadRequest(req, res, 'promptProfile is not supported.');
+        return;
+      }
+      for (const key of ['fastModel', 'codingModel', 'reviewModel', 'apiModel']) {
+        if (body[key] !== undefined && typeof body[key] !== 'string') {
+          sendBadRequest(req, res, `${key} must be a string.`);
+          return;
+        }
       }
       if (body.internetAccessEnabled !== undefined && typeof body.internetAccessEnabled !== 'boolean') {
         sendBadRequest(req, res, 'internetAccessEnabled must be a boolean.');
@@ -534,6 +593,7 @@ const server = http.createServer(async (req, res) => {
       await engine.updateConfig(body as any, {
         activateModel: body.activateModel === true,
       });
+      clearModelRuntimeCache();
       sendJson(req, res, 200, engine.getPublicConfig());
       return;
     }
@@ -603,7 +663,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (requestUrl.pathname === '/api/model/runtime' && method === 'GET') {
-      sendJson(req, res, 200, await engine.getModelRuntime());
+      sendJson(req, res, 200, await getCachedModelRuntime());
       return;
     }
 
@@ -623,7 +683,7 @@ const server = http.createServer(async (req, res) => {
           sendBadRequest(req, res, imageValidationError);
           return;
         }
-        const runtime = await engine.getModelRuntime();
+        const runtime = await getCachedModelRuntime();
         const thinkingWarning = getThinkingWarning(runtime.configuredModelCapabilities, thinkingEnabled);
 
         // Attach images to the last user message if provided
@@ -675,7 +735,7 @@ const server = http.createServer(async (req, res) => {
           res.end();
           return;
         }
-        const runtime = await engine.getModelRuntime();
+        const runtime = await getCachedModelRuntime();
         const thinkingWarning = getThinkingWarning(runtime.configuredModelCapabilities, thinkingEnabled);
 
         // Attach images to the last user message if provided
@@ -704,6 +764,7 @@ const server = http.createServer(async (req, res) => {
               onRunStep: (event) => writeNdjson(res, event),
               onRunMetric: (event) => writeNdjson(res, event),
               onRunSummary: (event) => writeNdjson(res, event),
+              onTrace: (event) => writeTraceNdjson(res, event),
             },
             { signal: abortController.signal, think: thinkingEnabled }
           );
@@ -724,6 +785,7 @@ const server = http.createServer(async (req, res) => {
             onRunStep: (event) => writeNdjson(res, event),
             onRunMetric: (event) => writeNdjson(res, event),
             onRunSummary: (event) => writeNdjson(res, event),
+            onTrace: (event) => writeTraceNdjson(res, event),
           },
           { signal: abortController.signal, think: thinkingEnabled },
         );
@@ -743,6 +805,32 @@ const server = http.createServer(async (req, res) => {
         req.off('aborted', onAbort);
         res.off('close', onAbort);
       }
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/runs' && method === 'GET') {
+      sendJson(req, res, 200, await engine.listRuns());
+      return;
+    }
+
+    if (requestUrl.pathname.startsWith('/api/runs/') && requestUrl.pathname.endsWith('/checkpoint') && method === 'GET') {
+      const runId = requestUrl.pathname.split('/')[3];
+      const checkpoint = await engine.getRunCheckpoint(runId);
+      sendJson(req, res, checkpoint ? 200 : 404, checkpoint || { error: 'Run checkpoint not found.' });
+      return;
+    }
+
+    if (requestUrl.pathname.startsWith('/api/runs/') && requestUrl.pathname.endsWith('/resume') && method === 'POST') {
+      const runId = requestUrl.pathname.split('/')[3];
+      const checkpoint = await engine.resumeRun(runId);
+      sendJson(req, res, checkpoint ? 200 : 404, checkpoint || { error: 'Run checkpoint not found.' });
+      return;
+    }
+
+    if (requestUrl.pathname.startsWith('/api/runs/') && method === 'GET') {
+      const runId = requestUrl.pathname.split('/')[3];
+      const checkpoint = await engine.getRun(runId);
+      sendJson(req, res, checkpoint ? 200 : 404, checkpoint || { error: 'Run not found.' });
       return;
     }
 
@@ -876,6 +964,78 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/api/workspace/git/diff' && method === 'GET') {
       sendJson(req, res, 200, await engine.gitDiff());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/git/diff/structured' && method === 'GET') {
+      sendJson(req, res, 200, await engine.getStructuredDiff());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/project/commands' && method === 'GET') {
+      sendJson(req, res, 200, await engine.detectProjectCommands());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/symbol' && method === 'GET') {
+      const name = getQueryValue(requestUrl, 'name');
+      const kind = getQueryValue(requestUrl, 'kind');
+      if (!name) {
+        sendBadRequest(req, res, 'name query parameter is required.');
+        return;
+      }
+      if (kind === 'function') {
+        sendJson(req, res, 200, await engine.findFunction(name));
+        return;
+      }
+      if (kind === 'component') {
+        sendJson(req, res, 200, await engine.findComponent(name));
+        return;
+      }
+      sendJson(req, res, 200, await engine.findSymbol(name));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/imports' && method === 'GET') {
+      const targetPath = getQueryValue(requestUrl, 'path');
+      const direction = getQueryValue(requestUrl, 'direction');
+      if (!targetPath) {
+        sendBadRequest(req, res, 'path query parameter is required.');
+        return;
+      }
+      if (direction === 'reverse') {
+        sendJson(req, res, 200, await engine.whoImports(targetPath));
+        return;
+      }
+      if (direction === 'affected') {
+        sendJson(req, res, 200, await engine.affectedFiles(targetPath));
+        return;
+      }
+      sendJson(req, res, 200, await engine.whatDoesThisImport(targetPath));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/tests/select' && method === 'POST') {
+      const body = await readBody(req);
+      sendJson(req, res, 200, await engine.selectTestsForChangedFiles(body.changedFiles));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/checkpoint' && method === 'POST') {
+      const body = await readBody(req);
+      const label = typeof body.label === 'string' ? body.label : undefined;
+      sendJson(req, res, 200, await engine.createCheckpoint(label));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/checkpoint/rollback' && method === 'POST') {
+      const body = await readBody(req);
+      const checkpointId = typeof body.checkpointId === 'string' ? body.checkpointId : '';
+      if (!checkpointId) {
+        sendBadRequest(req, res, 'checkpointId is required.');
+        return;
+      }
+      sendJson(req, res, 200, await engine.rollbackToCheckpoint(checkpointId));
       return;
     }
 

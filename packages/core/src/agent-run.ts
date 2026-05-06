@@ -89,6 +89,9 @@ export function summarizeRun(run: AgentRun): string {
   if (run.agentProtocol) {
     facts.push(`protocol ${run.agentProtocol}`);
   }
+  if (run.modelRoute) {
+    facts.push(`route ${run.modelRoute.role} -> ${run.modelRoute.model}`);
+  }
   if (run.workflow) {
     facts.push(`workflow ${run.workflow.workflowType} (${run.workflow.status})`);
   }
@@ -109,6 +112,15 @@ export function summarizeRun(run: AgentRun): string {
   }
   if (run.commands.length > 0) {
     facts.push(`ran ${run.commands.length} command${run.commands.length === 1 ? '' : 's'}`);
+  }
+  if (typeof run.parseFailureCount === 'number' && run.parseFailureCount > 0) {
+    facts.push(`parse failures ${run.parseFailureCount}`);
+  }
+  if (run.routingNotes && run.routingNotes.length > 0) {
+    facts.push(`routing notes ${run.routingNotes.length}`);
+  }
+  if (run.memoryNotes && run.memoryNotes.length > 0) {
+    facts.push(`memory notes ${run.memoryNotes.length}`);
   }
   if (run.git && run.git.changedFiles > 0) {
     facts.push(`changed ${run.git.changedFiles} file${run.git.changedFiles === 1 ? '' : 's'} (+${run.git.addedLines} / -${run.git.removedLines})`);
@@ -154,6 +166,16 @@ export class AgentRunBuilder {
       metrics: run.metrics ? { ...run.metrics } : undefined,
       git: run.git ? { ...run.git } : undefined,
       workflow: cloneWorkflowState(run.workflow),
+      structuredDiff: run.structuredDiff ? { files: run.structuredDiff.files.map((file) => ({ ...file, hunks: file.hunks.map((hunk) => ({ ...hunk, lines: hunk.lines.map((line) => ({ ...line })) })) })) } : undefined,
+      fileChanges: run.fileChanges ? run.fileChanges.map((file) => ({ ...file, hunks: file.hunks.map((hunk) => ({ ...hunk, lines: hunk.lines.map((line) => ({ ...line })) })) })) : undefined,
+      selectedTests: run.selectedTests ? [...run.selectedTests] : undefined,
+      checkpointIds: run.checkpointIds ? [...run.checkpointIds] : undefined,
+      modelRoute: run.modelRoute ? { ...run.modelRoute } : undefined,
+      heavyModelLock: run.heavyModelLock ? { ...run.heavyModelLock } : undefined,
+      lastRouteSelection: run.lastRouteSelection ? { ...run.lastRouteSelection } : undefined,
+      parseFailureCount: run.parseFailureCount,
+      routingNotes: run.routingNotes ? [...run.routingNotes] : undefined,
+      memoryNotes: run.memoryNotes ? [...run.memoryNotes] : undefined,
     };
   }
 
@@ -174,6 +196,16 @@ export class AgentRunBuilder {
       metrics: this.run.metrics ? { ...this.run.metrics } : undefined,
       git: this.run.git ? { ...this.run.git } : undefined,
       workflow: cloneWorkflowState(this.run.workflow),
+      structuredDiff: this.run.structuredDiff ? { files: this.run.structuredDiff.files.map((file) => ({ ...file, hunks: file.hunks.map((hunk) => ({ ...hunk, lines: hunk.lines.map((line) => ({ ...line })) })) })) } : undefined,
+      fileChanges: this.run.fileChanges ? this.run.fileChanges.map((file) => ({ ...file, hunks: file.hunks.map((hunk) => ({ ...hunk, lines: hunk.lines.map((line) => ({ ...line })) })) })) : undefined,
+      selectedTests: this.run.selectedTests ? [...this.run.selectedTests] : undefined,
+      checkpointIds: this.run.checkpointIds ? [...this.run.checkpointIds] : undefined,
+      modelRoute: this.run.modelRoute ? { ...this.run.modelRoute } : undefined,
+      heavyModelLock: this.run.heavyModelLock ? { ...this.run.heavyModelLock } : undefined,
+      lastRouteSelection: this.run.lastRouteSelection ? { ...this.run.lastRouteSelection } : undefined,
+      parseFailureCount: this.run.parseFailureCount,
+      routingNotes: this.run.routingNotes ? [...this.run.routingNotes] : undefined,
+      memoryNotes: this.run.memoryNotes ? [...this.run.memoryNotes] : undefined,
     };
   }
 
@@ -198,6 +230,18 @@ export class AgentRunBuilder {
 
   setLoopCount(modelLoops: number) {
     this.setMetric({ modelLoops });
+  }
+
+  setRuntimeModels(patch: Pick<AgentRun, 'agentModel' | 'summaryModel' | 'activeModel' | 'heavyModelLock' | 'lastRouteSelection'>) {
+    this.run.agentModel = patch.agentModel;
+    this.run.summaryModel = patch.summaryModel;
+    this.run.activeModel = patch.activeModel;
+    this.run.heavyModelLock = patch.heavyModelLock ? { ...patch.heavyModelLock } : undefined;
+    this.run.lastRouteSelection = patch.lastRouteSelection ? { ...patch.lastRouteSelection } : undefined;
+  }
+
+  setModelRoute(route: AgentRun['modelRoute']) {
+    this.run.modelRoute = route ? { ...route } : undefined;
   }
 
   startStep(step: Omit<AgentRunStep, 'startedAt' | 'status'>): AgentRunStep {
@@ -262,6 +306,23 @@ export class AgentRunBuilder {
     mergeWebFetches(this.run.webFetches, metadata.webFetches);
     mergeCommands(this.run.commands, metadata.command);
     this.run.git = mergeLineStats(this.run.git, metadata.lineStats);
+    if (metadata.structuredDiff) {
+      const existingFiles = this.run.structuredDiff?.files ?? [];
+      this.run.structuredDiff = {
+        files: [...existingFiles, ...metadata.structuredDiff.files],
+      };
+      this.run.fileChanges = this.run.structuredDiff.files;
+    }
+    uniquePush(this.run.selectedTests ??= [], metadata.selectedTests);
+    if (metadata.checkpointId) {
+      uniquePush(this.run.checkpointIds ??= [], [metadata.checkpointId]);
+    }
+    if (metadata.contextBudgetUsed || metadata.contextBudgetLimit) {
+      this.setMetric({
+        contextBudgetUsed: metadata.contextBudgetUsed,
+        contextBudgetLimit: metadata.contextBudgetLimit,
+      });
+    }
   }
 
   setGitStats(git: AgentRunLineStats | undefined) {

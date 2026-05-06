@@ -1,6 +1,6 @@
 import { memo } from 'react';
 import { AgentRunSteps, type AgentRunStepData } from './AgentRunSteps';
-import { AgentRunSummary, type AgentRunSummaryData } from './AgentRunSummary';
+import { type AgentRunSummaryData } from './AgentRunSummary';
 import { StreamingMarkdown } from './StreamingMarkdown';
 import { formatToolInputSummary } from '../lib/run-console';
 
@@ -93,9 +93,6 @@ function ChatMessageRowComponent({ message }: { message: ChatMessageRowData }) {
             <span className="chat-msg-name">{message.role === 'user' ? 'You' : 'Assistant'}</span>
             <span className="chat-msg-time">{formatTime(message.createdAt)}</span>
           </div>
-          {message.role === 'assistant' && message.executionMode === 'agentic' && message.runSummary && (
-            <AgentRunSummary run={message.runSummary} />
-          )}
           {message.role === 'assistant' && message.executionMode === 'agentic' && (message.runSteps?.length || 0) > 0 && (
             <AgentRunSteps steps={message.runSteps || []} />
           )}

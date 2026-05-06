@@ -79,6 +79,12 @@ async function testExecutor() {
 
   await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
   await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const value = "hello";\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'helpers.ts'), [
+    'export function helperThing() {',
+    '  return 42;',
+    '}',
+    '',
+  ].join('\n'), 'utf8');
 
   try {
     const runtime = createToolRuntime(workspaceRoot, traces);
@@ -104,6 +110,12 @@ async function testExecutor() {
     const patchResult = await executor.execute(assertParseOk(parseActionDsl('{"kind":"action","action":"propose_patch","args":{"path":"src/index.ts","oldText":"hello","newText":"agent"}}')).value);
     assert.strictEqual(patchResult.kind, 'tool');
     assert.ok(patchResult.result.preview?.includes('agent'));
+
+    for (const action of ['find_symbol', 'find_function', 'get_structured_diff', 'create_checkpoint']) {
+      const removed = parseActionDsl(JSON.stringify({ kind: 'action', action, args: {} }));
+      assert.ok(!removed.ok);
+      assert.strictEqual(removed.error.code, 'UNKNOWN_ACTION');
+    }
 
     assert.ok(traces.some((entry) => entry.type === 'action_dsl_action_started'));
     assert.ok(traces.some((entry) => entry.type === 'action_dsl_action_finished'));

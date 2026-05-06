@@ -35,6 +35,20 @@ export interface AdapterOptions {
   retries?: number;
 }
 
+export type ModelRoutePurpose =
+  | 'classify'
+  | 'direct'
+  | 'inspect'
+  | 'code'
+  | 'summarize'
+  | 'review';
+
+export type ExecutionProfile =
+  | 'fast_local'
+  | 'balanced_local'
+  | 'deep_review'
+  | 'api_frontier';
+
 export interface AvailableModel {
   id: string;
   object?: string;

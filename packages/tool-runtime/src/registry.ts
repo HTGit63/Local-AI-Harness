@@ -1,4 +1,21 @@
-import { ApprovalDecision, ToolActionContext, ToolDiffStats, ToolResult } from './types';
+import { ApprovalDecision, StructuredDiff, ToolActionContext, ToolDiffStats, ToolResult } from './types';
+import {
+  addInterfaceProperty,
+  buildContextPack as buildCodeContextPack,
+  findSymbols,
+  insertImportStatement,
+  renameIdentifierText,
+  replaceFunctionBody,
+} from './code-tools';
+import { createWorkspaceCheckpoint, getWorkspaceCheckpointAffectedFiles, rollbackWorkspaceCheckpoint } from './checkpoint-tools';
+import { parseStructuredDiff } from './diff-tools';
+import {
+  affectedFiles as findAffectedFiles,
+  detectProjectCommands as detectCommands,
+  selectTestsForChangedFiles as selectTests,
+  whatDoesThisImport as findImports,
+  whoImports as findImporters,
+} from './project-tools';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
@@ -12,6 +29,7 @@ const MAX_WEB_RESULTS = 5;
 const MAX_WEB_FETCH_BYTES = 180_000;
 const MAX_WEB_FETCH_TEXT_CHARS = 16_000;
 const WEB_REQUEST_TIMEOUT_MS = 12_000;
+const CHECKPOINT_TARGET = '.gamma-harness/checkpoints';
 
 function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
@@ -402,11 +420,106 @@ function parseUnifiedDiffStats(diff: string): ToolDiffStats {
   };
 }
 
-async function buildDiffPreview(filePath: string, before: string, after: string): Promise<{ preview: string; lineStats: ToolDiffStats }> {
+function diffStatsFromStructuredDiff(diff: StructuredDiff): ToolDiffStats {
+  const addedLines = diff.files.reduce((total, file) => total + file.addedLines, 0);
+  const removedLines = diff.files.reduce((total, file) => total + file.removedLines, 0);
+  return {
+    changedFiles: diff.files.length,
+    addedLines,
+    removedLines,
+  };
+}
+
+function parseUnifiedPatchFiles(patchText: string): string[] {
+  const files = new Set<string>();
+  for (const line of patchText.split('\n')) {
+    if (!line.startsWith('+++ ') && !line.startsWith('--- ')) {
+      continue;
+    }
+    const raw = line.slice(4).trim().split(/\s+/)[0];
+    if (!raw || raw === '/dev/null') {
+      continue;
+    }
+    files.add(raw.replace(/^b\//, '').replace(/^a\//, ''));
+  }
+  return Array.from(files);
+}
+
+function normalizeInsertedContent(content: string): string[] {
+  return content.endsWith('\n')
+    ? content.slice(0, -1).split('\n')
+    : content.split('\n');
+}
+
+type DiffPreview = {
+  preview: string;
+  lineStats: ToolDiffStats;
+  structuredDiff: StructuredDiff;
+};
+
+function emptyStructuredDiff(): StructuredDiff {
+  return { files: [] };
+}
+
+function mergeDiffPreviews(diffs: DiffPreview[]): DiffPreview {
+  return {
+    preview: truncateOutput(diffs.map((diff) => diff.preview).join('\n')),
+    lineStats: diffs.reduce((total, diff) => ({
+      changedFiles: total.changedFiles + diff.lineStats.changedFiles,
+      addedLines: total.addedLines + diff.lineStats.addedLines,
+      removedLines: total.removedLines + diff.lineStats.removedLines,
+    }), { changedFiles: 0, addedLines: 0, removedLines: 0 }),
+    structuredDiff: {
+      files: diffs.flatMap((diff) => diff.structuredDiff.files),
+    },
+  };
+}
+
+async function readTextIfPresent(filePath: string): Promise<string> {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') {
+      return '';
+    }
+    throw error;
+  }
+}
+
+function fallbackStructuredDiff(filePath: string, before: string, after: string): StructuredDiff {
+  if (before === after) {
+    return emptyStructuredDiff();
+  }
+  const beforeLines = before.length > 0 ? before.split('\n') : [];
+  const afterLines = after.length > 0 ? after.split('\n') : [];
+  const lines = [
+    { type: 'hunk' as const, content: `@@ -1,${beforeLines.length} +1,${afterLines.length} @@` },
+    ...beforeLines.map((content, index) => ({ type: 'removed' as const, oldLine: index + 1, content })),
+    ...afterLines.map((content, index) => ({ type: 'added' as const, newLine: index + 1, content })),
+  ];
+  return {
+    files: [{
+      path: filePath,
+      oldPath: filePath,
+      addedLines: afterLines.length,
+      removedLines: beforeLines.length,
+      hunks: [{
+        oldStart: beforeLines.length > 0 ? 1 : 0,
+        oldLines: beforeLines.length,
+        newStart: afterLines.length > 0 ? 1 : 0,
+        newLines: afterLines.length,
+        lines,
+      }],
+    }],
+  };
+}
+
+async function buildDiffPreview(filePath: string, before: string, after: string): Promise<DiffPreview> {
   if (before === after) {
     return {
       preview: `No content changes for ${filePath}`,
       lineStats: { changedFiles: 0, addedLines: 0, removedLines: 0 },
+      structuredDiff: emptyStructuredDiff(),
     };
   }
 
@@ -421,24 +534,30 @@ async function buildDiffPreview(filePath: string, before: string, after: string)
     try {
       const { stdout } = await execFileAsync(
         'diff',
-        ['-u', '--label', `${filePath} (before)`, '--label', `${filePath} (after)`, beforePath, afterPath],
+        ['-u', '--label', `a/${filePath}`, '--label', `b/${filePath}`, beforePath, afterPath],
         { maxBuffer: MAX_BUFFER_BYTES },
       );
+      const structuredDiff = parseStructuredDiff(stdout);
       return {
         preview: truncateOutput(stdout),
-        lineStats: parseUnifiedDiffStats(stdout),
+        lineStats: diffStatsFromStructuredDiff(structuredDiff),
+        structuredDiff,
       };
     } catch (error: any) {
       if (typeof error?.stdout === 'string' && error.stdout.trim()) {
+        const structuredDiff = parseStructuredDiff(error.stdout);
         return {
           preview: truncateOutput(error.stdout),
-          lineStats: parseUnifiedDiffStats(error.stdout),
+          lineStats: diffStatsFromStructuredDiff(structuredDiff),
+          structuredDiff,
         };
       }
 
+      const structuredDiff = fallbackStructuredDiff(filePath, before, after);
       return {
         preview: createSummaryPreview(filePath, before, after),
-        lineStats: countDiffStatsFromContent(before, after),
+        lineStats: diffStatsFromStructuredDiff(structuredDiff),
+        structuredDiff,
       };
     }
   } finally {
@@ -513,6 +632,7 @@ export class ToolRegistry {
   private wrapExecution(name: string, inputSummary: string, executor: () => Promise<ToolResult>): Promise<ToolResult> {
     const startedAt = Date.now();
     this.context.emitTrace('tool_call', { name, inputSummary });
+    this.context.emitTrace('tool_call_started', { tool: name, inputSummary });
     return executor()
       .then((result) => {
         const durationMs = Date.now() - startedAt;
@@ -520,6 +640,12 @@ export class ToolRegistry {
           name,
           resultSummary: result.success ? 'Success' : 'Failed',
           output: truncateOutput(result.output),
+          durationMs,
+        });
+        this.context.emitTrace('tool_call_completed', {
+          tool: name,
+          success: result.success,
+          outputPreview: truncateOutput(result.output),
           durationMs,
         });
         return {
@@ -536,6 +662,12 @@ export class ToolRegistry {
           name,
           resultSummary: 'Error',
           output: error.message,
+          durationMs,
+        });
+        this.context.emitTrace('tool_call_completed', {
+          tool: name,
+          success: false,
+          outputPreview: error.message,
           durationMs,
         });
         return {
@@ -836,6 +968,7 @@ export class ToolRegistry {
             metadata: {
               fileWrites: [filePath],
               lineStats: diff.lineStats,
+              structuredDiff: diff.structuredDiff,
             },
           };
         }
@@ -849,21 +982,229 @@ export class ToolRegistry {
         metadata: {
           fileWrites: [filePath],
           lineStats: diff.lineStats,
+          structuredDiff: diff.structuredDiff,
         },
       };
     });
   }
 
-  async previewPatch(filePath: string, oldContent: string, newContent: string): Promise<ToolResult> {
-    return this.wrapExecution('patch_preview', `Previewing patch for ${filePath}`, async () => {
-      const diff = await buildDiffPreview(filePath, oldContent, newContent);
+  async replaceRange(filePath: string, startLine: number, endLine: number, newContent: string): Promise<ToolResult> {
+    return this.wrapExecution('replace_range', `Replacing ${filePath}:${startLine}-${endLine}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
+        return { success: false, output: 'Line range must use 1-based integers with endLine >= startLine.' };
+      }
+
+      const absolutePath = this.resolveTarget(filePath);
+      const before = await fs.readFile(absolutePath, 'utf8');
+      const lines = before.split('\n');
+      if (endLine > lines.length) {
+        return { success: false, output: `Line range exceeds file length (${lines.length}).` };
+      }
+
+      const replacement = normalizeInsertedContent(newContent);
+      const nextLines = [
+        ...lines.slice(0, startLine - 1),
+        ...replacement,
+        ...lines.slice(endLine),
+      ];
+      const after = nextLines.join('\n');
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('replace_range', filePath, diff.preview);
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+          };
+        }
+      }
+
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `Replaced ${filePath}:${startLine}-${endLine}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+      };
+    });
+  }
+
+  async insertAfter(filePath: string, anchorText: string, newContent: string): Promise<ToolResult> {
+    return this.insertNearAnchor('insert_after', filePath, anchorText, newContent, 'after');
+  }
+
+  async insertBefore(filePath: string, anchorText: string, newContent: string): Promise<ToolResult> {
+    return this.insertNearAnchor('insert_before', filePath, anchorText, newContent, 'before');
+  }
+
+  async replaceBlock(filePath: string, anchorStart: string, anchorEnd: string, newContent: string): Promise<ToolResult> {
+    return this.wrapExecution('replace_block', `Replacing block in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      if (!anchorStart || !anchorEnd) {
+        return { success: false, output: 'anchorStart and anchorEnd are required.' };
+      }
+
+      const absolutePath = this.resolveTarget(filePath);
+      const before = await fs.readFile(absolutePath, 'utf8');
+      const startIndex = before.indexOf(anchorStart);
+      if (startIndex === -1) {
+        return { success: false, output: 'anchorStart not found.' };
+      }
+      const endIndex = before.indexOf(anchorEnd, startIndex + anchorStart.length);
+      if (endIndex === -1) {
+        return { success: false, output: 'anchorEnd not found after anchorStart.' };
+      }
+      const afterEnd = endIndex + anchorEnd.length;
+      const after = `${before.slice(0, startIndex)}${newContent}${before.slice(afterEnd)}`;
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('replace_block', filePath, diff.preview);
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+          };
+        }
+      }
+
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `Replaced block in ${filePath}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+      };
+    });
+  }
+
+  async previewPatch(filePath: string, before: string, after: string): Promise<ToolResult> {
+    return this.wrapExecution('preview_patch', `Previewing patch for ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('read', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const diff = await buildDiffPreview(filePath, before, after);
       return {
         success: true,
         output: diff.preview,
         preview: diff.preview,
-        metadata: {
-          lineStats: diff.lineStats,
-        },
+        metadata: { lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+      };
+    });
+  }
+
+  async applyUnifiedPatch(patchText: string): Promise<ToolResult> {
+    return this.wrapExecution('apply_unified_patch', 'Applying unified patch', async () => {
+      if (!patchText.trim()) {
+        return { success: false, output: 'patchText is required.' };
+      }
+      const files = parseUnifiedPatchFiles(patchText);
+      const policyTargets = files.length > 0 ? files : ['.'];
+      for (const target of policyTargets) {
+        const policy = this.context.checkPolicy('write', target);
+        if (!policy.allowed) {
+          return { success: false, output: `Denied: ${policy.reason}` };
+        }
+      }
+
+      const approvalRequired = policyTargets.some((target) => this.context.checkPolicy('write', target).requiresApproval);
+      const preview = truncateOutput(patchText);
+      const structuredDiff = parseStructuredDiff(patchText);
+      const lineStats = diffStatsFromStructuredDiff(structuredDiff);
+      if (approvalRequired) {
+        const approved = await this.withApproval('apply_unified_patch', files.join(', ') || '.', preview);
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview,
+            metadata: { fileWrites: files, lineStats, structuredDiff },
+          };
+        }
+      }
+
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-patch-'));
+      const patchPath = path.join(tempDir, 'change.patch');
+      try {
+        await fs.writeFile(patchPath, patchText, 'utf8');
+        const { stdout, stderr } = await execFileAsync('patch', ['-p0', '--forward', '--batch', '-i', patchPath], {
+          cwd: this.context.cwd,
+          maxBuffer: MAX_BUFFER_BYTES,
+        });
+        const output = truncateOutput(stdout || stderr || 'Patch applied.');
+        return {
+          success: true,
+          output,
+          preview,
+          metadata: { fileWrites: files, lineStats, structuredDiff },
+        };
+      } catch (error: any) {
+        return {
+          success: false,
+          output: truncateOutput(error?.stdout || error?.stderr || error?.message || 'Patch failed.'),
+          preview,
+          metadata: { fileWrites: files, lineStats, structuredDiff },
+        };
+      } finally {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  private async insertNearAnchor(
+    action: 'insert_after' | 'insert_before',
+    filePath: string,
+    anchorText: string,
+    newContent: string,
+    position: 'after' | 'before',
+  ): Promise<ToolResult> {
+    return this.wrapExecution(action, `${position === 'after' ? 'Inserting after' : 'Inserting before'} anchor in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      if (!anchorText) {
+        return { success: false, output: 'anchorText is required.' };
+      }
+
+      const absolutePath = this.resolveTarget(filePath);
+      const before = await fs.readFile(absolutePath, 'utf8');
+      const anchorIndex = before.indexOf(anchorText);
+      if (anchorIndex === -1) {
+        return { success: false, output: 'anchorText not found.' };
+      }
+      const insertionIndex = position === 'after' ? anchorIndex + anchorText.length : anchorIndex;
+      const after = `${before.slice(0, insertionIndex)}${newContent}${before.slice(insertionIndex)}`;
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval(action, filePath, diff.preview);
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+          };
+        }
+      }
+
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `${position === 'after' ? 'Inserted after' : 'Inserted before'} anchor in ${filePath}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
       };
     });
   }
@@ -926,6 +1267,7 @@ export class ToolRegistry {
           metadata: {
             fileWrites: [filePath],
             lineStats: diff.lineStats,
+            structuredDiff: diff.structuredDiff,
           },
         };
       }
@@ -939,6 +1281,7 @@ export class ToolRegistry {
         metadata: {
           fileWrites: [filePath],
           lineStats: diff.lineStats,
+          structuredDiff: diff.structuredDiff,
         },
       };
     });
@@ -957,6 +1300,7 @@ export class ToolRegistry {
         ? {
             preview: `Delete directory ${filePath}`,
             lineStats: { changedFiles: 0, addedLines: 0, removedLines: 0 },
+            structuredDiff: emptyStructuredDiff(),
           }
         : await buildDiffPreview(filePath, await fs.readFile(absolutePath, 'utf8'), '');
       if (policy.requiresApproval) {
@@ -969,6 +1313,7 @@ export class ToolRegistry {
             metadata: {
               fileDeletes: stat.isDirectory() ? undefined : [filePath],
               lineStats: diff.lineStats,
+              structuredDiff: diff.structuredDiff,
             },
           };
         }
@@ -986,6 +1331,336 @@ export class ToolRegistry {
         metadata: {
           fileDeletes: stat.isDirectory() ? undefined : [filePath],
           lineStats: diff.lineStats,
+          structuredDiff: diff.structuredDiff,
+        },
+      };
+    });
+  }
+
+  async findSymbol(symbolName: string): Promise<ToolResult> {
+    return this.wrapExecution('find_symbol', `Finding symbol ${symbolName}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const matches = await findSymbols(this.context.cwd, symbolName, 'symbol');
+      return {
+        success: true,
+        output: JSON.stringify({ symbolName, matches }, null, 2),
+        metadata: {
+          searches: [{ query: symbolName, pattern: 'symbol' }],
+        },
+      };
+    });
+  }
+
+  async findFunction(functionName: string): Promise<ToolResult> {
+    return this.wrapExecution('find_function', `Finding function ${functionName}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const matches = await findSymbols(this.context.cwd, functionName, 'function');
+      return {
+        success: true,
+        output: JSON.stringify({ functionName, matches }, null, 2),
+        metadata: {
+          searches: [{ query: functionName, pattern: 'function' }],
+        },
+      };
+    });
+  }
+
+  async findComponent(componentName: string): Promise<ToolResult> {
+    return this.wrapExecution('find_component', `Finding component ${componentName}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const matches = await findSymbols(this.context.cwd, componentName, 'component');
+      return {
+        success: true,
+        output: JSON.stringify({ componentName, matches }, null, 2),
+        metadata: {
+          searches: [{ query: componentName, pattern: 'component' }],
+        },
+      };
+    });
+  }
+
+  async replaceFunction(filePath: string, functionName: string, newBody: string): Promise<ToolResult> {
+    return this.wrapExecution('replace_function', `Replacing ${functionName} in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const absolutePath = this.resolveTarget(filePath);
+      const { before, after } = await replaceFunctionBody(this.context.cwd, filePath, functionName, newBody);
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('replace_function', filePath, diff.preview, { functionName });
+        if (!approved) {
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview: diff.preview,
+            metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+          };
+        }
+      }
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `Replaced function ${functionName} in ${filePath}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+      };
+    });
+  }
+
+  async insertImport(filePath: string, importStatement: string): Promise<ToolResult> {
+    return this.wrapExecution('insert_import', `Inserting import in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const absolutePath = this.resolveTarget(filePath);
+      const { before, after } = await insertImportStatement(this.context.cwd, filePath, importStatement);
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('insert_import', filePath, diff.preview);
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff } };
+        }
+      }
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return { success: true, output: `Inserted import in ${filePath}`, preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff } };
+    });
+  }
+
+  async addTypeProperty(filePath: string, interfaceName: string, property: string): Promise<ToolResult> {
+    return this.wrapExecution('add_type_property', `Adding ${interfaceName}.${property}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const absolutePath = this.resolveTarget(filePath);
+      const { before, after } = await addInterfaceProperty(this.context.cwd, filePath, interfaceName, property);
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('add_type_property', filePath, diff.preview, { interfaceName });
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff } };
+        }
+      }
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return { success: true, output: `Added property to ${interfaceName}`, preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff } };
+    });
+  }
+
+  async renameIdentifier(filePath: string, oldName: string, newName: string): Promise<ToolResult> {
+    return this.wrapExecution('rename_identifier', `Renaming ${oldName} to ${newName} in ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('write', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const absolutePath = this.resolveTarget(filePath);
+      const { before, after, replacements } = await renameIdentifierText(this.context.cwd, filePath, oldName, newName);
+      const diff = await buildDiffPreview(filePath, before, after);
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('rename_identifier', filePath, diff.preview, { oldName, newName });
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview: diff.preview, metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff } };
+        }
+      }
+      await fs.writeFile(absolutePath, after, 'utf8');
+      return {
+        success: true,
+        output: `Renamed ${replacements} identifier occurrence${replacements === 1 ? '' : 's'} in ${filePath}`,
+        preview: diff.preview,
+        metadata: { fileWrites: [filePath], lineStats: diff.lineStats, structuredDiff: diff.structuredDiff },
+      };
+    });
+  }
+
+  async whatDoesThisImport(filePath: string): Promise<ToolResult> {
+    return this.wrapExecution('what_does_this_import', `Reading imports for ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('read', filePath);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const imports = await findImports(this.context.cwd, filePath);
+      return { success: true, output: JSON.stringify({ filePath, imports }, null, 2), metadata: { fileReads: [filePath] } };
+    });
+  }
+
+  async whoImports(filePath: string): Promise<ToolResult> {
+    return this.wrapExecution('who_imports', `Finding importers for ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const importers = await findImporters(this.context.cwd, filePath);
+      return { success: true, output: JSON.stringify({ filePath, importers }, null, 2), metadata: { searches: [{ query: filePath, pattern: 'imports' }] } };
+    });
+  }
+
+  async affectedFiles(filePath: string): Promise<ToolResult> {
+    return this.wrapExecution('affected_files', `Finding affected files for ${filePath}`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const affected = await findAffectedFiles(this.context.cwd, filePath);
+      return { success: true, output: JSON.stringify({ filePath, affectedFiles: affected }, null, 2), metadata: { searches: [{ query: filePath, pattern: 'affected-files' }] } };
+    });
+  }
+
+  async selectTestsForChangedFiles(changedFiles: string | string[]): Promise<ToolResult> {
+    return this.wrapExecution('select_tests_for_changed_files', 'Selecting targeted tests', async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const selection = await selectTests(this.context.cwd, changedFiles);
+      return { success: true, output: JSON.stringify(selection, null, 2), metadata: { selectedTests: selection.tests } };
+    });
+  }
+
+  async detectProjectCommands(): Promise<ToolResult> {
+    return this.wrapExecution('detect_project_commands', 'Detecting project commands', async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const commands = await detectCommands(this.context.cwd);
+      return { success: true, output: JSON.stringify(commands, null, 2), metadata: { fileReads: commands.detectedFiles } };
+    });
+  }
+
+  async buildContextPack(query: string, maxFilesOrContextBudget = 5): Promise<ToolResult> {
+    return this.wrapExecution('build_context_pack', `Building context pack for "${query}"`, async () => {
+      const policy = this.context.checkPolicy('read', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const contextBudget = maxFilesOrContextBudget > 100 ? maxFilesOrContextBudget : 8_000;
+      const maxFiles = maxFilesOrContextBudget > 100 ? 5 : maxFilesOrContextBudget;
+      const pack = await buildCodeContextPack(this.context.cwd, query, contextBudget, maxFiles);
+      return {
+        success: true,
+        output: JSON.stringify(pack, null, 2),
+        metadata: {
+          fileReads: pack.fileCards.map((card) => card.filePath),
+          contextBudgetUsed: pack.contextBudgetUsed,
+          contextBudgetLimit: pack.contextBudgetLimit,
+        },
+      };
+    });
+  }
+
+  async getStructuredDiff(): Promise<ToolResult> {
+    return this.wrapExecution('get_structured_diff', 'git diff as structured hunks', async () => {
+      try {
+        const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--unified=80', '--'], {
+          cwd: this.context.cwd,
+          maxBuffer: MAX_BUFFER_BYTES,
+        });
+        const structuredDiff = parseStructuredDiff(stdout);
+        const lineStats = diffStatsFromStructuredDiff(structuredDiff);
+        return {
+          success: true,
+          output: JSON.stringify(structuredDiff, null, 2),
+          metadata: {
+            structuredDiff,
+            lineStats,
+            command: { command: 'git diff --no-ext-diff --unified=80 --', success: true },
+          },
+        };
+      } catch (error) {
+        if (isNotGitRepository(error)) {
+          const structuredDiff = { files: [] };
+          return {
+            success: true,
+            output: JSON.stringify(structuredDiff, null, 2),
+            metadata: {
+              structuredDiff,
+              lineStats: { changedFiles: 0, addedLines: 0, removedLines: 0 },
+              command: { command: 'git diff --no-ext-diff --unified=80 --', success: true },
+            },
+          };
+        }
+        throw error;
+      }
+    });
+  }
+
+  async createCheckpoint(label?: string, targetFiles?: string[]): Promise<ToolResult> {
+    return this.wrapExecution('create_checkpoint', 'Creating workspace checkpoint', async () => {
+      const policy = this.context.checkPolicy('write', CHECKPOINT_TARGET);
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const preview = `Create checkpoint${label ? `: ${label}` : ''}`;
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('create_checkpoint', CHECKPOINT_TARGET, preview);
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview };
+        }
+      }
+      const checkpoint = await createWorkspaceCheckpoint(this.context.cwd, label, targetFiles);
+      this.context.emitTrace('checkpoint_created', checkpoint);
+      return {
+        success: true,
+        output: JSON.stringify(checkpoint, null, 2),
+        preview,
+        metadata: {
+          checkpointId: checkpoint.id,
+          directoriesCreated: [checkpoint.path],
+        },
+      };
+    });
+  }
+
+  async rollbackToCheckpoint(checkpointId: string): Promise<ToolResult> {
+    return this.wrapExecution('rollback_to_checkpoint', `Rollback to ${checkpointId}`, async () => {
+      const policy = this.context.checkPolicy('write', '.');
+      if (!policy.allowed) {
+        return { success: false, output: `Denied: ${policy.reason}` };
+      }
+      const preview = `Rollback workspace to checkpoint ${checkpointId}. This restores snapshot files and removes files created after the checkpoint.`;
+      if (policy.requiresApproval) {
+        const approved = await this.withApproval('rollback_to_checkpoint', checkpointId, preview);
+        if (!approved) {
+          return { success: false, output: 'Rejected by user.', preview };
+        }
+      }
+      const affectedFiles = await getWorkspaceCheckpointAffectedFiles(this.context.cwd, checkpointId);
+      const before = new Map<string, string>();
+      for (const filePath of affectedFiles) {
+        before.set(filePath, await readTextIfPresent(this.resolveTarget(filePath)));
+      }
+
+      const rollback = await rollbackWorkspaceCheckpoint(this.context.cwd, checkpointId);
+      const diffs: DiffPreview[] = [];
+      for (const filePath of rollback.affectedFiles) {
+        const beforeContent = before.get(filePath) ?? '';
+        const afterContent = await readTextIfPresent(this.resolveTarget(filePath));
+        diffs.push(await buildDiffPreview(filePath, beforeContent, afterContent));
+      }
+      const diff = mergeDiffPreviews(diffs);
+      this.context.emitTrace('checkpoint_rolled_back', rollback);
+      return {
+        success: true,
+        output: JSON.stringify(rollback, null, 2),
+        preview: diff.preview || preview,
+        metadata: {
+          checkpointId,
+          directoriesCreated: [rollback.checkpoint.path],
+          fileWrites: rollback.restoredPaths,
+          fileDeletes: rollback.deletedPaths,
+          lineStats: diff.lineStats,
+          structuredDiff: diff.structuredDiff,
         },
       };
     });

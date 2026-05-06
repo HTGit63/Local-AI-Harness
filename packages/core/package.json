@@ -15,6 +15,7 @@
     "@local-harness/tool-runtime": "file:../tool-runtime",
     "@local-harness/action-dsl": "file:../action-dsl",
     "@local-harness/workflow-runner": "file:../workflow-runner",
+    "@local-harness/task-orchestrator": "file:../task-orchestrator",
     "@local-harness/planner": "file:../planner",
     "@local-harness/approval-workflow": "file:../approval-workflow",
     "@local-harness/prompt-recipes": "file:../prompt-recipes",

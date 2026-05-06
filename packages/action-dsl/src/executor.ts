@@ -93,7 +93,7 @@ export class ActionDslExecutor {
   }
 
   private async executeToolAction(document: ActionDslAction): Promise<ToolResult> {
-    const args = document.args as Record<string, unknown>;
+    const args = document.args as unknown as Record<string, unknown>;
 
     switch (document.action) {
       case 'read_file':
@@ -104,15 +104,6 @@ export class ActionDslExecutor {
         return this.runtime.searchText(String(args.query), typeof args.path === 'string' ? args.path : undefined);
       case 'glob':
         return this.runtime.glob(String(args.pattern));
-      case 'find_symbol':
-      case 'find_function':
-        return this.runtime.searchText(String(args.name), typeof args.path === 'string' ? args.path : undefined);
-      case 'build_context_pack': {
-        const root = typeof args.root === 'string' && args.root.trim() ? args.root : '.';
-        const listing = await this.runtime.listDir(root);
-        return outputWithPreview(listing, listing.preview || `Context pack root: ${root}`);
-      }
-      case 'get_structured_diff':
       case 'propose_patch':
         return this.runtime.previewPatch(String(args.path), String(args.oldText), String(args.newText));
       case 'write_file_preview': {
@@ -124,8 +115,6 @@ export class ActionDslExecutor {
           return this.runtime.writeFile(String(args.path), args.content);
         }
         return this.runtime.patchFile(String(args.path), String(args.oldText), String(args.newText));
-      case 'create_checkpoint':
-        return emptyToolResult(`Checkpoint recorded${typeof args.label === 'string' ? `: ${args.label}` : ''}.`);
       case 'run_command_preview':
         return outputWithPreview(
           emptyToolResult(`Preview only: ${String(args.command)}`),
