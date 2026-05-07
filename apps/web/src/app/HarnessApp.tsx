@@ -182,6 +182,43 @@ interface PlanState {
   };
 }
 
+interface AgentDashboardSummary {
+  statePath: string;
+  taskIdentity: string;
+  objective: string;
+  taskType: string;
+  status: string;
+  phase: string;
+  step: string;
+  nextAction: string;
+  allowedTools: string[];
+  requiredProof: string[];
+  missingProof: string[];
+  evidenceCount: number;
+  blockerCount: number;
+  commandCount: number;
+  checkpointCount: number;
+  verificationCount: number;
+  latestCheckpoint: string;
+  latestVerification: string;
+  doneReady: boolean;
+  filesRead: number;
+  filesChanged: number;
+}
+
+interface AgentDashboardState {
+  exists: boolean;
+  statePath: string;
+  markdown: string | null;
+  summary: AgentDashboardSummary | null;
+  toolPolicy: {
+    phase: string;
+    allowedTools: string[];
+  };
+  trace: TraceEntry[];
+  pendingApprovalCount: number;
+}
+
 interface TraceHeadlineData {
   state?: { intendedNextAction?: string; currentPhase?: string };
   step?: { title?: string; toolName?: string };
@@ -1080,6 +1117,7 @@ function HarnessApp() {
   const [traces, setTraces] = useState<TraceEntry[]>([]);
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [plan, setPlan] = useState<PlanState | null>(null);
+  const [agentDashboard, setAgentDashboard] = useState<AgentDashboardState | null>(null);
   const [repoContext, setRepoContext] = useState<RepoContext | null>(null);
   const [gitDiff, setGitDiff] = useState('');
   const [structuredDiff, setStructuredDiff] = useState<StructuredDiff | null>(null);
@@ -1247,6 +1285,7 @@ function HarnessApp() {
         traceEntries: TraceEntry[],
         approvalItems: ApprovalItem[],
         planState: PlanState | null,
+        agentState: AgentDashboardState | null,
         runtimeState: ModelRuntimeState | null,
         sessionState: SessionState | null,
       ) => {
@@ -1254,6 +1293,7 @@ function HarnessApp() {
         setConfig(cfg);
         setApprovals(approvalItems);
         setPlan(planState);
+        setAgentDashboard(agentState);
         setModelRuntime(runtimeState);
         setSession(sessionState);
         setTraces((current) => {
@@ -1319,33 +1359,35 @@ function HarnessApp() {
       };
 
       if (mode === 'live') {
-        const [health, cfg, tr, ap, pl, mrt, sess] = await Promise.all([
+        const [health, cfg, tr, ap, pl, ag, mrt, sess] = await Promise.all([
           safe<{ status: BackendStatus }>(`${API}/health`, { status: 'offline' }),
           safe<ConfigState | null>(`${API}/config`, null),
           safe<TraceEntry[]>(traceUrl, []),
           safe<ApprovalItem[]>(`${API}/approvals`, []),
           safe<PlanState | null>(`${API}/plan`, null),
+          safe<AgentDashboardState | null>(`${API}/agent/dashboard`, null),
           safe<ModelRuntimeState | null>(`${API}/model/runtime`, null),
           safe<SessionState | null>(`${API}/session`, null),
         ]);
 
-        applyCoreState(health, cfg, tr, ap, pl, mrt, sess);
+        applyCoreState(health, cfg, tr, ap, pl, ag, mrt, sess);
         return;
       }
 
-      const [health, cfg, tr, ap, pl, mrt, sess, sessList, sk] = await Promise.all([
+      const [health, cfg, tr, ap, pl, ag, mrt, sess, sessList, sk] = await Promise.all([
         safe<{ status: BackendStatus }>(`${API}/health`, { status: 'offline' }),
         safe<ConfigState | null>(`${API}/config`, null),
         safe<TraceEntry[]>(traceUrl, []),
         safe<ApprovalItem[]>(`${API}/approvals`, []),
         safe<PlanState | null>(`${API}/plan`, null),
+        safe<AgentDashboardState | null>(`${API}/agent/dashboard`, null),
         safe<ModelRuntimeState | null>(`${API}/model/runtime`, null),
         safe<SessionState | null>(`${API}/session`, null),
         safe<SessionState[]>(`${API}/sessions`, []),
         safe<SkillMetadata[]>(`${API}/skills`, []),
       ]);
 
-      applyCoreState(health, cfg, tr, ap, pl, mrt, sess);
+      applyCoreState(health, cfg, tr, ap, pl, ag, mrt, sess);
       setSessions(sessList);
       setSkills(sk);
 
@@ -2962,6 +3004,33 @@ function HarnessApp() {
               {/* Activity Tab */}
               {settingsTab === 'activity' && (
                 <>
+                  <div className="settings-section">
+                    <div className="settings-section-title">Agent State Dashboard</div>
+                    {agentDashboard?.exists && agentDashboard.summary ? (
+                      <div className="settings-info">
+                        <div className="settings-info-row"><span>Task</span><span>{agentDashboard.summary.taskIdentity}</span></div>
+                        <div className="settings-info-row"><span>Status</span><span>{agentDashboard.summary.status}{agentDashboard.summary.doneReady ? ' / proof ready' : ''}</span></div>
+                        <div className="settings-info-row"><span>Phase</span><span>{agentDashboard.summary.phase}</span></div>
+                        <div className="settings-info-row"><span>Step</span><span>{agentDashboard.summary.step}</span></div>
+                        <div className="settings-info-row"><span>Next</span><span>{agentDashboard.summary.nextAction}</span></div>
+                        <div className="settings-info-row"><span>Type</span><span>{agentDashboard.summary.taskType}</span></div>
+                        <div className="settings-info-row"><span>Evidence</span><span>{agentDashboard.summary.evidenceCount}</span></div>
+                        <div className="settings-info-row"><span>Checkpoints</span><span>{agentDashboard.summary.checkpointCount} {agentDashboard.summary.latestCheckpoint || 'none'}</span></div>
+                        <div className="settings-info-row"><span>Verification</span><span>{agentDashboard.summary.verificationCount} {agentDashboard.summary.latestVerification || 'none'}</span></div>
+                        <div className="settings-info-row"><span>Commands</span><span>{agentDashboard.summary.commandCount}</span></div>
+                        <div className="settings-info-row"><span>Files</span><span>read {agentDashboard.summary.filesRead}, changed {agentDashboard.summary.filesChanged}</span></div>
+                        <div className="settings-info-row"><span>Missing Proof</span><span>{agentDashboard.summary.missingProof.length > 0 ? agentDashboard.summary.missingProof.join(', ') : 'none'}</span></div>
+                        <div className="settings-info-row"><span>Allowed Tools</span><span>{agentDashboard.toolPolicy.allowedTools.join(', ') || 'none'}</span></div>
+                        <div className="settings-info-row"><span>Approvals</span><span>{agentDashboard.pendingApprovalCount}</span></div>
+                        <div className="settings-info-row"><span>Trace Events</span><span>{agentDashboard.trace.length}</span></div>
+                        <div className="settings-info-row"><span>Diff</span><span>{gitDiff ? 'available below' : 'none'}</span></div>
+                        <div className="settings-info-row"><span>State</span><span>{agentDashboard.statePath}</span></div>
+                      </div>
+                    ) : (
+                      <div className="empty-note">No Agent state file yet. Use CLI: gamma agent task "..."</div>
+                    )}
+                  </div>
+
                   <div className="settings-section">
                     <div className="settings-section-title">Live Plan</div>
                     {plan ? (

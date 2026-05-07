@@ -578,6 +578,131 @@ async function testApiWorkflow() {
     const configAfterResolve = await fetchJson<{ workspaceRoot: string }>(`${API_BASE}/api/config`);
     assert.strictEqual(configAfterResolve.workspaceRoot, pickedWorkspace);
 
+    await fs.mkdir(path.join(pickedWorkspace, '.gamma-harness'), { recursive: true });
+    await fs.writeFile(path.join(pickedWorkspace, '.gamma-harness', 'agent_state.md'), [
+      '# Gamma Agent State',
+      '',
+      '## Schema Version',
+      '',
+      'gamma-agent-state/v1',
+      '',
+      '## Task Identity',
+      '',
+      'api-dashboard-task',
+      '',
+      '## User Objective',
+      '',
+      'Fix dashboard proof visibility',
+      '',
+      '## Workspace',
+      '',
+      pickedWorkspace,
+      '',
+      '## Branch',
+      '',
+      'main',
+      '',
+      '## Mode',
+      '',
+      'Agent',
+      '',
+      '## Current Status',
+      '',
+      'UNVERIFIED',
+      '',
+      '## Definition of Done',
+      '',
+      '- Evidence ledger exists',
+      '',
+      '## Constraints',
+      '',
+      '- CLI-first',
+      '',
+      '## Current Phase',
+      '',
+      'VERIFY_IF_REQUIRED',
+      '',
+      '## Current Step',
+      '',
+      'Patch complete; verification pending.',
+      '',
+      '## Next Action',
+      '',
+      'Run gamma agent verify.',
+      '',
+      '## Assumptions',
+      '',
+      '- none',
+      '',
+      '## Blockers',
+      '',
+      '- none',
+      '',
+      '## Files Read',
+      '',
+      '- package.json',
+      '',
+      '## Files Changed',
+      '',
+      '- src/index.ts',
+      '',
+      '## Commands Run',
+      '',
+      '- none',
+      '',
+      '## Checkpoints',
+      '',
+      '- cp-api-dashboard',
+      '',
+      '## Verification Results',
+      '',
+      '- none',
+      '',
+      '## Evidence Ledger',
+      '',
+      '- Diff captured after editing src/index.ts.',
+      '',
+      '## Task Ledger',
+      '',
+      '- [DONE] step-001: dashboard-state | proof required: state visible | proof collected: state file written',
+      '',
+      '## Working Memory',
+      '',
+      '- Dashboard must stay read-only.',
+      '',
+      '## Compacted History',
+      '',
+      '- none',
+      '',
+    ].join('\n'), 'utf8');
+
+    const agentDashboard = await fetchJson<{
+      exists: boolean;
+      statePath: string;
+      summary: {
+        taskIdentity: string;
+        phase: string;
+        status: string;
+        checkpointCount: number;
+        verificationCount: number;
+        missingProof: string[];
+      };
+      toolPolicy: { allowedTools: string[] };
+      pendingApprovalCount: number;
+      trace: unknown[];
+    }>(`${API_BASE}/api/agent/dashboard`);
+    assert.strictEqual(agentDashboard.exists, true);
+    assert.ok(agentDashboard.statePath.endsWith(path.join('.gamma-harness', 'agent_state.md')));
+    assert.strictEqual(agentDashboard.summary.taskIdentity, 'api-dashboard-task');
+    assert.strictEqual(agentDashboard.summary.phase, 'VERIFY_IF_REQUIRED');
+    assert.strictEqual(agentDashboard.summary.status, 'UNVERIFIED');
+    assert.strictEqual(agentDashboard.summary.checkpointCount, 1);
+    assert.strictEqual(agentDashboard.summary.verificationCount, 0);
+    assert.ok(agentDashboard.summary.missingProof.includes('verification'));
+    assert.ok(agentDashboard.toolPolicy.allowedTools.includes('run_command'));
+    assert.strictEqual(agentDashboard.pendingApprovalCount, 0);
+    assert.ok(Array.isArray(agentDashboard.trace));
+
     const chatRequestsBeforeAgentic = mockModel.getChatRequests().length;
     const agenticEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
       method: 'POST',

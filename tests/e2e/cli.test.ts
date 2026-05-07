@@ -358,6 +358,147 @@ async function testDoctorJson() {
   assert.ok(result.ui_server_starts);
 }
 
+async function testChatPromptDirectMode() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-cli-chat-'));
+  const server = await startMockModelServer({
+    chatResponder() {
+      return 'PING';
+    },
+  });
+
+  try {
+    const output = await runCli(['chat', '-p', 'Reply with exactly PING', '--json'], {
+      cwd: workspaceRoot,
+      env: {
+        OPENAI_BASE_URL: server.baseUrl,
+      },
+    });
+    const result = JSON.parse(output);
+    assert.strictEqual(result.mode, 'chat');
+    assert.strictEqual(result.input, 'Reply with exactly PING');
+    assert.strictEqual(result.output, 'PING');
+
+    const chatRequest = server.requests.find((request) =>
+      request.url === '/v1/chat/completions' || request.url === '/api/chat',
+    );
+    assert.ok(chatRequest);
+    assert.strictEqual(chatRequest.body.agentic, undefined);
+    assert.ok(!JSON.stringify(chatRequest.body.messages || []).includes('[Current Task Plan]'));
+  } finally {
+    await stopMockServer(server.server);
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testAgentStateCommands() {
+  const workspaceRoot = await bootstrapWorkspace({
+    'package.json': JSON.stringify({ name: 'agent-state-cli', private: true }, null, 2) + '\n',
+    'README.md': '# Agent State CLI\n',
+  });
+
+  try {
+    const idleOutput = await runCli(['agent', 'status', '--json'], { cwd: workspaceRoot });
+    const idle = JSON.parse(idleOutput);
+    assert.strictEqual(idle.status, 'IDLE');
+    assert.ok(String(idle.statePath).endsWith(path.join('.gamma-harness', 'agent_state.md')));
+
+    const taskOutput = await runCli(['agent', 'task', 'Prepare v2 one-step state', '--json'], { cwd: workspaceRoot });
+    const task = JSON.parse(taskOutput);
+    assert.strictEqual(task.status, 'IN_PROGRESS');
+    assert.strictEqual(task.phase, 'TASK_INTAKE');
+    assert.strictEqual(task.objective, 'Prepare v2 one-step state');
+    await fs.access(path.join(workspaceRoot, '.gamma-harness', 'agent_state.md'));
+
+    const stepOutput = await runCli(['agent', 'step', '--json'], { cwd: workspaceRoot });
+    const step = JSON.parse(stepOutput);
+    assert.strictEqual(step.executedPhase, 'TASK_INTAKE');
+    assert.strictEqual(step.nextPhase, 'STATE_REVIEW');
+    assert.strictEqual(step.summary.phase, 'STATE_REVIEW');
+    assert.ok(step.summary.evidenceCount >= 2);
+
+    const statusOutput = await runCli(['agent', 'status', '--json'], { cwd: workspaceRoot });
+    const status = JSON.parse(statusOutput);
+    assert.strictEqual(status.phase, 'STATE_REVIEW');
+    assert.strictEqual(status.status, 'IN_PROGRESS');
+    assert.strictEqual(status.checkpointCount, 0);
+    assert.strictEqual(status.verificationCount, 0);
+    assert.strictEqual(status.doneReady, true);
+
+    const humanStatusOutput = await runCli(['agent', 'status'], { cwd: workspaceRoot });
+    assert.ok(humanStatusOutput.includes('Status: IN_PROGRESS (proof ready)'));
+    assert.ok(humanStatusOutput.includes('Checkpoints: 0 (none)'));
+    assert.ok(humanStatusOutput.includes('Verification: 0 (none)'));
+    assert.ok(humanStatusOutput.includes('Missing proof:'));
+    assert.ok(humanStatusOutput.split(/\r?\n/).length <= 18);
+
+    const stateOutput = await runCli(['agent', 'state'], { cwd: workspaceRoot });
+    assert.ok(stateOutput.includes('# Gamma Agent State'));
+    assert.ok(stateOutput.includes('## Current Phase'));
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testAgentPatchVerifyCommands() {
+  const workspaceRoot = await bootstrapWorkspace({
+    'package.json': JSON.stringify({ name: 'agent-patch-cli', private: true }, null, 2) + '\n',
+    'src/index.ts': 'export const value = "old";\n',
+  });
+
+  try {
+    await runCli(['agent', 'task', 'Fix bug in src/index.ts', '--json'], { cwd: workspaceRoot });
+
+    const toolsOutput = await runCli(['agent', 'tools', 'patch_file', '--json'], { cwd: workspaceRoot });
+    const tools = JSON.parse(toolsOutput);
+    assert.strictEqual(tools.checks[0].allowed, false);
+    assert.ok(Array.isArray(tools.allowedTools));
+
+    for (let index = 0; index < 4; index += 1) {
+      await runCli(['agent', 'step', '--json'], { cwd: workspaceRoot });
+    }
+
+    const patchOutput = await runCli([
+      'agent',
+      'patch',
+      '--file',
+      'src/index.ts',
+      '--old',
+      '"old"',
+      '--new',
+      '"new"',
+      '--json',
+    ], { cwd: workspaceRoot });
+    const patch = JSON.parse(patchOutput);
+    assert.strictEqual(patch.status, 'UNVERIFIED');
+    assert.strictEqual(patch.phase, 'VERIFY_IF_REQUIRED');
+    assert.ok(patch.checkpointId.startsWith('cp-'));
+    assert.ok(patch.summary.checkpointCount >= 1);
+    assert.ok(patch.summary.evidenceCount >= 1);
+
+    const fileContent = await fs.readFile(path.join(workspaceRoot, 'src', 'index.ts'), 'utf8');
+    assert.ok(fileContent.includes('"new"'));
+
+    const verifyOutput = await runCli([
+      'agent',
+      'verify',
+      '--type',
+      'bug-fix',
+      '--command',
+      'node --version',
+      '--json',
+    ], { cwd: workspaceRoot });
+    const verify = JSON.parse(verifyOutput);
+    assert.strictEqual(verify.commandSuccess, true);
+    assert.strictEqual(verify.summary.status, 'DONE');
+    assert.strictEqual(verify.summary.doneReady, true);
+    assert.ok(verify.summary.commandCount >= 1);
+    assert.ok(verify.summary.verificationCount >= 1);
+    assert.deepStrictEqual(verify.gate.missingProof, []);
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testAgentSmokeReadFile() {
   const workspaceRoot = await bootstrapWorkspace({
     'package.json': JSON.stringify({
@@ -679,6 +820,9 @@ async function run() {
   await testWorkspaceStatus();
   await testSkillsList();
   await testDoctorJson();
+  await testChatPromptDirectMode();
+  await testAgentStateCommands();
+  await testAgentPatchVerifyCommands();
   await testAgentSmokeReadFile();
   await testAgentSmokeWriteFile();
   await testAgentSmokeInspectProject();

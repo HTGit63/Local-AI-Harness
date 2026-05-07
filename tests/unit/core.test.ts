@@ -2,7 +2,7 @@ import assert from 'assert';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { CoreEngine, PromptAnalyzer } from '@local-harness/core';
+import { CoreEngine, PromptAnalyzer, checkAgentToolPolicy, evaluateAgentDoneGate, validateAgentStateSections } from '@local-harness/core';
 import { ModelAdapter, PROFILES, type ChatMessage as AdapterChatMessage } from '@local-harness/model-adapter';
 import { PromptOptimizer, RECIPES } from '@local-harness/prompt-recipes';
 import { RepoIndexer } from '@local-harness/repo-indexer';
@@ -513,6 +513,133 @@ async function testDirectChatDoesNotCreateTaskPlan() {
     assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'task_plan_created'));
   } finally {
     globalThis.fetch = originalFetch;
+  }
+}
+
+async function testAgentStateLifecycle() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-agent-state-'));
+  await fs.writeFile(path.join(workspaceRoot, 'README.md'), '# Agent State\n', 'utf8');
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot });
+    const started = await engine.startAgentTask('Prepare the v2 persistent state file');
+
+    assert.ok(started.statePath.endsWith(path.join('.gamma-harness', 'agent_state.md')));
+    assert.strictEqual(started.summary.phase, 'TASK_INTAKE');
+    assert.strictEqual(started.summary.status, 'IN_PROGRESS');
+    assert.strictEqual(started.summary.objective, 'Prepare the v2 persistent state file');
+
+    const initialMarkdown = await fs.readFile(started.statePath, 'utf8');
+    assert.deepStrictEqual(validateAgentStateSections(initialMarkdown), []);
+    assert.ok(initialMarkdown.includes('## Evidence Ledger'));
+    assert.ok(initialMarkdown.includes('## Task Ledger'));
+
+    const statusBefore = await engine.getAgentStatus();
+    assert.strictEqual(statusBefore?.phase, 'TASK_INTAKE');
+
+    const step = await engine.runAgentStep();
+    assert.strictEqual(step.executedPhase, 'TASK_INTAKE');
+    assert.strictEqual(step.nextPhase, 'STATE_REVIEW');
+    assert.strictEqual(step.summary.phase, 'STATE_REVIEW');
+    assert.strictEqual(step.summary.status, 'IN_PROGRESS');
+    assert.ok(step.summary.evidenceCount >= 2);
+
+    const state = await engine.readAgentState();
+    assert.ok(state);
+    assert.ok(state.filesRead.includes(path.join('.gamma-harness', 'agent_state.md')));
+    assert.ok(state.taskLedger.some((entry) => entry.title === 'TASK_INTAKE' && entry.status === 'DONE'));
+    assert.ok(state.evidenceLedger.some((entry) => entry.includes('TASK_INTAKE completed')));
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+function testAgentDoneGateAndToolPolicy() {
+  assert.strictEqual(checkAgentToolPolicy('STATE_REVIEW', 'patch_file').allowed, false);
+  assert.strictEqual(checkAgentToolPolicy('CHECKPOINT_IF_EDIT', 'create_checkpoint').allowed, true);
+  assert.strictEqual(checkAgentToolPolicy('TOOL_ACTION', 'patch_file').allowed, true);
+  assert.strictEqual(checkAgentToolPolicy('VERIFY_IF_REQUIRED', 'run_command').allowed, true);
+
+  const state = {
+    schemaVersion: 'gamma-agent-state/v1',
+    taskIdentity: 'task-test',
+    userObjective: 'Fix bug in src/index.ts',
+    workspace: '/tmp/gamma',
+    branch: 'main',
+    mode: 'Agent' as const,
+    currentStatus: 'IN_PROGRESS' as const,
+    definitionOfDone: [],
+    constraints: [],
+    currentPhase: 'VERIFY_IF_REQUIRED' as const,
+    currentStep: 'Verify',
+    nextAction: 'Verify',
+    assumptions: [],
+    blockers: [],
+    filesRead: ['src/index.ts'],
+    filesChanged: [],
+    commandsRun: [],
+    checkpoints: [],
+    verificationResults: [],
+    evidenceLedger: ['Task accepted.'],
+    taskLedger: [],
+    workingMemory: [],
+    compactedHistory: [],
+  };
+
+  const blocked = evaluateAgentDoneGate(state, 'bug_fix');
+  assert.strictEqual(blocked.canMarkDone, false);
+  assert.ok(blocked.missingProof.includes('checkpoint'));
+  assert.ok(blocked.missingProof.includes('diff'));
+  assert.ok(blocked.missingProof.includes('files_changed'));
+  assert.ok(blocked.missingProof.includes('verification'));
+
+  state.checkpoints = ['cp-1'];
+  state.filesChanged = ['src/index.ts'];
+  state.evidenceLedger.push('Diff captured after editing src/index.ts.');
+  state.commandsRun = ['node --version => exit 0'];
+  state.verificationResults = ['PASS command: node --version :: v20'];
+  const passed = evaluateAgentDoneGate(state, 'bug_fix');
+  assert.strictEqual(passed.canMarkDone, true);
+  assert.deepStrictEqual(passed.missingProof, []);
+}
+
+async function testAgentPatchVerifyChain() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-agent-patch-'));
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const value = "old";\n', 'utf8');
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot });
+    await engine.startAgentTask('Fix bug in src/index.ts');
+    await engine.runAgentStep();
+    await engine.runAgentStep();
+    await engine.runAgentStep();
+    await engine.runAgentStep();
+
+    const patch = await engine.runAgentPatch({
+      filePath: 'src/index.ts',
+      oldContent: '"old"',
+      newContent: '"new"',
+    });
+    assert.strictEqual(patch.status, 'UNVERIFIED');
+    assert.strictEqual(patch.phase, 'VERIFY_IF_REQUIRED');
+    assert.ok(patch.checkpointId.startsWith('cp-'));
+    assert.ok(patch.summary.missingProof.includes('verification'));
+
+    const verification = await engine.runAgentVerification({
+      taskType: 'bug_fix',
+      command: 'node --version',
+    });
+    assert.strictEqual(verification.commandSuccess, true);
+    assert.strictEqual(verification.summary.status, 'DONE');
+    assert.deepStrictEqual(verification.gate.missingProof, []);
+
+    const finalState = await engine.readAgentState();
+    assert.ok(finalState?.checkpoints.includes(patch.checkpointId));
+    assert.ok(finalState?.filesChanged.includes('src/index.ts'));
+    assert.ok(finalState?.verificationResults.some((entry) => entry.startsWith('PASS command: node --version')));
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
 }
 
@@ -1531,6 +1658,9 @@ async function run() {
   await testEngineRecordsExecutionModes();
   await testEnginePrioritizesEditsWithoutAutoRepoContext();
   await testDirectChatDoesNotCreateTaskPlan();
+  await testAgentStateLifecycle();
+  testAgentDoneGateAndToolPolicy();
+  await testAgentPatchVerifyChain();
   await testEngineCreatesTaskPlanTraceAndCheckpoint();
   await testRepoIndexerExcludesVendoredAndSessionDirs();
   await testRepoIndexerBuildsWorkspaceInventory();

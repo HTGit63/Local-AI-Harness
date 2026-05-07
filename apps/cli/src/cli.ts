@@ -167,7 +167,7 @@ async function handlePrompt() {
   const promptIndex = args.indexOf('prompt');
   const promptText = args.slice(promptIndex + 1).filter((arg) => !arg.startsWith('--')).join(' ');
   if (!promptText) {
-    throw new Error('Usage: harness prompt [--thinking|--nothinking] <text>');
+    throw new Error('Usage: gamma prompt [--thinking|--nothinking] <text>');
   }
 
   const thinkingEnabled = args.includes('--nothinking') ? false : args.includes('--thinking') ? true : undefined;
@@ -177,7 +177,7 @@ async function handlePrompt() {
     : null;
 
   if (isJson) {
-    const response = await engine.chat([
+    const response = await engine.directChat([
       { role: 'user', content: promptText },
     ], thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
     printOutput({ input: promptText, output: response, ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
@@ -185,7 +185,7 @@ async function handlePrompt() {
   }
 
   const stepHistory: string[] = [];
-  const response = await engine.chatStream([
+  const response = await engine.directChatStream([
     { role: 'user', content: promptText },
   ], {
     onStatus: (event) => pushStepStatus(stepHistory, event.action || event.phase),
@@ -194,6 +194,33 @@ async function handlePrompt() {
   }, thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
 
   renderAssistantOutput(response);
+}
+
+async function handleChat() {
+  const promptText = getArgValue('-p') || getArgValue('--prompt');
+  const thinkingEnabled = args.includes('--nothinking') ? false : args.includes('--thinking') ? true : undefined;
+  if (!promptText) {
+    if (isJson) {
+      throw new Error('JSON mode requires gamma chat -p "<text>".');
+    }
+    startChatRepl();
+    return;
+  }
+
+  if (isJson) {
+    const output = await engine.directChat([
+      { role: 'user', content: promptText },
+    ], thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
+    printOutput({ mode: 'chat', input: promptText, output });
+    return;
+  }
+
+  const output = await engine.directChatStream([
+    { role: 'user', content: promptText },
+  ], {
+    onStatus: (event) => console.log(`\n[chat] ${event.action || event.phase}`),
+  }, thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
+  renderAssistantOutput(output);
 }
 
 async function handleSession() {
@@ -214,7 +241,7 @@ async function handleSession() {
     case 'resume': {
       const id = args[2];
       if (!id) {
-        throw new Error('Usage: harness session resume <id>');
+        throw new Error('Usage: gamma session resume <id>');
       }
 
       const session = await engine.resumeSession(id);
@@ -228,7 +255,7 @@ async function handleSession() {
     case 'delete': {
       const id = args[2];
       if (!id) {
-        throw new Error('Usage: harness session delete <id>');
+        throw new Error('Usage: gamma session delete <id>');
       }
 
       const deleted = await engine.deleteSession(id);
@@ -236,7 +263,7 @@ async function handleSession() {
       return;
     }
     default:
-      throw new Error('Usage: harness session <list|resume|delete>');
+      throw new Error('Usage: gamma session <list|resume|delete>');
   }
 }
 
@@ -248,7 +275,7 @@ async function handleWorkspace() {
     case 'use': {
       const nextWorkspace = args.slice(2).join(' ').trim();
       if (!nextWorkspace) {
-        throw new Error('Usage: harness workspace use <path>');
+        throw new Error('Usage: gamma workspace use <path>');
       }
       await engine.updateConfig({ workspaceRoot: path.resolve(nextWorkspace) });
       printOutput(engine.getPublicConfig());
@@ -259,13 +286,13 @@ async function handleWorkspace() {
       return;
     case 'read':
       if (!args[2]) {
-        throw new Error('Usage: harness workspace read <path>');
+        throw new Error('Usage: gamma workspace read <path>');
       }
       printOutput(await engine.readFile(args[2]));
       return;
     case 'search':
       if (!args[2]) {
-        throw new Error('Usage: harness workspace search <query> [glob]');
+        throw new Error('Usage: gamma workspace search <query> [glob]');
       }
       printOutput(await engine.searchText(args[2], args[3]));
       return;
@@ -276,7 +303,7 @@ async function handleWorkspace() {
       printOutput(await engine.gitDiff());
       return;
     default:
-      throw new Error('Usage: harness workspace <status|use|list|read|search|git-status|git-diff>');
+      throw new Error('Usage: gamma workspace <status|use|list|read|search|git-status|git-diff>');
   }
 }
 
@@ -289,7 +316,7 @@ async function handleSkills() {
     case 'activate': {
       const skillSlug = args[2];
       if (!skillSlug) {
-        throw new Error('Usage: harness skills activate <slug>');
+        throw new Error('Usage: gamma skills activate <slug>');
       }
 
       const session = await engine.updateSessionSkills([skillSlug]);
@@ -301,7 +328,7 @@ async function handleSkills() {
       return;
     }
     default:
-      throw new Error('Usage: harness skills <list|activate>');
+      throw new Error('Usage: gamma skills <list|activate>');
   }
 }
 
@@ -325,7 +352,7 @@ async function handleModel() {
     case 'use': {
       const nextModel = args[2];
       if (!nextModel) {
-        throw new Error('Usage: harness model use <name>');
+        throw new Error('Usage: gamma model use <name>');
       }
 
       await engine.updateConfig({ model: nextModel }, { activateModel: true });
@@ -339,22 +366,190 @@ async function handleModel() {
       return;
     }
     default:
-      throw new Error('Usage: harness model <list|status|use>');
+      throw new Error('Usage: gamma model <list|status|use>');
   }
 }
 
 async function handleConfig() {
   if (args[1] !== 'show') {
-    throw new Error('Usage: harness config show');
+    throw new Error('Usage: gamma config show');
   }
 
   printOutput(engine.getPublicConfig());
 }
 
+function formatAgentStatus(summary: {
+  statePath: string;
+  taskIdentity: string;
+  objective: string;
+  taskType?: string;
+  status: string;
+  phase: string;
+  step: string;
+  nextAction: string;
+  allowedTools?: string[];
+  missingProof?: string[];
+  evidenceCount: number;
+  blockerCount: number;
+  commandCount?: number;
+  checkpointCount?: number;
+  verificationCount?: number;
+  latestCheckpoint?: string;
+  latestVerification?: string;
+  doneReady?: boolean;
+  filesRead: number;
+  filesChanged: number;
+}): string {
+  const missingProof = summary.missingProof?.length ? summary.missingProof.join('; ') : 'none';
+  const latestCheckpoint = summary.latestCheckpoint || 'none';
+  const latestVerification = summary.latestVerification || 'none';
+  return [
+    `Task: ${summary.taskIdentity}`,
+    `Status: ${summary.status}${summary.doneReady ? ' (proof ready)' : ''}`,
+    `Phase: ${summary.phase}`,
+    `Step: ${summary.step}`,
+    `Objective: ${summary.objective}`,
+    summary.taskType ? `Type: ${summary.taskType}` : null,
+    `Files: read ${summary.filesRead}, changed ${summary.filesChanged}`,
+    `Evidence: ${summary.evidenceCount}`,
+    `Checkpoints: ${summary.checkpointCount ?? 0} (${latestCheckpoint})`,
+    `Verification: ${summary.verificationCount ?? 0} (${latestVerification})`,
+    `Commands: ${summary.commandCount ?? 0}`,
+    `Blockers: ${summary.blockerCount}`,
+    summary.allowedTools ? `Tools: ${summary.allowedTools.join(', ')}` : null,
+    `Missing proof: ${missingProof}`,
+    `State: ${summary.statePath}`,
+    `Next: ${summary.nextAction}`,
+  ].filter((line): line is string => Boolean(line)).join('\n');
+}
+
+async function handleAgent() {
+  const subcommand = args[1] || 'status';
+  switch (subcommand) {
+    case 'task': {
+      const taskText = args.slice(2).filter((arg) => !arg.startsWith('--')).join(' ').trim();
+      if (!taskText) {
+        throw new Error('Usage: gamma agent task "<objective>"');
+      }
+      const result = await engine.startAgentTask(taskText);
+      printOutput(isJson ? result.summary : formatAgentStatus(result.summary));
+      return;
+    }
+    case 'status': {
+      const summary = await engine.getAgentStatus();
+      if (!summary) {
+        const missing = {
+          status: 'IDLE',
+          statePath: engine.getAgentStatePath(),
+          nextAction: 'Run gamma agent task "..."',
+        };
+        printOutput(isJson ? missing : [
+          'Task: none',
+          'Status: IDLE',
+          `State: ${missing.statePath}`,
+          `Next: ${missing.nextAction}`,
+        ].join('\n'));
+        return;
+      }
+      printOutput(isJson ? summary : formatAgentStatus(summary));
+      return;
+    }
+    case 'state': {
+      const markdown = await engine.readAgentStateMarkdown();
+      if (!markdown) {
+        throw new Error('Agent state file is missing. Run gamma agent task "..." first.');
+      }
+      printOutput(isJson ? { statePath: engine.getAgentStatePath(), markdown } : markdown);
+      return;
+    }
+    case 'step': {
+      const result = await engine.runAgentStep();
+      printOutput(isJson ? result : [
+        `Executed: ${result.executedPhase}`,
+        `Completed: ${result.completedStep}`,
+        `Status: ${result.status}`,
+        `Next phase: ${result.nextPhase}`,
+        `Evidence: ${result.evidence}`,
+        `Next: ${result.nextAction}`,
+      ].join('\n'));
+      return;
+    }
+    case 'tools': {
+      const checks = args.slice(2).filter((arg) => !arg.startsWith('--'));
+      const result = await engine.getAgentToolPolicy(checks as any);
+      printOutput(result);
+      return;
+    }
+    case 'checkpoint': {
+      const label = args.slice(2).filter((arg) => !arg.startsWith('--')).join(' ').trim() || undefined;
+      const summary = await engine.createAgentCheckpoint(label);
+      printOutput(isJson ? summary : formatAgentStatus(summary));
+      return;
+    }
+    case 'patch': {
+      const filePath = getArgValue('--file') || args[2];
+      const oldContent = getArgValue('--old');
+      const newContent = getArgValue('--new');
+      if (!filePath || oldContent === undefined || newContent === undefined) {
+        throw new Error('Usage: gamma agent patch --file <path> --old <text> --new <text>');
+      }
+      const result = await engine.runAgentPatch({ filePath, oldContent, newContent });
+      printOutput(isJson ? result : [
+        `Patched: ${result.filePath}`,
+        `Checkpoint: ${result.checkpointId}`,
+        `Status: ${result.status}`,
+        `Phase: ${result.phase}`,
+        `Diff: ${result.diffSummary}`,
+        `Next: ${result.summary.nextAction}`,
+      ].join('\n'));
+      return;
+    }
+    case 'verify': {
+      const taskType = getArgValue('--type')?.replace(/-/g, '_') as any;
+      const commandText = getArgValue('--command');
+      const result = await engine.runAgentVerification({ taskType, command: commandText });
+      printOutput(isJson ? result : [
+        `Type: ${result.taskType}`,
+        result.command ? `Command: ${result.command}` : null,
+        result.commandSuccess !== undefined ? `Command success: ${result.commandSuccess}` : null,
+        `Status: ${result.summary.status}`,
+        result.gate.missingProof.length ? `Missing proof: ${result.gate.missingProof.join('; ')}` : 'Missing proof: none',
+        `Next: ${result.summary.nextAction}`,
+      ].filter((line): line is string => Boolean(line)).join('\n'));
+      return;
+    }
+    case 'rollback': {
+      const checkpointId = args[2];
+      if (!checkpointId) {
+        throw new Error('Usage: gamma agent rollback <checkpointId>');
+      }
+      const result = await engine.rollbackAgentCheckpoint(checkpointId);
+      printOutput(isJson ? result : [
+        `Rolled back: ${result.checkpointId}`,
+        `Affected files: ${result.affectedFiles.length}`,
+        `Status: ${result.summary.status}`,
+        `Next: ${result.summary.nextAction}`,
+      ].join('\n'));
+      return;
+    }
+    case 'compact': {
+      const summary = await engine.compactAgentState();
+      printOutput(isJson ? summary : formatAgentStatus(summary));
+      return;
+    }
+    case 'diff': {
+      printOutput(await engine.gitDiff());
+      return;
+    }
+    default:
+      throw new Error('Usage: gamma agent <task|status|state|step|tools|checkpoint|patch|verify|rollback|compact|diff>');
+  }
+}
+
 async function handleAgentSmoke() {
   const task = getArgValue('--task');
   if (!task) {
-    throw new Error('Usage: harness agent-smoke --task "<prompt>" [--require-action <name>] [--require-approval] [--require-diff] [--workflow <name>]');
+    throw new Error('Usage: gamma agent-smoke --task "<prompt>" [--require-action <name>] [--require-approval] [--require-diff] [--workflow <name>]');
   }
 
   const requireAction = getArgValue('--require-action');
@@ -520,17 +715,17 @@ async function handleAgentSmoke() {
   printOutput(result);
 }
 
-function startRepl() {
+function startChatRepl() {
   const history: { role: 'user' | 'assistant'; content: string }[] = [];
   const session = engine.startSession();
   let thinkingEnabled = false;
   const initialConfig = engine.getPublicConfig();
 
-  console.log('Gamma Harness CLI');
+  console.log('Gamma Harness Chat CLI');
   console.log(
-    `Session: ${session.id}  Model: ${session.model}  Mode: ${session.mode}  Execution: agentic  Thinking: ${thinkingEnabled ? 'on' : 'off'}  Memory: ${initialConfig.sessionMemoryEnabled ? `${initialConfig.sessionMemoryTurns} turns` : 'off'}  Retries: ${initialConfig.toolRetryMax}`,
+    `Session: ${session.id}  Model: ${session.model}  Mode: chat  Execution: direct  Thinking: ${thinkingEnabled ? 'on' : 'off'}  Memory: ${initialConfig.sessionMemoryEnabled ? `${initialConfig.sessionMemoryTurns} turns` : 'off'}`,
   );
-  console.log("Commands: /help /exit /status /agent /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>");
+  console.log("Commands: /help /exit /status /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /read <path> /search <query> [glob] /sessions /skills /activate <slug>");
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -566,7 +761,7 @@ function startRepl() {
       }
 
       if (input === '/help') {
-        console.log('Slash commands: /exit /quit /bye /clear /help /status /agent /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>');
+        console.log('Slash commands: /exit /quit /bye /clear /help /status /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /read <path> /search <query> [glob] /sessions /skills /activate <slug>');
         rl.prompt();
         return;
       }
@@ -595,30 +790,9 @@ function startRepl() {
         console.log(JSON.stringify({
           session: engine.getSession(),
           config: engine.getPublicConfig(),
-          executionMode: 'agentic',
+          executionMode: 'direct',
           thinkingEnabled,
         }, null, 2));
-        rl.prompt();
-        return;
-      }
-
-      if (input === '/agent') {
-        const config = engine.getPublicConfig();
-        console.log(JSON.stringify({
-          contextBudget: config.contextBudget,
-          toolRetryMax: config.toolRetryMax,
-          sessionMemoryEnabled: config.sessionMemoryEnabled,
-          sessionMemoryTurns: config.sessionMemoryTurns,
-          selfCheckEnabled: config.selfCheckEnabled,
-          internetAccessEnabled: config.internetAccessEnabled,
-          streamIdleTimeoutMs: config.streamIdleTimeoutMs,
-        }, null, 2));
-        rl.prompt();
-        return;
-      }
-
-      if (input === '/plan') {
-        console.log(JSON.stringify(engine.getPlanState(), null, 2));
         rl.prompt();
         return;
       }
@@ -673,54 +847,31 @@ function startRepl() {
         return;
       }
 
-      if (input === '/sessions') {
-        console.log(JSON.stringify(await engine.listSessions(), null, 2));
+      if (input.startsWith('/read ')) {
+        const filePath = input.substring('/read '.length).trim();
+        const result = await engine.readFile(filePath);
+        console.log(result.output);
         rl.prompt();
         return;
       }
 
-      if (input === '/doctor') {
-        console.log(JSON.stringify(await runDiagnostics({ repoRoot: process.cwd(), quiet: true }), null, 2));
-        rl.prompt();
-        return;
-      }
-
-      if (input === '/mode' || input === '/permissions') {
-        console.log(JSON.stringify({ mode: engine.getPublicConfig().mode }, null, 2));
-        rl.prompt();
-        return;
-      }
-
-      if (input.startsWith('/mode ') || input.startsWith('/permissions ')) {
-        const nextMode = input.split(' ').slice(1).join(' ').trim();
-        if (!['read-only', 'workspace-write', 'danger'].includes(nextMode)) {
-          console.log('Mode must be one of read-only, workspace-write, or danger');
+      if (input.startsWith('/search ')) {
+        const parts = input.substring('/search '.length).trim().split(/\s+/);
+        const query = parts.shift();
+        const filePattern = parts.join(' ') || undefined;
+        if (!query) {
+          console.log('Usage: /search <query> [glob]');
           rl.prompt();
           return;
         }
-
-        await engine.updateConfig({ mode: nextMode as 'read-only' | 'workspace-write' | 'danger' });
-        console.log(JSON.stringify({ mode: engine.getPublicConfig().mode }, null, 2));
+        const result = await engine.searchText(query, filePattern);
+        console.log(result.output);
         rl.prompt();
         return;
       }
 
-      if (input === '/approvals') {
-        console.log(JSON.stringify(engine.getPendingApprovals(), null, 2));
-        rl.prompt();
-        return;
-      }
-
-      if (input.startsWith('/approve ')) {
-        const approvalId = input.split(' ')[1];
-        console.log(engine.resolveApproval(approvalId, true) ? `Approved ${approvalId}` : `Approval ${approvalId} not found`);
-        rl.prompt();
-        return;
-      }
-
-      if (input.startsWith('/reject ')) {
-        const approvalId = input.split(' ')[1];
-        console.log(engine.resolveApproval(approvalId, false) ? `Rejected ${approvalId}` : `Approval ${approvalId} not found`);
+      if (input === '/sessions') {
+        console.log(JSON.stringify(await engine.listSessions(), null, 2));
         rl.prompt();
         return;
       }
@@ -741,8 +892,8 @@ function startRepl() {
 
       history.push({ role: 'user', content: input });
       const stepHistory: string[] = [];
-      const response = await engine.chatStream([
-        { role: 'system', content: 'You are a helpful coding assistant. Be concise. Use tools when file actions are needed.' },
+      const response = await engine.directChatStream([
+        { role: 'system', content: 'You are in Chat Mode. Read, explain, and plan only. Do not write files or run commands.' },
         ...history,
       ], {
         onStatus: (event: { action: string; phase: string }) => {
@@ -787,9 +938,13 @@ async function main() {
       return;
     case 'chat':
       if (isJson) {
-        throw new Error('JSON mode is not supported for interactive chat.');
+        await handleChat();
+        return;
       }
-      startRepl();
+      await handleChat();
+      return;
+    case 'agent':
+      await handleAgent();
       return;
     case 'session':
       await handleSession();
@@ -807,7 +962,7 @@ async function main() {
       await handleConfig();
       return;
     default:
-      throw new Error('Available commands: doctor | benchmark | agent-smoke | prompt | chat | session | workspace | skills | model | config');
+      throw new Error('Available commands: doctor | benchmark | agent-smoke | prompt | chat | agent | session | workspace | skills | model | config');
   }
 }
 

@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import * as os from 'os';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { ApprovalQueueManager, ApprovalRequestPayload } from '@local-harness/approval-workflow';
@@ -12,9 +13,32 @@ import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes
 import { RepoIndexer, ProjectContext, TaskContext } from '@local-harness/repo-indexer';
 import { AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
 import { LOCAL_MODEL_BUDGET_PROFILES, LocalModelBudgetProfile, TaskOrchestrator, TaskPlan, TaskStep } from '@local-harness/task-orchestrator';
-import { ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
+import { createWorkspaceCheckpoint, rollbackWorkspaceCheckpoint, ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
+import {
+  advanceAgentOneStep,
+  applyAgentDoneGate,
+  checkAgentToolPolicy,
+  createInitialAgentState,
+  createTaskIdentity,
+  evaluateAgentDoneGate,
+  getAgentAllowedToolsForPhase,
+  getAgentStatePath,
+  readAgentState,
+  summarizeAgentState,
+  writeAgentState,
+  type AgentDoneGateResult,
+  type AgentStatePhase,
+  type AgentStateStatus,
+  type AgentTaskType,
+  type AgentToolName,
+  type AgentStateSummary,
+  type AgentStepResult,
+  type AgentState,
+  type AgentToolPolicyResult,
+  validateAgentStateSections,
+} from './agent-state';
 import {
   buildFixSingleFilePatchPrompt,
   buildFixSingleFileSummaryPrompt,
@@ -191,6 +215,50 @@ export interface RunCheckpoint {
   }>;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface AgentTaskStartResult {
+  statePath: string;
+  state: AgentState;
+  summary: AgentStateSummary;
+}
+
+export interface AgentStepExecutionResult extends AgentStepResult {
+  state: AgentState;
+  summary: AgentStateSummary;
+}
+
+export interface AgentPatchResult {
+  statePath: string;
+  filePath: string;
+  checkpointId: string;
+  diffSummary: string;
+  status: AgentStateStatus;
+  phase: AgentStatePhase;
+  summary: AgentStateSummary;
+}
+
+export interface AgentVerificationResult {
+  statePath: string;
+  taskType: AgentTaskType;
+  command?: string;
+  commandSuccess?: boolean;
+  gate: AgentDoneGateResult;
+  summary: AgentStateSummary;
+}
+
+export interface AgentRollbackResult {
+  statePath: string;
+  checkpointId: string;
+  affectedFiles: string[];
+  summary: AgentStateSummary;
+}
+
+export interface AgentToolPolicySummary {
+  statePath: string;
+  phase: AgentStatePhase | 'IDLE';
+  allowedTools: AgentToolName[];
+  checks?: AgentToolPolicyResult[];
 }
 
 export interface ChatStreamHandlers {
@@ -1259,6 +1327,384 @@ export class CoreEngine extends EventEmitter {
 
   async getRunCheckpoint(runId: string): Promise<RunCheckpoint | null> {
     return this.readRunCheckpointFile(runId);
+  }
+
+  getAgentStatePath(): string {
+    return getAgentStatePath(this.config.workspaceRoot);
+  }
+
+  async readAgentState(): Promise<AgentState | null> {
+    return readAgentState(this.config.workspaceRoot);
+  }
+
+  async readAgentStateMarkdown(): Promise<string | null> {
+    try {
+      return await fs.readFile(this.getAgentStatePath(), 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  async startAgentTask(userObjective: string): Promise<AgentTaskStartResult> {
+    const objective = userObjective.trim();
+    if (!objective) {
+      throw new Error('Agent task objective is required.');
+    }
+
+    const branch = await this.detectGitBranch();
+    const state = createInitialAgentState({
+      taskIdentity: createTaskIdentity(),
+      userObjective: objective,
+      workspace: this.config.workspaceRoot,
+      branch,
+    });
+    const statePath = await writeAgentState(this.config.workspaceRoot, state);
+    this.traceBus.emitEvent({
+      type: 'agent_state_updated',
+      data: {
+        statePath,
+        taskIdentity: state.taskIdentity,
+        phase: state.currentPhase,
+        status: state.currentStatus,
+      },
+    });
+    return {
+      statePath,
+      state,
+      summary: summarizeAgentState(statePath, state),
+    };
+  }
+
+  async getAgentStatus(): Promise<AgentStateSummary | null> {
+    const state = await this.readAgentState();
+    return state ? summarizeAgentState(this.getAgentStatePath(), state) : null;
+  }
+
+  async runAgentStep(): Promise<AgentStepExecutionResult> {
+    const statePath = this.getAgentStatePath();
+    const stateMarkdown = await this.readAgentStateMarkdown();
+    if (!stateMarkdown) {
+      throw new Error('Agent state file is missing. Run gamma agent task "..." first.');
+    }
+
+    const missingSections = validateAgentStateSections(stateMarkdown);
+    if (missingSections.length > 0) {
+      throw new Error(`Agent state file is invalid. Missing sections: ${missingSections.join(', ')}`);
+    }
+
+    const state = await this.readAgentState();
+    if (!state) {
+      throw new Error('Agent state file could not be parsed.');
+    }
+
+    const { state: nextState, result } = advanceAgentOneStep({ state, statePath });
+    const updatedPath = await writeAgentState(this.config.workspaceRoot, nextState);
+    this.traceBus.emitEvent({
+      type: 'agent_state_step_completed',
+      data: result,
+    });
+    return {
+      ...result,
+      statePath: updatedPath,
+      state: nextState,
+      summary: summarizeAgentState(updatedPath, nextState),
+    };
+  }
+
+  async compactAgentState(): Promise<AgentStateSummary> {
+    const state = await this.readAgentState();
+    if (!state) {
+      throw new Error('Agent state file is missing. Run gamma agent task "..." first.');
+    }
+    const nextState: AgentState = {
+      ...state,
+      compactedHistory: [
+        ...state.compactedHistory,
+        ...state.workingMemory,
+      ].slice(-12),
+      workingMemory: state.workingMemory.slice(0, 4),
+    };
+    const statePath = await writeAgentState(this.config.workspaceRoot, nextState);
+    return summarizeAgentState(statePath, nextState);
+  }
+
+  async getAgentToolPolicy(tools: AgentToolName[] = []): Promise<AgentToolPolicySummary> {
+    const state = await this.readAgentState();
+    const phase = state?.currentPhase ?? 'IDLE';
+    return {
+      statePath: this.getAgentStatePath(),
+      phase,
+      allowedTools: getAgentAllowedToolsForPhase(phase),
+      checks: tools.length > 0 && state
+        ? tools.map((tool) => checkAgentToolPolicy(state.currentPhase, tool))
+        : undefined,
+    };
+  }
+
+  async createAgentCheckpoint(label?: string): Promise<AgentStateSummary> {
+    const { state } = await this.readRequiredAgentState();
+    this.requireAgentTool(state, 'create_checkpoint');
+    const checkpoint = await createWorkspaceCheckpoint(this.config.workspaceRoot, label || `agent checkpoint ${state.taskIdentity}`);
+    const nextState = cloneAgentState(state);
+    nextState.checkpoints = addUniqueAgentEntry(nextState.checkpoints, checkpoint.id);
+    nextState.currentPhase = 'TOOL_ACTION';
+    nextState.currentStep = `Checkpoint ${checkpoint.id} created.`;
+    nextState.nextAction = 'Run gamma agent patch for one bounded edit.';
+    nextState.evidenceLedger = addUniqueAgentEntry(nextState.evidenceLedger, `Checkpoint ${checkpoint.id} created before edit.`);
+    const statePath = await writeAgentState(this.config.workspaceRoot, nextState);
+    return summarizeAgentState(statePath, nextState);
+  }
+
+  async runAgentPatch(input: { filePath: string; oldContent: string; newContent: string }): Promise<AgentPatchResult> {
+    const { state } = await this.readRequiredAgentState();
+
+    const relativePath = this.normalizeWorkspaceRelativePath(input.filePath);
+    const policy = this.workspacePolicy.checkAction('write', relativePath);
+    if (!policy.allowed) {
+      throw new Error(`Agent patch denied: ${policy.reason}`);
+    }
+
+    const nextState = cloneAgentState(state);
+    let checkpointId = '';
+    try {
+      if (state.currentPhase === 'TOOL_ACTION') {
+        this.requireAgentTool(state, 'patch_file');
+        checkpointId = state.checkpoints[state.checkpoints.length - 1] || '';
+        if (!checkpointId) {
+          throw new Error('Patch phase requires an existing checkpoint.');
+        }
+      } else {
+        this.requireAgentTool(state, 'create_checkpoint');
+        const checkpoint = await createWorkspaceCheckpoint(
+          this.config.workspaceRoot,
+          `agent patch ${relativePath}`,
+          [relativePath],
+        );
+        checkpointId = checkpoint.id;
+        nextState.checkpoints = addUniqueAgentEntry(nextState.checkpoints, checkpoint.id);
+        nextState.evidenceLedger = addUniqueAgentEntry(
+          nextState.evidenceLedger,
+          `Checkpoint ${checkpoint.id} created before editing ${relativePath}.`,
+        );
+      }
+
+      nextState.currentPhase = 'TOOL_ACTION';
+      this.requireAgentTool(nextState, 'patch_file');
+
+      const absolutePath = path.resolve(this.config.workspaceRoot, relativePath);
+      const fileContent = await fs.readFile(absolutePath, 'utf8');
+      if (!fileContent.includes(input.oldContent)) {
+        throw new Error(`Target content not found in ${relativePath}.`);
+      }
+      await fs.writeFile(absolutePath, fileContent.replace(input.oldContent, input.newContent), 'utf8');
+      nextState.filesChanged = addUniqueAgentEntry(nextState.filesChanged, relativePath);
+      nextState.evidenceLedger = addUniqueAgentEntry(nextState.evidenceLedger, `Patch applied to ${relativePath}.`);
+
+      nextState.currentPhase = 'DIFF_IF_EDIT';
+      this.requireAgentTool(nextState, 'git_diff');
+      const diffResult = await this.gitDiff();
+      const diffSummary = truncateStreamPreview(diffResult.output || 'No diff output.');
+      nextState.evidenceLedger = addUniqueAgentEntry(nextState.evidenceLedger, `Diff captured after editing ${relativePath}.`);
+      nextState.currentStatus = 'UNVERIFIED';
+      nextState.currentPhase = 'VERIFY_IF_REQUIRED';
+      nextState.currentStep = `Patched ${relativePath}; checkpoint and diff recorded.`;
+      nextState.nextAction = 'Run gamma agent verify --type code-edit --command "<targeted check>".';
+      const statePath = await writeAgentState(this.config.workspaceRoot, nextState);
+      return {
+        statePath,
+        filePath: relativePath,
+        checkpointId,
+        diffSummary,
+        status: nextState.currentStatus,
+        phase: nextState.currentPhase,
+        summary: summarizeAgentState(statePath, nextState),
+      };
+    } catch (error: any) {
+      nextState.currentStatus = 'FAILED';
+      nextState.currentPhase = 'VERIFY_IF_REQUIRED';
+      nextState.currentStep = `Patch failed for ${relativePath}.`;
+      nextState.nextAction = checkpointId ? `Run gamma agent rollback ${checkpointId} or fix the patch input.` : 'Fix the patch input.';
+      nextState.blockers = addUniqueAgentEntry(nextState.blockers, error?.message || 'Agent patch failed.');
+      nextState.evidenceLedger = addUniqueAgentEntry(nextState.evidenceLedger, `Patch failed for ${relativePath}: ${error?.message || 'unknown error'}`);
+      await writeAgentState(this.config.workspaceRoot, nextState);
+      throw error;
+    }
+  }
+
+  async runAgentVerification(input: { taskType?: AgentTaskType; command?: string } = {}): Promise<AgentVerificationResult> {
+    const { state } = await this.readRequiredAgentState();
+    const taskType = input.taskType ?? evaluateAgentDoneGate(state).taskType;
+    let nextState = cloneAgentState(state);
+    let commandSuccess: boolean | undefined;
+
+    if (input.command?.trim()) {
+      this.requireAgentTool(nextState, 'run_command');
+      const command = input.command.trim();
+      const result = await this.runAgentCommand(command);
+      commandSuccess = result.success;
+      nextState.commandsRun = addUniqueAgentEntry(
+        nextState.commandsRun,
+        `${command} => exit ${result.exitCode}`,
+      );
+      nextState.verificationResults = addUniqueAgentEntry(
+        nextState.verificationResults,
+        `${result.success ? 'PASS' : 'FAIL'} command: ${command} :: ${result.outputPreview}`,
+      );
+      if (!result.success) {
+        nextState.currentStatus = 'FAILED';
+        nextState.currentPhase = 'VERIFY_IF_REQUIRED';
+        nextState.currentStep = `Verification command failed: ${command}`;
+        nextState.nextAction = 'Fix blocker or rerun targeted verification.';
+        nextState.blockers = addUniqueAgentEntry(nextState.blockers, `Verification command failed: ${command}`);
+      }
+    } else if (taskType === 'read_only_research') {
+      nextState.verificationResults = addUniqueAgentEntry(
+        nextState.verificationResults,
+        'PASS read-only state proof check.',
+      );
+    } else {
+      nextState.verificationResults = addUniqueAgentEntry(
+        nextState.verificationResults,
+        'PENDING no verification command supplied.',
+      );
+    }
+
+    const gated = commandSuccess === false
+      ? { state: nextState, gate: evaluateAgentDoneGate(nextState, taskType) }
+      : applyAgentDoneGate(nextState, taskType);
+    nextState = gated.state;
+    const statePath = await writeAgentState(this.config.workspaceRoot, nextState);
+    this.traceBus.emitEvent({
+      type: 'agent_done_gate_evaluated',
+      data: {
+        statePath,
+        taskType,
+        status: nextState.currentStatus,
+        missingProof: gated.gate.missingProof,
+      },
+    });
+    return {
+      statePath,
+      taskType,
+      command: input.command?.trim() || undefined,
+      commandSuccess,
+      gate: gated.gate,
+      summary: summarizeAgentState(statePath, nextState),
+    };
+  }
+
+  async rollbackAgentCheckpoint(checkpointId: string): Promise<AgentRollbackResult> {
+    const { state } = await this.readRequiredAgentState();
+    const id = checkpointId.trim();
+    if (!id) {
+      throw new Error('Checkpoint id is required.');
+    }
+    const rollback = await rollbackWorkspaceCheckpoint(this.config.workspaceRoot, id);
+    const nextState = cloneAgentState(state);
+    nextState.filesChanged = Array.from(new Set([...nextState.filesChanged, ...rollback.affectedFiles])).sort();
+    nextState.currentStatus = 'UNVERIFIED';
+    nextState.currentPhase = 'VERIFY_IF_REQUIRED';
+    nextState.currentStep = `Rolled back checkpoint ${id}.`;
+    nextState.nextAction = 'Inspect diff and verify rollback result.';
+    nextState.evidenceLedger = addUniqueAgentEntry(nextState.evidenceLedger, `Rollback checkpoint ${id} affected ${rollback.affectedFiles.length} file(s).`);
+    const statePath = await writeAgentState(this.config.workspaceRoot, nextState);
+    return {
+      statePath,
+      checkpointId: id,
+      affectedFiles: rollback.affectedFiles,
+      summary: summarizeAgentState(statePath, nextState),
+    };
+  }
+
+  private async readRequiredAgentState(): Promise<{ statePath: string; state: AgentState }> {
+    const statePath = this.getAgentStatePath();
+    const stateMarkdown = await this.readAgentStateMarkdown();
+    if (!stateMarkdown) {
+      throw new Error('Agent state file is missing. Run gamma agent task "..." first.');
+    }
+    const missingSections = validateAgentStateSections(stateMarkdown);
+    if (missingSections.length > 0) {
+      throw new Error(`Agent state file is invalid. Missing sections: ${missingSections.join(', ')}`);
+    }
+    const state = await this.readAgentState();
+    if (!state) {
+      throw new Error('Agent state file could not be parsed.');
+    }
+    return { statePath, state };
+  }
+
+  private requireAgentTool(state: AgentState, tool: AgentToolName): AgentToolPolicyResult {
+    const check = checkAgentToolPolicy(state.currentPhase, tool);
+    if (!check.allowed) {
+      throw new Error(check.reason || `${tool} is not allowed during ${state.currentPhase}.`);
+    }
+    return check;
+  }
+
+  private normalizeWorkspaceRelativePath(filePath: string): string {
+    const trimmed = filePath.trim();
+    if (!trimmed) {
+      throw new Error('File path is required.');
+    }
+    const absolutePath = path.isAbsolute(trimmed)
+      ? path.resolve(trimmed)
+      : path.resolve(this.config.workspaceRoot, trimmed);
+    if (!this.workspacePolicy.isPathWithinWorkspace(absolutePath)) {
+      throw new Error(`Path resolves outside workspace: ${filePath}`);
+    }
+    const relativePath = path.relative(this.config.workspaceRoot, absolutePath).replace(/\\/g, '/');
+    if (!relativePath || relativePath.startsWith('../') || relativePath === '..') {
+      throw new Error(`Invalid workspace path: ${filePath}`);
+    }
+    return relativePath;
+  }
+
+  private async runAgentCommand(command: string): Promise<{ success: boolean; exitCode: number; outputPreview: string }> {
+    const tokens = tokenizeAgentCommand(command);
+    const [commandName, ...commandArgs] = tokens;
+    if (!commandName) {
+      throw new Error('Verification command is empty.');
+    }
+    const escapedArg = commandArgs.find((arg) => {
+      if (!agentCommandArgLooksLikePath(arg)) {
+        return false;
+      }
+      const normalizedArg = arg.startsWith('~/') ? path.join(os.homedir(), arg.slice(2)) : arg;
+      return !this.workspacePolicy.isPathWithinWorkspace(normalizedArg);
+    });
+    if (escapedArg) {
+      throw new Error(`Denied: Command argument "${escapedArg}" resolves outside the workspace root.`);
+    }
+    try {
+      const { stdout, stderr } = await execFileAsync(commandName, commandArgs, {
+        cwd: this.config.workspaceRoot,
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: 120000,
+      });
+      return {
+        success: true,
+        exitCode: 0,
+        outputPreview: truncateStreamPreview(`${stdout}${stderr ? `\n${stderr}` : ''}`.trim() || 'No output.'),
+      };
+    } catch (error: any) {
+      const output = `${error?.stdout || ''}${error?.stderr ? `\n${error.stderr}` : ''}`.trim() || error?.message || 'Command failed.';
+      return {
+        success: false,
+        exitCode: typeof error?.code === 'number' ? error.code : 1,
+        outputPreview: truncateStreamPreview(output),
+      };
+    }
+  }
+
+  private async detectGitBranch(): Promise<string> {
+    try {
+      const { stdout } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: this.config.workspaceRoot,
+      });
+      return stdout.trim() || 'unknown';
+    } catch {
+      return 'unknown';
+    }
   }
 
   async resumeRun(runId: string): Promise<RunCheckpoint | null> {
@@ -7755,4 +8201,48 @@ export class CoreEngine extends EventEmitter {
   async runCommand(command: string) {
     return this.runTool('runCommand', command);
   }
+}
+
+function cloneAgentState(state: AgentState): AgentState {
+  return {
+    ...state,
+    definitionOfDone: [...state.definitionOfDone],
+    constraints: [...state.constraints],
+    assumptions: [...state.assumptions],
+    blockers: [...state.blockers],
+    filesRead: [...state.filesRead],
+    filesChanged: [...state.filesChanged],
+    commandsRun: [...state.commandsRun],
+    checkpoints: [...state.checkpoints],
+    verificationResults: [...state.verificationResults],
+    evidenceLedger: [...state.evidenceLedger],
+    taskLedger: state.taskLedger.map((entry) => ({ ...entry })),
+    workingMemory: [...state.workingMemory],
+    compactedHistory: [...state.compactedHistory],
+  };
+}
+
+function addUniqueAgentEntry(values: string[], value: string): string[] {
+  return value && !values.includes(value) ? [...values, value] : values;
+}
+
+function tokenizeAgentCommand(command: string): string[] {
+  if (/[|&;<>()`$\\\n\r]/.test(command)) {
+    throw new Error('Safe verification command supports one executable plus arguments only. Shell operators, redirection, substitution, and backslashes are not supported.');
+  }
+  const matches = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+  return matches.map((token) => {
+    if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+      return token.slice(1, -1);
+    }
+    return token;
+  });
+}
+
+function agentCommandArgLooksLikePath(value: string): boolean {
+  return value.startsWith('/')
+    || value.startsWith('./')
+    || value.startsWith('../')
+    || value.startsWith('~/')
+    || value.includes('/');
 }

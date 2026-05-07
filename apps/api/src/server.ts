@@ -620,6 +620,28 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (requestUrl.pathname === '/api/agent/dashboard' && method === 'GET') {
+      const [state, markdown, summary, toolPolicy] = await Promise.all([
+        engine.readAgentState(),
+        engine.readAgentStateMarkdown(),
+        engine.getAgentStatus(),
+        engine.getAgentToolPolicy(),
+      ]);
+      const pendingApprovals = engine.getPendingApprovals();
+      sendJson(req, res, 200, {
+        exists: Boolean(state),
+        statePath: engine.getAgentStatePath(),
+        state,
+        markdown,
+        summary,
+        toolPolicy,
+        trace: engine.getTraceLog().slice(-50),
+        pendingApprovals,
+        pendingApprovalCount: pendingApprovals.length,
+      });
+      return;
+    }
+
     if (requestUrl.pathname === '/api/session' && method === 'POST') {
       const body = await readBody(req);
       const skills = Array.isArray(body.skills) ? body.skills.filter((skill): skill is string => typeof skill === 'string') : [];

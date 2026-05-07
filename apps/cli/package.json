@@ -2,6 +2,7 @@
   "name": "@local-harness/cli",
   "version": "0.1.0",
   "bin": {
+    "gamma": "./dist/cli.js",
     "harness": "./dist/cli.js"
   },
   "scripts": {
