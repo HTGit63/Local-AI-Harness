@@ -12,6 +12,8 @@ interface RunConsoleProps {
   phase?: string;
   currentTool?: string;
   streamStatus?: string;
+  fallbackPath?: string;
+  fallbackReason?: string;
   traces: RunTraceEntry[];
   approvals: RunApprovalItem[];
   gitDiff: string;
@@ -99,6 +101,8 @@ export function RunConsole({
   phase,
   currentTool,
   streamStatus,
+  fallbackPath,
+  fallbackReason,
   traces,
   approvals,
   gitDiff,
@@ -137,7 +141,15 @@ export function RunConsole({
       </div>
 
       <div className="run-console-body">
-        <CurrentTaskCard plan={plan} currentStepId={currentStepId} progress={progress} phase={phase} streamStatus={streamStatus} />
+        <CurrentTaskCard
+          plan={plan}
+          currentStepId={currentStepId}
+          progress={progress}
+          phase={phase}
+          streamStatus={streamStatus}
+          fallbackPath={fallbackPath}
+          fallbackReason={fallbackReason}
+        />
         {contextData && (
           <section className="run-console-section">
             <div className="run-console-section-head">

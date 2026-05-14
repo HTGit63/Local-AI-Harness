@@ -35,19 +35,7 @@ export interface AdapterOptions {
   retries?: number;
 }
 
-export type ModelRoutePurpose =
-  | 'classify'
-  | 'direct'
-  | 'inspect'
-  | 'code'
-  | 'summarize'
-  | 'review';
 
-export type ExecutionProfile =
-  | 'fast_local'
-  | 'balanced_local'
-  | 'deep_review'
-  | 'api_frontier';
 
 export interface AvailableModel {
   id: string;
@@ -85,6 +73,14 @@ export interface ModelSwitchResult {
   message: string;
 }
 
+export interface ModelLifecyclePolicy {
+  preloadKeepAlive: string;
+  unloadKeepAlive: number;
+  chatTimeoutMs: number;
+  preloadTimeoutMs: number;
+  unloadTimeoutMs: number;
+}
+
 export interface ModelRuntimeState {
   configuredModel: string;
   activeModel: string | null;
@@ -92,6 +88,9 @@ export interface ModelRuntimeState {
   installedModels: string[];
   availableModels: AvailableModel[];
   supportsLifecycle: boolean;
+  lifecyclePolicy: ModelLifecyclePolicy;
+  reasoningSupported?: boolean;
+  nativeToolCallingSupported?: boolean;
   configuredModelCapabilities?: string[];
   lastSwitchResult?: ModelSwitchResult;
 }

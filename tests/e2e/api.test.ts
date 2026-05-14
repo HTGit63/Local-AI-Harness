@@ -31,6 +31,9 @@ interface SessionState {
       summary?: string;
       workspaceSource?: 'backend' | 'browser_snapshot';
       workspaceBound?: boolean;
+      toolProtocol?: 'native' | 'manual';
+      fallbackPath?: string;
+      fallbackReason?: string;
     };
   }>;
 }
@@ -469,13 +472,20 @@ async function testApiWorkflow() {
     assert.strictEqual(updatedConfig.selfCheckEnabled, false);
     assert.strictEqual(updatedConfig.localModelBudgetProfile, 'lean');
 
-    const session = await fetchJson<{ id: string; skillsActive: string[] }>(`${API_BASE}/api/session`, {
+    const session = await fetchJson<{ id: string; skillsActive: string[]; skillAudit?: { requested: string[]; catalog: string[]; records: Array<{ slug: string; status: string; reason: string }> } }>(`${API_BASE}/api/session`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ skills: ['engineering-code-reviewer'] }),
+      body: JSON.stringify({ skills: ['caveman', 'engineering-code-reviewer', 'definitely-not-a-skill'] }),
     });
     assert.ok(session.id);
     assert.deepStrictEqual(session.skillsActive, ['engineering-code-reviewer']);
+    assert.deepStrictEqual(session.skillAudit?.requested, ['caveman', 'engineering-code-reviewer', 'definitely-not-a-skill']);
+    assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'caveman')?.status, 'filtered');
+    assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'definitely-not-a-skill')?.status, 'missing');
+
+    const sessionReloaded = await fetchJson<{ id: string; skillsActive: string[]; skillAudit?: { requested: string[]; catalog: string[]; records: Array<{ slug: string; status: string; reason: string }> } }>(`${API_BASE}/api/session`);
+    assert.strictEqual(sessionReloaded.skillAudit?.records.find((entry) => entry.slug === 'caveman')?.status, 'filtered');
+    assert.strictEqual(sessionReloaded.skillAudit?.records.find((entry) => entry.slug === 'definitely-not-a-skill')?.status, 'missing');
 
     const pendingWrite = fetchJson<ToolResult>(`${API_BASE}/api/workspace/write`, {
       method: 'POST',
@@ -575,6 +585,8 @@ async function testApiWorkflow() {
       .find((turn) => turn.executionMode === 'agentic');
     assert.ok(latestAgenticTurn?.runSummary?.summary);
     assert.strictEqual(latestAgenticTurn?.runSummary?.workspaceSource, 'backend');
+    assert.strictEqual(latestAgenticTurn?.runSummary?.toolProtocol, 'native');
+    assert.strictEqual(latestAgenticTurn?.runSummary?.fallbackPath, 'native_tools');
 
     const chatRequestsBeforeSnapshot = mockModel.getChatRequests().length;
     const snapshotEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {

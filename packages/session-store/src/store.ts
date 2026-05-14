@@ -1,6 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { SessionMetadata, SessionStorageEngine, SessionTurnMetadata } from './types';
+import { SessionMetadata, SessionStorageEngine, SessionTurnMetadata, SkillAuditState } from './types';
 
 const SESSION_FILE_SUFFIX = '.json';
 const SESSION_TURNS_SUFFIX = '-turns.jsonl';
@@ -47,6 +47,7 @@ export class FileSessionStore implements SessionStorageEngine {
     return {
       ...rest,
       skillsActive: [...rest.skillsActive],
+      skillAudit: this.cloneSkillAudit(rest.skillAudit),
       toolsAllowlist: [...rest.toolsAllowlist],
     };
   }
@@ -55,10 +56,23 @@ export class FileSessionStore implements SessionStorageEngine {
     return {
       ...session,
       skillsActive: [...session.skillsActive],
+      skillAudit: this.cloneSkillAudit(session.skillAudit),
       toolsAllowlist: [...session.toolsAllowlist],
       turnHistory: Array.isArray(session.turnHistory)
         ? session.turnHistory.map((turn) => ({ ...turn }))
         : undefined,
+    };
+  }
+
+  private cloneSkillAudit(skillAudit?: SkillAuditState): SkillAuditState | undefined {
+    if (!skillAudit) {
+      return undefined;
+    }
+
+    return {
+      requested: [...skillAudit.requested],
+      catalog: [...skillAudit.catalog],
+      records: skillAudit.records.map((record) => ({ ...record })),
     };
   }
 
@@ -98,10 +112,16 @@ export class FileSessionStore implements SessionStorageEngine {
           .map(([id, entry]) => {
             // Strip turnHistory from index entries (v1 → v2 migration)
             const { turnHistory: _, ...shallow } = entry.session as any;
+            const skillAudit = shallow.skillAudit as SkillAuditState | undefined;
             return [
               id,
               {
-                session: { ...shallow, skillsActive: [...(shallow.skillsActive || [])], toolsAllowlist: [...(shallow.toolsAllowlist || [])] },
+                session: {
+                  ...shallow,
+                  skillsActive: [...(shallow.skillsActive || [])],
+                  skillAudit: this.cloneSkillAudit(skillAudit),
+                  toolsAllowlist: [...(shallow.toolsAllowlist || [])],
+                },
                 fileMtimeMs: Number(entry.fileMtimeMs) || 0,
               },
             ];

@@ -19,7 +19,10 @@ function uniqueTraceValues(traces: RunTraceEntry[], key: string): string[] {
 
 export function RunMetrics({ plan, traces, approvals, filesChangedCount }: RunMetricsProps) {
   const filesRead = uniqueTraceValues(traces, 'filePath').length;
-  const toolEvents = traces.filter((trace) => trace.type === 'tool_call_started' || trace.type === 'tool_call_completed').length;
+  const toolEvents = traces.filter((trace) =>
+    trace.type === 'tool_call_started' ||
+    trace.type === 'tool_call_completed' ||
+    trace.type === 'command_policy_checked').length;
 
   return (
     <section className="run-console-section">

@@ -31,6 +31,7 @@ type ConversationMode = 'general' | 'architecture' | 'data-analysis' | 'code-rev
 type BackendStatus = 'ok' | 'degraded' | 'offline';
 type SettingsTab = 'connection' | 'workspace' | 'sessions' | 'activity' | 'agent';
 type ExecutionMode = 'direct' | 'agentic';
+type FallbackPath = 'native_tools' | 'native_retry' | 'manual_fallback' | 'manual_repair' | 'final_noop_warning';
 
 interface ChatToolEvent {
   id: string;
@@ -91,13 +92,7 @@ interface ConfigState {
     maxModelCallsPerRun: number;
     maxToolCallsPerRun: number;
   };
-  executionProfile?: 'fast_local' | 'balanced_local' | 'deep_review' | 'api_frontier';
-  providerProfile?: string;
-  promptProfile?: string;
-  fastModel?: string;
-  codingModel?: string;
-  reviewModel?: string;
-  apiModel?: string;
+
 }
 
 interface SessionState {
@@ -108,6 +103,7 @@ interface SessionState {
   mode: string;
   cwd: string;
   skillsActive: string[];
+  skillAudit?: SkillAuditState;
   toolsAllowlist: string[];
   turnHistory?: Array<{
     timestamp: number;
@@ -153,6 +149,10 @@ interface PlanState {
   sessionMemoryEnabled?: boolean;
   sessionMemoryTurns?: number;
   selfCheckEnabled?: boolean;
+  fallbackPath?: FallbackPath;
+  fallbackReason?: string;
+  fallbackCount?: number;
+  skillAudit?: SkillAuditState;
   lastStatus?: string;
   currentRunId?: string;
   currentTool?: string;
@@ -183,7 +183,20 @@ interface PlanState {
 }
 
 interface TraceHeadlineData {
-  state?: { intendedNextAction?: string; currentPhase?: string };
+  id?: string;
+  skillsActive?: string[];
+  skillAudit?: SkillAuditState;
+  state?: {
+    intendedNextAction?: string;
+    currentPhase?: string;
+    fallbackPath?: FallbackPath;
+    fallbackReason?: string;
+    fallbackCount?: number;
+    skillAudit?: SkillAuditState;
+  };
+  fallbackPath?: FallbackPath;
+  fallbackReason?: string;
+  fallbackCount?: number;
   step?: { title?: string; toolName?: string };
   plan?: { title?: string };
   message?: string;
@@ -198,6 +211,8 @@ interface TraceHeadlineData {
   budgetType?: string;
   tool?: string;
   command?: string;
+  status?: string;
+  policyMode?: string;
   outputPreview?: string;
   error?: string;
   success?: boolean;
@@ -209,11 +224,13 @@ interface RunTracePayload {
   step?: TaskPlan['steps'][number];
   error?: string;
   reason?: string;
+  fallbackPath?: FallbackPath;
   budgetType?: string;
   tool?: string;
   inputSummary?: string;
   outputPreview?: string;
   command?: string;
+  status?: string;
 }
 
 interface SkillMetadata {
@@ -223,6 +240,20 @@ interface SkillMetadata {
   description: string;
   recommendedUse: string;
   riskLevel: string;
+}
+
+type SkillAuditStatus = 'available' | 'filtered' | 'missing';
+
+interface SkillAuditRecord {
+  slug: string;
+  status: SkillAuditStatus;
+  reason: string;
+}
+
+interface SkillAuditState {
+  requested: string[];
+  catalog: string[];
+  records: SkillAuditRecord[];
 }
 
 interface AvailableModel {
@@ -244,6 +275,14 @@ interface RunningModel {
   };
 }
 
+interface ModelLifecyclePolicy {
+  preloadKeepAlive: string;
+  unloadKeepAlive: number;
+  chatTimeoutMs: number;
+  preloadTimeoutMs: number;
+  unloadTimeoutMs: number;
+}
+
 interface ModelRuntimeState {
   configuredModel: string;
   activeModel: string | null;
@@ -251,6 +290,9 @@ interface ModelRuntimeState {
   installedModels: string[];
   availableModels: AvailableModel[];
   supportsLifecycle: boolean;
+  lifecyclePolicy: ModelLifecyclePolicy;
+  reasoningSupported?: boolean;
+  nativeToolCallingSupported?: boolean;
   configuredModelCapabilities?: string[];
   lastSwitchResult?: {
     message: string;
@@ -291,6 +333,10 @@ interface AgentRunSummary {
   workspaceSource: 'backend' | 'browser_snapshot';
   workspaceBound: boolean;
   browserContextActive: boolean;
+  toolProtocol?: 'native' | 'manual';
+  fallbackPath?: FallbackPath;
+  fallbackReason?: string;
+  fallbackCount?: number;
   filesRead: string[];
   directoriesRead: string[];
   filesWritten: string[];
@@ -314,7 +360,6 @@ interface AgentRunSummary {
     firstTokenMs?: number;
   };
   usedManualFallback: boolean;
-  fallbackReason?: string;
   summary?: string;
   steps: AgentRunStep[];
 }
@@ -377,10 +422,19 @@ type ChatStreamEvent =
   | { type: 'task_checkpoint_saved'; data: { runId: string; checkpointPath?: string }; id?: string; timestamp?: number }
   | { type: 'task_budget_exceeded'; data: { runId: string; budgetType: string }; id?: string; timestamp?: number }
   | { type: 'task_plan_completed'; data: { runId: string; plan?: TaskPlan }; id?: string; timestamp?: number }
+  | { type: 'command_policy_checked'; data: { command: string; allowed: boolean; approvalRequired: boolean; policyMode: string; status: string; reason?: string; workspaceRoot: string; shellOperatorsAllowed: boolean }; id?: string; timestamp?: number }
   | { type: 'tool_call_started'; data: { runId?: string; tool: string; inputSummary: string }; id?: string; timestamp?: number }
   | { type: 'tool_call_completed'; data: { runId?: string; tool: string; success: boolean; outputPreview: string }; id?: string; timestamp?: number }
   | { type: 'verification_started'; data: { runId: string; command?: string }; id?: string; timestamp?: number }
   | { type: 'verification_completed'; data: { runId: string; success: boolean; outputPreview: string }; id?: string; timestamp?: number }
+  | { type: 'manual_tool_fallback'; data: { model: string; routedModel?: string; reason?: string; manualToolProtocol?: boolean; selectedTools?: string[]; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
+  | { type: 'manual_tool_strategy_selected'; data: { model: string; routedModel?: string; reason?: string; manualToolProtocol?: boolean; selectedTools?: string[]; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
+  | { type: 'native_tool_retry_requested'; data: { model: string; reason?: string; promptMode?: string; attempt?: number; selectedTools?: string[]; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
+  | { type: 'manual_tool_repair'; data: { model: string; reason?: string; attempt?: number; manualToolProtocol?: boolean; selectedTools?: string[]; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
+  | { type: 'final_noop_warning'; data: { model: string; reason?: string; promptMode?: string; manualToolProtocol?: boolean; selectedTools?: string[]; repairAttempts?: number; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
+  | { type: 'tool_simulation_detected'; data: { model: string; attempt?: number; preview?: string; manualToolProtocol?: boolean; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
+  | { type: 'stream_idle_timeout_retry'; data: { timeoutMs?: number; receivedContent?: boolean; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
+  | { type: 'stream_idle_timeout_partial'; data: { timeoutMs?: number; receivedContent?: boolean; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
   | { type: 'delta'; delta: string }
   | { type: 'done'; response: string }
   | { type: 'error'; message: string };
@@ -595,6 +649,42 @@ function safeJsonStringify(value: unknown): string {
   }
 }
 
+function formatFallbackPath(path?: FallbackPath): string {
+  switch (path) {
+    case 'native_tools':
+      return 'native tools';
+    case 'native_retry':
+      return 'native retry';
+    case 'manual_fallback':
+      return 'manual fallback';
+    case 'manual_repair':
+      return 'manual repair';
+    case 'final_noop_warning':
+      return 'final no-op warning';
+    default:
+      return 'native tools';
+  }
+}
+
+function formatDurationMs(ms: number | undefined): string {
+  if (!Number.isFinite(ms ?? NaN) || (ms ?? 0) < 0) {
+    return 'unknown';
+  }
+
+  const value = Math.max(0, Math.round((ms ?? 0) / 1000));
+  return `${value}s`;
+}
+
+function formatSkillAuditEntries(entries: SkillAuditRecord[] | undefined): string {
+  if (!entries || entries.length === 0) {
+    return 'None';
+  }
+
+  return entries
+    .map((entry) => `${entry.slug} (${shortenText(entry.reason, 36)})`)
+    .join(', ');
+}
+
 const TASK_TRACE_EVENT_TYPES = new Set<ChatStreamEvent['type']>([
   'task_plan_created',
   'task_step_started',
@@ -604,10 +694,19 @@ const TASK_TRACE_EVENT_TYPES = new Set<ChatStreamEvent['type']>([
   'task_checkpoint_saved',
   'task_budget_exceeded',
   'task_plan_completed',
+  'command_policy_checked',
   'tool_call_started',
   'tool_call_completed',
   'verification_started',
   'verification_completed',
+  'manual_tool_fallback',
+  'manual_tool_strategy_selected',
+  'native_tool_retry_requested',
+  'manual_tool_repair',
+  'final_noop_warning',
+  'tool_simulation_detected',
+  'stream_idle_timeout_retry',
+  'stream_idle_timeout_partial',
 ]);
 
 function isRunTraceEvent(event: ChatStreamEvent): event is Extract<ChatStreamEvent, { data: unknown }> {
@@ -654,27 +753,77 @@ function summarizeTurnIntent(turn: NonNullable<SessionState['turnHistory']>[numb
 function formatTraceHeadline(trace: TraceEntry): string {
   const data = trace.data as TraceHeadlineData | undefined;
   switch (trace.type) {
+    case 'session_started':
+      return [
+        `Session started${data?.id ? ` ${shortenText(data.id, 12)}` : ''}`,
+        data?.skillsActive ? `${data.skillsActive.length} active skills` : '',
+        data?.skillAudit ? `${data.skillAudit.requested.length} requested / ${data.skillAudit.records.filter((entry) => entry.status !== 'available').length} flagged` : '',
+      ].filter(Boolean).join(' · ');
+    case 'session_resumed':
+      return `Session resumed${data?.id ? ` ${shortenText(data.id, 12)}` : ''}`;
     case 'planner_trace':
-      return data?.state?.intendedNextAction || data?.state?.currentPhase || 'Planner updated';
+      return data?.state
+        ? [
+            data.state.intendedNextAction || data.state.currentPhase || 'Planner updated',
+            data.state.skillAudit
+              ? `skills ${data.state.skillAudit.requested.length} req / ${data.state.skillAudit.records.filter((entry) => entry.status !== 'available').length} flagged`
+              : '',
+            data.state.fallbackPath ? `path ${formatFallbackPath(data.state.fallbackPath)}` : '',
+          ].filter(Boolean).join(' · ')
+        : 'Planner updated';
     case 'run_step_started':
     case 'run_step_finished':
       return data?.step?.title || data?.step?.toolName || 'Run step';
     case 'run_summary_ready':
       return data?.summary || 'Run summary ready';
     case 'manual_tool_fallback':
-      return data?.reason || 'Manual fallback active';
+      return [
+        'Manual fallback active',
+        data?.fallbackPath ? formatFallbackPath(data.fallbackPath) : '',
+        data?.reason || '',
+      ].filter(Boolean).join(' · ');
     case 'manual_tool_strategy_selected':
-      return data?.reason || 'Manual tool strategy selected';
+      return [
+        'Manual tool strategy selected',
+        data?.fallbackPath ? formatFallbackPath(data.fallbackPath) : '',
+        data?.reason || '',
+      ].filter(Boolean).join(' · ');
+    case 'native_tool_retry_requested':
+      return [
+        'Native retry requested',
+        data?.fallbackPath ? formatFallbackPath(data.fallbackPath) : '',
+        data?.reason || '',
+      ].filter(Boolean).join(' · ');
+    case 'manual_tool_repair':
+      return [
+        'Manual repair',
+        data?.fallbackPath ? formatFallbackPath(data.fallbackPath) : '',
+        data?.reason || '',
+      ].filter(Boolean).join(' · ');
+    case 'final_noop_warning':
+      return [
+        'Final no-op warning',
+        data?.fallbackPath ? formatFallbackPath(data.fallbackPath) : '',
+        data?.reason || '',
+      ].filter(Boolean).join(' · ');
     case 'tool_simulation_detected':
-      return data?.preview || 'Tool simulation detected';
+      return [
+        'Tool simulation detected',
+        data?.fallbackPath ? formatFallbackPath(data.fallbackPath) : '',
+        data?.preview || '',
+      ].filter(Boolean).join(' · ');
     case 'stream_idle_timeout_retry':
-      return `Stream stalled after ${data?.timeoutMs ?? 0}ms; retrying non-stream`;
+      return `Stream stalled after ${data?.timeoutMs ?? 0}ms; retrying non-stream${data?.fallbackPath ? ` · ${formatFallbackPath(data.fallbackPath)}` : ''}`;
     case 'stream_idle_timeout_partial':
-      return `Stream stalled after ${data?.timeoutMs ?? 0}ms with partial output`;
+      return `Stream stalled after ${data?.timeoutMs ?? 0}ms with partial output${data?.fallbackPath ? ` · ${formatFallbackPath(data.fallbackPath)}` : ''}`;
     case 'repo_context_loaded':
       return `${data?.fileCount ?? 0} files indexed`;
     case 'chat_execution_plan':
-      return `Intent ${data?.intent || 'unknown'} · ${data?.toolProtocolMode || 'native'} tools`;
+      return [
+        `Intent ${data?.intent || 'unknown'}`,
+        `${data?.toolProtocolMode || 'native'} tools`,
+        data?.fallbackPath ? formatFallbackPath(data.fallbackPath) : '',
+      ].filter(Boolean).join(' · ');
     case 'task_plan_created':
       return `Plan created: ${data?.plan?.title || data?.runId || 'task'}`;
     case 'task_step_started':
@@ -691,6 +840,8 @@ function formatTraceHeadline(trace: TraceEntry): string {
       return `Budget exceeded: ${data?.budgetType || 'run'}`;
     case 'task_plan_completed':
       return `Plan completed: ${data?.plan?.title || data?.runId || 'run'}`;
+    case 'command_policy_checked':
+      return `Command ${data?.status || 'checked'}: ${data?.command || 'shell'}${data?.reason ? ` · ${shortenText(data.reason, 64)}` : ''}`;
     case 'tool_call_started':
       return `Tool started: ${data?.tool || 'tool'}`;
     case 'tool_call_completed':
@@ -1121,12 +1272,6 @@ function HarnessApp() {
   const [streamIdleTimeoutDraft, setStreamIdleTimeoutDraft] = useState('45');
   const [contextBudgetDraft, setContextBudgetDraft] = useState('24000');
   const [localModelBudgetProfileDraft, setLocalModelBudgetProfileDraft] = useState<'lean' | 'balanced' | 'deep'>('balanced');
-  const [executionProfileDraft, setExecutionProfileDraft] = useState<NonNullable<ConfigState['executionProfile']>>('balanced_local');
-  const [promptProfileDraft, setPromptProfileDraft] = useState('gemma-local-fast');
-  const [fastModelDraft, setFastModelDraft] = useState('');
-  const [codingModelDraft, setCodingModelDraft] = useState('');
-  const [reviewModelDraft, setReviewModelDraft] = useState('');
-  const [apiModelDraft, setApiModelDraft] = useState('');
   const [toolRetryMaxDraft, setToolRetryMaxDraft] = useState('2');
   const [sessionMemoryEnabledDraft, setSessionMemoryEnabledDraft] = useState(true);
   const [sessionMemoryTurnsDraft, setSessionMemoryTurnsDraft] = useState('3');
@@ -1222,6 +1367,13 @@ function HarnessApp() {
     [messages],
   );
   const liveActivityBadge = streamStatus || plan?.lastStatus || plan?.currentPhase || 'Ready';
+  const runtimeLifecyclePolicy = modelRuntime?.lifecyclePolicy;
+  const runtimeReasoningSupported = modelRuntime?.reasoningSupported;
+  const runtimeNativeToolCallingSupported = modelRuntime?.nativeToolCallingSupported;
+  const skillAudit = session?.skillAudit ?? plan?.skillAudit;
+  const filteredSkillAudit = skillAudit?.records.filter((entry) => entry.status === 'filtered') ?? [];
+  const missingSkillAudit = skillAudit?.records.filter((entry) => entry.status === 'missing') ?? [];
+  const showAgentWorkbench = isAgentic;
 
   /* ─── Refresh dashboard data ─── */
   const refreshDashboard = useCallback(async (
@@ -1285,12 +1437,6 @@ function HarnessApp() {
             sessionMemoryTurns: cfg.sessionMemoryTurns,
             selfCheckEnabled: cfg.selfCheckEnabled,
             localModelBudgetProfile: cfg.localModelBudgetProfile,
-            executionProfile: cfg.executionProfile,
-            promptProfile: cfg.promptProfile,
-            fastModel: cfg.fastModel,
-            codingModel: cfg.codingModel,
-            reviewModel: cfg.reviewModel,
-            apiModel: cfg.apiModel,
           });
 
           if (sig !== lastConfigSigRef.current) {
@@ -1308,12 +1454,6 @@ function HarnessApp() {
             setSessionMemoryTurnsDraft(String(cfg.sessionMemoryTurns));
             setSelfCheckEnabledDraft(cfg.selfCheckEnabled);
             setLocalModelBudgetProfileDraft(cfg.localModelBudgetProfile || 'balanced');
-            setExecutionProfileDraft(cfg.executionProfile || 'balanced_local');
-            setPromptProfileDraft(cfg.promptProfile || 'gemma-local-fast');
-            setFastModelDraft(cfg.fastModel || '');
-            setCodingModelDraft(cfg.codingModel || '');
-            setReviewModelDraft(cfg.reviewModel || '');
-            setApiModelDraft(cfg.apiModel || '');
           }
         }
       };
@@ -1729,6 +1869,9 @@ function HarnessApp() {
               lastStatus = 'Checkpoint saved';
             } else if (event.type === 'task_budget_exceeded') {
               lastStatus = `Budget exceeded: ${data.budgetType || 'run'}`;
+            } else if (event.type === 'command_policy_checked') {
+              currentPhase = 'command policy';
+              lastStatus = `${data.command || 'command'} · ${data.status || 'checked'}`;
             } else if (event.type === 'tool_call_started') {
               currentTool = typeof data.tool === 'string' ? data.tool : currentTool;
               lastStatus = data.inputSummary || 'Tool call started';
@@ -1852,12 +1995,7 @@ function HarnessApp() {
           sessionMemoryTurns,
           selfCheckEnabled: selfCheckEnabledDraft,
           localModelBudgetProfile: localModelBudgetProfileDraft,
-          executionProfile: executionProfileDraft,
-          promptProfile: promptProfileDraft,
-          fastModel: fastModelDraft.trim(),
-          codingModel: codingModelDraft.trim(),
-          reviewModel: reviewModelDraft.trim(),
-          apiModel: apiModelDraft.trim(),
+
           activateModel: shouldActivate,
         }),
       });
@@ -2253,7 +2391,7 @@ function HarnessApp() {
             )}
           </section>
 
-          {(isAgentic || isSending || Boolean(plan?.currentRunId) || livePlanSteps.length > 0) && (
+          {showAgentWorkbench ? (
             <section className="activity-deck">
               <div className="activity-card activity-card-primary">
                 <div className="command-center-section-head">
@@ -2274,9 +2412,19 @@ function HarnessApp() {
                     <strong>{plan?.currentTool || 'None'}</strong>
                   </div>
                   <div className="activity-summary-item">
-                    <span>Tool Path</span>
+                    <span>Tool Protocol</span>
                     <strong>{plan?.toolProtocol || 'native'}</strong>
                   </div>
+                  <div className="activity-summary-item">
+                    <span>Fallback Path</span>
+                    <strong>{plan?.fallbackPath ? formatFallbackPath(plan.fallbackPath) : 'native tools'}</strong>
+                  </div>
+                  {plan?.fallbackReason ? (
+                    <div className="activity-summary-item">
+                      <span>Fallback Reason</span>
+                      <strong>{plan.fallbackReason}</strong>
+                    </div>
+                  ) : null}
                   <div className="activity-summary-item">
                     <span>Workspace</span>
                     <strong>{plan?.workspaceBound === false ? 'Snapshot only' : 'Backend bound'}</strong>
@@ -2331,6 +2479,49 @@ function HarnessApp() {
                     ))}
                   </div>
                 )}
+              </div>
+            </section>
+          ) : (
+            <section className="activity-deck">
+              <div className="activity-card activity-card-primary">
+                <div className="command-center-section-head">
+                  <span>Direct Activity</span>
+                  <span>{liveActivityBadge}</span>
+                </div>
+                <div className="activity-summary-grid">
+                  <div className="activity-summary-item">
+                    <span>Phase</span>
+                    <strong>{streamStatus || 'direct'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Next</span>
+                    <strong>{isSending ? 'Generating direct answer' : 'Ready for direct reply'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Model</span>
+                    <strong>{shortenText(activeModelLabel, 24)}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Workspace</span>
+                    <strong>{browserSelection && !workspaceSelection ? 'Snapshot only' : config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 24) : 'Not bound'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Thinking</span>
+                    <strong>{thinkingEnabled ? 'On' : 'Off'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Memory</span>
+                    <strong>{config?.sessionMemoryEnabled ? `${config.sessionMemoryTurns} turns` : 'Off'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Policy</span>
+                    <strong>{getPermissionModeSummary(config?.mode)}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Status</span>
+                    <strong>{streamStatus || 'Ready'}</strong>
+                  </div>
+                </div>
               </div>
             </section>
           )}
@@ -2519,20 +2710,24 @@ function HarnessApp() {
           </div>
         </main>
 
-        <RunConsole
-          plan={plan?.taskPlan}
-          currentStepId={plan?.currentStepId}
-          progress={plan?.stepProgress}
-          phase={plan?.currentPhase}
-          currentTool={plan?.currentTool}
-          streamStatus={streamStatus}
-          traces={traces}
-          approvals={approvals}
-          gitDiff={gitDiff}
-          structuredDiff={currentRunSummary?.structuredDiff ?? structuredDiff}
-          checkpointIds={currentRunSummary?.checkpointIds ?? []}
-          onResolveApproval={resolveApproval}
-        />
+        {showAgentWorkbench && (
+          <RunConsole
+            plan={plan?.taskPlan}
+            currentStepId={plan?.currentStepId}
+            progress={plan?.stepProgress}
+            phase={plan?.currentPhase}
+            currentTool={plan?.currentTool}
+            streamStatus={streamStatus}
+            fallbackPath={plan?.fallbackPath}
+            fallbackReason={plan?.fallbackReason}
+            traces={traces}
+            approvals={approvals}
+            gitDiff={gitDiff}
+            structuredDiff={currentRunSummary?.structuredDiff ?? structuredDiff}
+            checkpointIds={currentRunSummary?.checkpointIds ?? []}
+            onResolveApproval={resolveApproval}
+          />
+        )}
 
         {/* ── Settings Drawer ── */}
         {settingsOpen && (
@@ -2593,43 +2788,7 @@ function HarnessApp() {
                         </select>
                       </div>
                     </div>
-                    <div className="settings-row">
-                      <div className="settings-field">
-                        <label>Execution Profile</label>
-                        <select className="settings-select" value={executionProfileDraft} onChange={e => setExecutionProfileDraft(e.target.value as NonNullable<ConfigState['executionProfile']>)}>
-                          <option value="fast_local">Fast Local</option>
-                          <option value="balanced_local">Balanced Local</option>
-                          <option value="deep_review">Deep Review</option>
-                          <option value="api_frontier">API Frontier</option>
-                        </select>
-                      </div>
-                      <div className="settings-field">
-                        <label>Prompt Profile</label>
-                        <select className="settings-select" value={promptProfileDraft} onChange={e => setPromptProfileDraft(e.target.value)}>
-                          <option value="gemma-local-fast">Gemma Local Fast</option>
-                          <option value="qwen-coder-local">Qwen Coder Local</option>
-                          <option value="deepseek-coder-local">DeepSeek Coder Local</option>
-                          <option value="kimi-api-long-context">Kimi API Long Context</option>
-                          <option value="frontier-mini-api">Frontier Mini API</option>
-                        </select>
-                      </div>
-                    </div>
-                    <div className="settings-field">
-                      <label>Fast Model</label>
-                      <input className="settings-input" value={fastModelDraft} onChange={e => setFastModelDraft(e.target.value)} placeholder="gemma4:e4b" />
-                    </div>
-                    <div className="settings-field">
-                      <label>Coding Model</label>
-                      <input className="settings-input" value={codingModelDraft} onChange={e => setCodingModelDraft(e.target.value)} placeholder="qwen3.5:9b-q4_K_M" />
-                    </div>
-                    <div className="settings-field">
-                      <label>Review Model</label>
-                      <input className="settings-input" value={reviewModelDraft} onChange={e => setReviewModelDraft(e.target.value)} placeholder="VladimirGav/gemma4-26b-16GB-VRAM:latest" />
-                    </div>
-                    <div className="settings-field">
-                      <label>API Model</label>
-                      <input className="settings-input" value={apiModelDraft} onChange={e => setApiModelDraft(e.target.value)} placeholder="optional" />
-                    </div>
+
                     <button className="settings-btn" onClick={() => void saveConfig()} type="button">
                       Save & Apply
                     </button>
@@ -2653,7 +2812,23 @@ function HarnessApp() {
                       </div>
                       <div className="settings-info-row">
                         <span>Lifecycle</span>
-                        <span>{modelRuntime?.supportsLifecycle ? 'Available' : 'Unavailable'}</span>
+                        <span>{modelRuntime?.supportsLifecycle && runtimeLifecyclePolicy ? `Available · preload ${runtimeLifecyclePolicy.preloadKeepAlive} / unload ${formatDurationMs(runtimeLifecyclePolicy.unloadTimeoutMs)}` : 'Unavailable'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Reasoning</span>
+                        <span>{runtimeReasoningSupported === true ? 'Supported' : runtimeReasoningSupported === false ? 'Unavailable' : 'Unknown'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Native Tools</span>
+                        <span>{runtimeNativeToolCallingSupported === true ? 'Supported' : runtimeNativeToolCallingSupported === false ? 'Unavailable' : 'Unknown'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Keep-alive</span>
+                        <span>{runtimeLifecyclePolicy ? `preload ${runtimeLifecyclePolicy.preloadKeepAlive} · unload ${runtimeLifecyclePolicy.unloadKeepAlive === 0 ? '0s' : `${runtimeLifecyclePolicy.unloadKeepAlive}s`}` : 'Unknown'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Chat Timeout</span>
+                        <span>{runtimeLifecyclePolicy ? formatDurationMs(runtimeLifecyclePolicy.chatTimeoutMs) : 'Unknown'}</span>
                       </div>
                       <div className="settings-info-row">
                         <span>Installed</span>
@@ -2679,20 +2854,7 @@ function HarnessApp() {
                         <span>Local Budget Profile</span>
                         <span>{config?.localModelBudgetProfile || 'balanced'}</span>
                       </div>
-                      <div className="settings-info-row">
-                        <span>Execution Profile</span>
-                        <span>{config?.executionProfile || 'balanced_local'}</span>
-                      </div>
-                      <div className="settings-info-row">
-                        <span>Prompt Profile</span>
-                        <span>{config?.promptProfile || 'gemma-local-fast'}</span>
-                      </div>
-                      <div className="settings-info-row">
-                        <span>Router</span>
-                        <span>
-                          fast {config?.fastModel || 'gemma4:e4b'} · code {config?.codingModel || config?.model} · review {config?.reviewModel || config?.model} · api {config?.apiModel || 'off'}
-                        </span>
-                      </div>
+
                       <div className="settings-info-row">
                         <span>Run Budget</span>
                         <span>{config?.localModelBudget ? `${config.localModelBudget.maxModelCallsPerRun} model / ${config.localModelBudget.maxToolCallsPerRun} tool` : 'Unknown'}</span>
@@ -2710,7 +2872,7 @@ function HarnessApp() {
                         <span>{config?.selfCheckEnabled ? 'Required' : 'Disabled'}</span>
                       </div>
                       <div className="settings-info-row">
-                        <span>Command Policy</span>
+                        <span>Policy Mode</span>
                         <span>{getPermissionModeSummary(config?.mode)}</span>
                       </div>
                       <div className="settings-info-row">
@@ -2737,6 +2899,30 @@ function HarnessApp() {
                             {s.title}
                           </button>
                         ))}
+                      </div>
+                    )}
+                    {skillAudit && (
+                      <div className="settings-info" style={{ marginTop: '12px' }}>
+                        <div className="settings-info-row">
+                          <span>Requested</span>
+                          <span>{skillAudit.requested.length}</span>
+                        </div>
+                        <div className="settings-info-row">
+                          <span>Catalog</span>
+                          <span>{skillAudit.catalog.length}</span>
+                        </div>
+                        <div className="settings-info-row">
+                          <span>Active</span>
+                          <span>{session?.skillsActive.length || 0}</span>
+                        </div>
+                        <div className="settings-info-row">
+                          <span>Filtered</span>
+                          <span>{formatSkillAuditEntries(filteredSkillAudit)}</span>
+                        </div>
+                        <div className="settings-info-row">
+                          <span>Missing</span>
+                          <span>{formatSkillAuditEntries(missingSkillAudit)}</span>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -2929,7 +3115,7 @@ function HarnessApp() {
                         <div className="settings-info-row"><span>Mode</span><span>{session.mode}</span></div>
                         <div className="settings-info-row"><span>Last Turn</span><span>{session.turnHistory && session.turnHistory.length > 0 ? session.turnHistory[session.turnHistory.length - 1].executionMode : 'None'}</span></div>
                         <div className="settings-info-row"><span>Turns</span><span>{session.turnHistory?.length || 0}</span></div>
-                        <div className="settings-info-row"><span>Skills</span><span>{session.skillsActive.length || 'None'}</span></div>
+                        <div className="settings-info-row"><span>Skills</span><span>{session.skillAudit ? `${session.skillsActive.length} active / ${session.skillAudit.requested.length} requested` : (session.skillsActive.length || 'None')}</span></div>
                         <div className="settings-info-row"><span>Last Summary</span><span>{summarizeTurnIntent(latestSessionTurn)}</span></div>
                       </div>
                     ) : (
@@ -2975,7 +3161,11 @@ function HarnessApp() {
                         <div className="settings-info-row"><span>Workspace</span><span>{plan.workspaceRoot || config?.workspaceRoot || 'Unknown'}</span></div>
                         <div className="settings-info-row"><span>Source</span><span>{plan.workspaceSource || 'backend'}</span></div>
                         <div className="settings-info-row"><span>Bound</span><span>{plan.workspaceBound === false ? 'No' : 'Yes'}</span></div>
-                        <div className="settings-info-row"><span>Tool Path</span><span>{plan.toolProtocol || 'native'}</span></div>
+                        <div className="settings-info-row"><span>Tool Protocol</span><span>{plan.toolProtocol || 'native'}</span></div>
+                        <div className="settings-info-row"><span>Fallback Path</span><span>{plan.fallbackPath ? formatFallbackPath(plan.fallbackPath) : 'native tools'}</span></div>
+                        {plan.fallbackReason ? (
+                          <div className="settings-info-row"><span>Fallback Reason</span><span>{plan.fallbackReason}</span></div>
+                        ) : null}
                         <div className="settings-info-row"><span>Internet</span><span>{plan.internetAccessEnabled ?? config?.internetAccessEnabled ? 'Enabled' : 'Disabled'}</span></div>
                         <div className="settings-info-row"><span>Context Budget</span><span>{plan.contextBudget ?? config?.contextBudget ?? 'Unknown'}</span></div>
                         <div className="settings-info-row"><span>Retry Budget</span><span>{plan.toolRetryMax ?? config?.toolRetryMax ?? 0}</span></div>

@@ -20,7 +20,12 @@ function asDuration(value: unknown): string | undefined {
 
 export function ToolCallList({ traces, currentTool }: ToolCallListProps) {
   const toolEvents = traces
-    .filter((trace) => trace.type === 'tool_call_started' || trace.type === 'tool_call_completed' || trace.type === 'verification_started' || trace.type === 'verification_completed')
+    .filter((trace) =>
+      trace.type === 'tool_call_started' ||
+      trace.type === 'tool_call_completed' ||
+      trace.type === 'command_policy_checked' ||
+      trace.type === 'verification_started' ||
+      trace.type === 'verification_completed')
     .slice(-10)
     .reverse();
 
@@ -37,9 +42,9 @@ export function ToolCallList({ traces, currentTool }: ToolCallListProps) {
           {toolEvents.map((trace, index) => {
             const data = getTraceData(trace);
             const ok = data.success === true;
-            const failed = data.success === false;
+            const failed = data.success === false || data.status === 'denied' || data.status === 'rejected' || data.status === 'failed';
             const title = asText(data.tool) || asText(data.command) || 'verification';
-            const body = asText(data.inputSummary) || asText(data.outputPreview) || 'Running.';
+            const body = asText(data.inputSummary) || asText(data.outputPreview) || asText(data.reason) || asText(data.status) || 'Running.';
             const duration = asDuration(data.durationMs);
             return (
               <div key={`${trace.timestamp}-${trace.type}-${index}`} className={`tool-call-row ${ok ? 'tool-call-row-ok' : failed ? 'tool-call-row-failed' : ''}`}>

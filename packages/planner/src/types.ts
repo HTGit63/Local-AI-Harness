@@ -1,9 +1,24 @@
 import type { TaskComplexity, TaskPlan } from '@local-harness/task-orchestrator';
 
+export type SkillAuditStatus = 'available' | 'filtered' | 'missing';
+
+export interface SkillAuditRecord {
+  slug: string;
+  status: SkillAuditStatus;
+  reason: string;
+}
+
+export interface SkillAuditState {
+  requested: string[];
+  catalog: string[];
+  records: SkillAuditRecord[];
+}
+
 export interface PlanState {
   taskSummary: string;
   currentPhase: string;
   activeSkills: string[];
+  skillAudit?: SkillAuditState;
   intendedNextAction: string;
   blockers: string[];
   isComplete: boolean;
@@ -20,6 +35,9 @@ export interface PlanState {
   selfCheckEnabled?: boolean;
   executionProfile?: string;
   promptProfile?: string;
+  fallbackPath?: string;
+  fallbackReason?: string;
+  fallbackCount?: number;
   lastStatus?: string;
   currentRunId?: string;
   currentTool?: string;

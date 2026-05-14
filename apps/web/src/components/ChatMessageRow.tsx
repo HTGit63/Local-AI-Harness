@@ -31,6 +31,23 @@ export interface ChatMessageRowData {
   runSteps?: AgentRunStepData[];
 }
 
+function formatFallbackPath(path?: string): string {
+  switch (path) {
+    case 'native_tools':
+      return 'native tools';
+    case 'native_retry':
+      return 'native retry';
+    case 'manual_fallback':
+      return 'manual fallback';
+    case 'manual_repair':
+      return 'manual repair';
+    case 'final_noop_warning':
+      return 'final no-op warning';
+    default:
+      return 'native tools';
+  }
+}
+
 function splitAssistantContent(content: string): Array<{ kind: 'content' | 'thought'; value: string }> {
   return content
     .split(/(<think>[\s\S]*?(?:<\/think>|$))/gi)
@@ -57,12 +74,26 @@ function buildHonestFallback(message: ChatMessageRowData): string {
     return message.runSummary.summary;
   }
 
-  const finishedTools = message.toolEvents.filter((event) => event.state === 'done');
-  if (finishedTools.length === 0) {
-    return '';
+  const labels: string[] = [];
+  if (message.runSummary?.toolProtocol) {
+    labels.push(`Tool protocol: ${message.runSummary.toolProtocol}`);
+  }
+  if (message.runSummary?.fallbackPath) {
+    labels.push(`Fallback path: ${formatFallbackPath(message.runSummary.fallbackPath)}`);
+  }
+  if (message.runSummary?.fallbackReason) {
+    labels.push(message.runSummary.fallbackReason);
   }
 
-  return `Inspected tool activity only. Completed ${finishedTools.length} tool step${finishedTools.length === 1 ? '' : 's'}, but model did not return final narrative answer.`;
+  const finishedTools = message.toolEvents.filter((event) => event.state === 'done');
+  if (finishedTools.length === 0) {
+    return labels.join(' · ');
+  }
+
+  return [
+    `Inspected tool activity only. Completed ${finishedTools.length} tool step${finishedTools.length === 1 ? '' : 's'}, but model did not return final narrative answer.`,
+    labels.join(' · '),
+  ].filter(Boolean).join(' ');
 }
 
 function formatTime(timestamp: number): string {

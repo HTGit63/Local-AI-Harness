@@ -38,10 +38,16 @@ export interface ToolSearchRecord {
   pattern?: string;
 }
 
+export type ToolCommandStatus = 'executed' | 'denied' | 'rejected' | 'failed';
+
 export interface ToolCommandRecord {
   command: string;
   success: boolean;
   durationMs?: number;
+  status?: ToolCommandStatus;
+  reason?: string;
+  policyMode?: string;
+  approvalRequired?: boolean;
 }
 
 export interface ToolWebSearchRecord {
@@ -97,6 +103,7 @@ export interface ToolApprovalRequest {
 export interface ToolActionContext {
   cwd: string;
   internetAccessEnabled?: boolean;
+  policyMode?: string;
   emitTrace: (type: string, data: unknown) => void;
   checkPolicy: (action: 'read' | 'write' | 'delete' | 'execute', target?: string) => {
     allowed: boolean;

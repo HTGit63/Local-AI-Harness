@@ -20,6 +20,13 @@ function assertLeanThinkingControl(value: unknown) {
   assert.ok(value === false || value === 'low', `Expected lean thinking control, got: ${String(value)}`);
 }
 
+function getLatestAgenticRunSummary(engine: CoreEngine) {
+  return [...(engine.getSession()?.turnHistory || [])]
+    .reverse()
+    .find((turn) => turn.executionMode === 'agentic')
+    ?.runSummary;
+}
+
 async function testConfigDefaults() {
   const engine = new CoreEngine();
   const config = engine.getPublicConfig();
@@ -165,6 +172,10 @@ async function testModelAdapter() {
     assert.strictEqual(runtimeBefore.activeModel, null);
     assert.ok(runtimeBefore.installedModels.includes('qwen3.5:9b-q4_K_M'));
     assert.deepStrictEqual(runtimeBefore.configuredModelCapabilities, MOCK_MODEL_CAPABILITIES['gemma4:e4b']);
+    assert.strictEqual(runtimeBefore.reasoningSupported, true);
+    assert.strictEqual(runtimeBefore.nativeToolCallingSupported, true);
+    assert.strictEqual(runtimeBefore.lifecyclePolicy.preloadKeepAlive, '2m');
+    assert.strictEqual(runtimeBefore.lifecyclePolicy.unloadKeepAlive, 0);
 
     const switchResult = await adapter.activateModel('qwen3.5:9b-q4_K_M', 'gemma4:e4b');
     assert.strictEqual(switchResult.activeModel, 'qwen3.5:9b-q4_K_M');
@@ -173,6 +184,7 @@ async function testModelAdapter() {
     const runtimeAfter = await adapter.getRuntimeState();
     assert.strictEqual(runtimeAfter.activeModel, 'qwen3.5:9b-q4_K_M');
     assert.strictEqual(runtimeAfter.lastSwitchResult?.requestedModel, 'qwen3.5:9b-q4_K_M');
+    assert.strictEqual(runtimeAfter.lifecyclePolicy.chatTimeoutMs >= 180_000, true);
     assert.strictEqual(PROFILES.fast.max_tokens, 512);
   } finally {
     globalThis.fetch = originalFetch;
@@ -226,12 +238,45 @@ async function testEnginePromptRecipeSelection() {
 }
 
 async function testEngineSanitizesDisabledSkills() {
-  const engine = new CoreEngine();
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-skill-sanitize-'));
+  const sessionDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-skill-sanitize-store-'));
+  const engine = new CoreEngine({ workspaceRoot, sessionDataDir });
   const session = engine.startSession(['caveman', 'patch-surgeon', 'patch-surgeon']);
   assert.deepStrictEqual(session.skillsActive, ['patch-surgeon']);
+  assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'caveman')?.status, 'filtered');
+  assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'caveman')?.reason, 'disabled by harness policy');
+  assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'patch-surgeon')?.status, 'available');
 
   const updated = await engine.updateSessionSkills(['caveman', 'repo-cartographer']);
   assert.deepStrictEqual(updated.skillsActive, ['repo-cartographer']);
+  assert.strictEqual(updated.skillAudit?.records.find((entry) => entry.slug === 'repo-cartographer')?.status, 'available');
+
+  await fs.rm(workspaceRoot, { recursive: true, force: true });
+  await fs.rm(sessionDataDir, { recursive: true, force: true });
+}
+
+async function testEngineTracksSkillAudit() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-skill-audit-'));
+  const sessionDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-skill-audit-store-'));
+  const availableSkills = ['patch-surgeon', 'repo-cartographer'];
+  const engine = new CoreEngine({ workspaceRoot, sessionDataDir });
+  const session = engine.startSession(['caveman', 'patch-surgeon', 'ghost-skill'], availableSkills);
+
+  assert.deepStrictEqual(session.skillsActive, ['patch-surgeon']);
+  assert.deepStrictEqual(session.skillAudit?.requested, ['caveman', 'patch-surgeon', 'ghost-skill']);
+  assert.deepStrictEqual(session.skillAudit?.catalog, availableSkills);
+  assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'caveman')?.status, 'filtered');
+  assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'ghost-skill')?.status, 'missing');
+  assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'ghost-skill')?.reason, 'not present in curated skill catalog');
+
+  const resumedEngine = new CoreEngine({ workspaceRoot, sessionDataDir });
+  const resumed = await resumedEngine.resumeSession(session.id, availableSkills);
+  assert.deepStrictEqual(resumed?.skillsActive, ['patch-surgeon']);
+  assert.strictEqual(resumed?.skillAudit?.records.find((entry) => entry.slug === 'caveman')?.status, 'filtered');
+  assert.strictEqual(resumed?.skillAudit?.records.find((entry) => entry.slug === 'ghost-skill')?.status, 'missing');
+
+  await fs.rm(workspaceRoot, { recursive: true, force: true });
+  await fs.rm(sessionDataDir, { recursive: true, force: true });
 }
 
 async function testEngineChatStream() {
@@ -658,6 +703,10 @@ async function testEngineKeepsNativeToolsWhenCapabilitiesOmitTools() {
     assert.ok(chatRequests[0].tools.length > 0);
     assert.ok(!JSON.stringify(chatRequests[0].messages).includes('Use exactly one JSON tool action at a time.'));
     assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'manual_tool_fallback'));
+    const runSummary = getLatestAgenticRunSummary(engine);
+    assert.strictEqual(runSummary?.toolProtocol, 'native');
+    assert.strictEqual(runSummary?.fallbackPath, 'native_tools');
+    assert.strictEqual(runSummary?.usedManualFallback, false);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -722,6 +771,9 @@ async function testEngineRecoversFromPlanningOnlyNativeReply() {
     assert.ok(chatRequests.some((body) => Array.isArray(body.tools) && body.tools.length > 0));
     assert.ok(chatRequests.some((body) => JSON.stringify(body.messages).includes('Planning-only text is not enough.')));
     assert.ok(engine.getTraceLog().some((entry) => entry.type === 'native_tool_retry_requested'));
+    const runSummary = getLatestAgenticRunSummary(engine);
+    assert.strictEqual(runSummary?.toolProtocol, 'native');
+    assert.strictEqual(runSummary?.fallbackPath, 'native_retry');
   } finally {
     globalThis.fetch = originalFetch;
     await fs.rm(workspaceRoot, { recursive: true, force: true });
@@ -767,6 +819,12 @@ async function testEngineUsesManualToolProtocolWhenModelLacksNativeTools() {
       JSON.stringify(chatRequests[0].messages).includes('Use exactly one JSON tool action at a time.'),
     );
     assertLeanThinkingControl(chatRequests[0].think ?? chatRequests[0].reasoning_effort);
+    const runSummary = getLatestAgenticRunSummary(engine);
+    assert.strictEqual(runSummary?.toolProtocol, 'manual');
+    assert.strictEqual(runSummary?.fallbackPath, 'manual_fallback');
+    assert.ok(runSummary?.usedManualFallback);
+    assert.ok((runSummary?.fallbackReason || '').includes('native tools'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'manual_tool_fallback'));
   } finally {
     globalThis.fetch = originalFetch;
     await fs.rm(workspaceRoot, { recursive: true, force: true });
@@ -1412,6 +1470,117 @@ async function testEngineCompactsLargeToolOutputsForModel() {
   }
 }
 
+async function testEngineSelectsInternetToolsOnlyForExplicitWebIntent() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Tool selection inspected.' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ internetAccessEnabled: true });
+    await engine.chat([
+      { role: 'user', content: 'Find TODO text in src/index.ts.' },
+    ]);
+    await engine.chat([
+      { role: 'user', content: 'Look up the latest TypeScript release notes online.' },
+    ]);
+
+    assert.ok(chatRequests.length >= 2);
+    const localToolNames = (chatRequests[0].tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name);
+    const webToolNames = (chatRequests[1].tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name);
+    assert.ok(localToolNames.includes('searchText'));
+    assert.ok(!localToolNames.includes('webSearch'));
+    assert.ok(webToolNames.includes('webSearch'));
+    assert.ok(!webToolNames.includes('fetchUrl'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testEngineRecordsDeniedCommandEventContract() {
+  const originalFetch = globalThis.fetch;
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-command-contract-'));
+  const streamedTraces: Array<{ type: string; data: any }> = [];
+
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({ name: 'command-contract-test' }), 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    chatResponder(body) {
+      if (body.messages?.some((message: { role?: string }) => message.role === 'tool')) {
+        return {
+          id: 'mock-command-final',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: 'Unsafe command was blocked and reported.' },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+        };
+      }
+
+      return {
+        id: 'mock-command-tool-call',
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+              function: {
+                name: 'runCommand',
+                arguments: JSON.stringify({ command: 'npm test && rm -rf .' }),
+              },
+            }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot });
+    const response = await engine.chatStream(
+      [{ role: 'user', content: 'Run npm test and report command safety.' }],
+      {
+        onTrace: (event) => streamedTraces.push({ type: event.type, data: event.data }),
+      },
+    );
+
+    assert.ok(response.includes('Unsafe command was blocked and reported.'));
+    const policyTrace = engine.getTraceLog().find((entry) => entry.type === 'command_policy_checked');
+    assert.ok(policyTrace);
+    assert.deepStrictEqual(
+      Object.keys(policyTrace?.data as Record<string, unknown>).sort(),
+      ['allowed', 'approvalRequired', 'command', 'policyMode', 'reason', 'shellOperatorsAllowed', 'status', 'workspaceRoot'].sort(),
+    );
+    assert.strictEqual((policyTrace?.data as { command?: string }).command, 'npm test && rm -rf .');
+    assert.strictEqual((policyTrace?.data as { status?: string }).status, 'denied');
+    assert.ok(streamedTraces.some((entry) => entry.type === 'command_policy_checked'));
+
+    const runSummary = getLatestAgenticRunSummary(engine);
+    assert.strictEqual(runSummary?.commands.length, 1);
+    assert.strictEqual(runSummary?.commands[0].success, false);
+    assert.strictEqual(runSummary?.commands[0].status, 'denied');
+    assert.strictEqual(runSummary?.commands[0].approvalRequired, true);
+    assert.ok(runSummary?.summary?.includes('attempted 1 command'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function run() {
   await testConfigDefaults();
   testPromptRecipes();
@@ -1423,6 +1592,7 @@ async function run() {
   await testModelAdapterPrefersNativeOllamaChat();
   await testEnginePromptRecipeSelection();
   await testEngineSanitizesDisabledSkills();
+  await testEngineTracksSkillAudit();
   await testEngineChatStream();
   await testEngineChatStreamEmitsToolEvents();
   await testEngineRecordsExecutionModes();
@@ -1453,6 +1623,8 @@ async function run() {
   await testEngineContinuesTruncatedResponses();
   await testDirectChatCompactsConversationHistory();
   await testEngineCompactsLargeToolOutputsForModel();
+  await testEngineSelectsInternetToolsOnlyForExplicitWebIntent();
+  await testEngineRecordsDeniedCommandEventContract();
   console.log('unit tests passed');
 }
 

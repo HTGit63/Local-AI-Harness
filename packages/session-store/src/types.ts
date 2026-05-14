@@ -1,6 +1,12 @@
 export type PolicyMode = 'read-only' | 'workspace-write' | 'danger';
 
 export type AgentRunExecutionMode = 'direct' | 'agentic';
+export type AgentFallbackPath =
+  | 'native_tools'
+  | 'native_retry'
+  | 'manual_fallback'
+  | 'manual_repair'
+  | 'final_noop_warning';
 export type AgentWorkspaceSource = 'backend' | 'browser_snapshot';
 export type AgentRunStepStatus = 'running' | 'done' | 'error' | 'skipped';
 export type AgentRunStepType =
@@ -68,6 +74,10 @@ export interface AgentRunCommand {
   command: string;
   success: boolean;
   durationMs?: number;
+  status?: 'executed' | 'denied' | 'rejected' | 'failed';
+  reason?: string;
+  policyMode?: string;
+  approvalRequired?: boolean;
 }
 
 export interface AgentRunApproval {
@@ -119,12 +129,14 @@ export interface AgentRun {
   workspaceRoot: string;
   workspaceSource: AgentWorkspaceSource;
   model: string;
+  toolProtocol?: 'native' | 'manual';
   promptMode: string;
   intent: string;
   browserContextActive: boolean;
   workspaceBound: boolean;
   usedNativeTools: boolean;
   usedManualFallback: boolean;
+  fallbackPath?: AgentFallbackPath;
   fallbackReason?: string;
   steps: AgentRunStep[];
   filesRead: string[];
@@ -162,6 +174,20 @@ export interface SessionTurnMetadata {
   runSummary?: AgentRun;
 }
 
+export type SkillAuditStatus = 'available' | 'filtered' | 'missing';
+
+export interface SkillAuditRecord {
+  slug: string;
+  status: SkillAuditStatus;
+  reason: string;
+}
+
+export interface SkillAuditState {
+  requested: string[];
+  catalog: string[];
+  records: SkillAuditRecord[];
+}
+
 export interface SessionMetadata {
   id: string;
   createdAt: number;
@@ -170,6 +196,7 @@ export interface SessionMetadata {
   mode: PolicyMode;
   cwd: string;
   skillsActive: string[];
+  skillAudit?: SkillAuditState;
   toolsAllowlist: string[];
   turnHistory?: SessionTurnMetadata[];
 }

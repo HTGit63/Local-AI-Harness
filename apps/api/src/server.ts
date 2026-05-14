@@ -59,6 +59,7 @@ const engine = new CoreEngine({
   workspaceRoot: WORKSPACE_ROOT,
 });
 let modelRuntimeCache: { value: ModelRuntimeState; expiresAt: number } | null = null;
+let skillsCatalogPromise: Promise<Array<{ slug: string }>> | null = null;
 
 async function getCachedModelRuntime(force = false): Promise<ModelRuntimeState> {
   const now = Date.now();
@@ -162,10 +163,18 @@ async function readBody(req: http.IncomingMessage): Promise<Record<string, unkno
 async function loadSkills() {
   try {
     const raw = await fs.readFile(SKILLS_PATH, 'utf8');
-    return JSON.parse(raw);
+    return JSON.parse(raw) as Array<{ slug: string }>;
   } catch {
     return [];
   }
+}
+
+async function getSkillsCatalog(): Promise<Array<{ slug: string }>> {
+  if (!skillsCatalogPromise) {
+    skillsCatalogPromise = loadSkills();
+  }
+
+  return skillsCatalogPromise;
 }
 
 function getQueryValue(url: URL, key: string, fallback = ''): string {
@@ -481,9 +490,7 @@ const server = http.createServer(async (req, res) => {
       const validModes = new Set(['read-only', 'workspace-write', 'danger']);
       const validProfiles = new Set(['fast', 'balanced', 'deep']);
       const validBudgetProfiles = new Set(['lean', 'balanced', 'deep']);
-      const validExecutionProfiles = new Set(['fast_local', 'balanced_local', 'deep_review', 'api_frontier']);
-      const validProviderProfiles = new Set(['ollama_local', 'openai_compatible', 'openrouter', 'together', 'groq', 'qwen_api', 'kimi_api']);
-      const validPromptProfiles = new Set(['gemma-local-fast', 'qwen-coder-local', 'deepseek-coder-local', 'kimi-api-long-context', 'frontier-mini-api']);
+
       if (body.baseUrl !== undefined && typeof body.baseUrl !== 'string') {
         sendBadRequest(req, res, 'baseUrl must be a string.');
         return;
@@ -512,24 +519,7 @@ const server = http.createServer(async (req, res) => {
         sendBadRequest(req, res, 'localModelBudgetProfile must be one of lean, balanced, or deep.');
         return;
       }
-      if (body.executionProfile !== undefined && (typeof body.executionProfile !== 'string' || !validExecutionProfiles.has(body.executionProfile))) {
-        sendBadRequest(req, res, 'executionProfile must be one of fast_local, balanced_local, deep_review, or api_frontier.');
-        return;
-      }
-      if (body.providerProfile !== undefined && (typeof body.providerProfile !== 'string' || !validProviderProfiles.has(body.providerProfile))) {
-        sendBadRequest(req, res, 'providerProfile is not supported.');
-        return;
-      }
-      if (body.promptProfile !== undefined && (typeof body.promptProfile !== 'string' || !validPromptProfiles.has(body.promptProfile))) {
-        sendBadRequest(req, res, 'promptProfile is not supported.');
-        return;
-      }
-      for (const key of ['fastModel', 'codingModel', 'reviewModel', 'apiModel']) {
-        if (body[key] !== undefined && typeof body[key] !== 'string') {
-          sendBadRequest(req, res, `${key} must be a string.`);
-          return;
-        }
-      }
+
       if (body.internetAccessEnabled !== undefined && typeof body.internetAccessEnabled !== 'boolean') {
         sendBadRequest(req, res, 'internetAccessEnabled must be a boolean.');
         return;
@@ -604,7 +594,8 @@ const server = http.createServer(async (req, res) => {
     if (requestUrl.pathname === '/api/session' && method === 'POST') {
       const body = await readBody(req);
       const skills = Array.isArray(body.skills) ? body.skills.filter((skill): skill is string => typeof skill === 'string') : [];
-      const session = engine.startSession(skills);
+      const skillCatalog = await getSkillsCatalog();
+      const session = engine.startSession(skills, skillCatalog.map((skill) => skill.slug).filter((slug): slug is string => typeof slug === 'string' && slug.length > 0));
       sendJson(req, res, 201, session);
       return;
     }
@@ -621,7 +612,8 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname.startsWith('/api/session/') && requestUrl.pathname.endsWith('/resume') && method === 'POST') {
       const sessionId = requestUrl.pathname.split('/')[3];
-      const session = await engine.resumeSession(sessionId);
+      const skillCatalog = await getSkillsCatalog();
+      const session = await engine.resumeSession(sessionId, skillCatalog.map((skill) => skill.slug).filter((slug): slug is string => typeof slug === 'string' && slug.length > 0));
       sendJson(req, res, session ? 200 : 404, session || { error: 'Session not found.' });
       return;
     }
@@ -634,7 +626,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (requestUrl.pathname === '/api/skills' && method === 'GET') {
-      sendJson(req, res, 200, await loadSkills());
+      sendJson(req, res, 200, await getSkillsCatalog());
       return;
     }
 

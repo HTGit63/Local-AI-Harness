@@ -3,7 +3,7 @@
 > Generated on 2026-04-19 for **HTGit63/Local-AI-Harness**.
 > Purpose: make the current harness converge into a trustworthy local coding operator centered on Gemma 4 E4B and Qwen 3.5 9B class models, without rewriting the TypeScript architecture.
 
-# 0. 2026-04-23 completion ledger
+# 0. 2026-05-13 completion ledger
 
 - `TASK-01 [done]` Workspace/mode/runtime truth now converges better through shared engine state, planner runtime context, session continuity state, and visible workspace-bound vs snapshot-only surfaces.
 - `TASK-02 [done]` Small-model agent loop now carries qwe-qwe-style long-run mechanisms: truncated-response continuation, bounded loop compaction, and compacted tool-result reinjection instead of uncontrolled context growth.
@@ -12,9 +12,9 @@
 - `TASK-05 [done]` Agent progress presentation is stronger: main web surface now shows live phase, next action, current tool, recent run steps, and recent trace without forcing the user into the settings drawer.
 - `TASK-06 [done]` Osaurus-inspired web refresh landed in lightweight form: cleaner command-center shell, stronger ambient layout, improved direct/agent posture cards, and no extra heavy runtime dependencies.
 - `TASK-07 [done]` Long-session stability improved through conversation compaction, loop compaction, and large tool-output truncation for model context, which reduces local RAM/context pressure during extended work.
-- `TASK-08 [done]` CLI visibility improved: active tool start/done events and run-summary heartbeat now print inline during long runs instead of waiting for the final answer.
-- `TASK-09 [done]` Regression coverage added for continuation recovery, direct-chat conversation compaction, and large tool-output compaction in unit tests; full repo test sweep passes.
-- `TASK-10 [done]` External-reference intent now maps to concrete repo changes instead of notes only: qwe-qwe informed continuation/compaction; Osaurus informed main-shell/live-activity UI posture; Codex docs informed explicit approval/runtime/status visibility.
+- `TASK-08 [done]` Internet/retrieval/context discipline is now explicit: web tools are selected only for real web intent or URLs, context packs carry budget telemetry, repo summaries stay compact, and tests cover no-web-by-default vs explicit-web selection.
+- `TASK-09 [done]` Command safety is now durable and visible: command policy checks emit `command_policy_checked`, denied/rejected/failed commands persist in run summaries, UI shows command status/reason, and workspace confinement still blocks escape before approval.
+- `TASK-10 [done]` Realism/event-contract closure added: adversarial command-denial flow asserts exact trace payload keys, stream delivery, persisted run-summary fields, context-pack budget limits, and full build/test evidence.
 
 # 0.1 2026-04-28 smart-agent tool ledger
 
@@ -25,12 +25,14 @@
 - `TASK-15 [done]` Model routing foundation added: execution profiles, provider profile labels, prompt profiles, fast/code/review/API model slots, route selection traces, and model-per-purpose calls for direct/code/summarize paths.
 - `TASK-16 [done]` Regression coverage added for deterministic repo tools, AST edits, import graph, targeted test selection, command detection, checkpoint rollback, and full `npm test` passes.
 
-Status: complete as of 2026-04-30; all checklist items in sections 0 and 0.1 are marked [done].
+Status: complete as of 2026-05-13; all checklist items in sections 0 and 0.1 are marked [done].
 
 Implementation audit note:
 - `qwe-qwe` mechanisms selectively ported: response continuation, context compaction mindset, bounded retry/continuation loop, compacted tool reinjection.
 - `osaurus` ideas selectively ported: clearer direct-vs-agent posture, stronger live command-center framing, better visible session/activity shell.
 - Official Codex docs influence applied selectively: explicit runtime/status surfaces, approval/state clarity, local-first constraints preserved.
+- Cleanup completed: stale untracked `docs/recovery-note.md` was removed because it described rollback/removal goals that conflict with the current implemented smart-agent/tooling state.
+- Final audit evidence: `npm run build:packages`, `node --import tsx tests/unit/core.test.ts`, `node --import tsx tests/integration/workflow.test.ts`, `npm run build:apps`, and full `npm test` passed during the TASK-08/09/10 closure pass.
 - Manual-only residual remains: live Ollama smoke with the operator’s preferred Gemma/Qwen models on this exact machine is still recommended after code/test completion.
 
 # 1. Core contract
@@ -666,6 +668,10 @@ This task sits in position 7 because it directly resolves one or more of the aud
 
 **Problems addressed:** P-002, P-014, P-015, P-028, P-032, P-035
 
+**Completion status:** Done as of 2026-05-13. The runtime now keeps web tools out of normal workspace turns, selects `webSearch` only for explicit web intent, selects `fetchUrl` only when a URL is present, and keeps context-pack behavior budgeted and test-covered.
+
+**Evidence:** `packages/core/src/engine.ts`, `tests/unit/core.test.ts`, `tests/integration/workflow.test.ts`, and the full `npm test` sweep.
+
 **Primary files:**
 
 - packages/core/src/engine.ts
@@ -731,6 +737,10 @@ This task sits in position 8 because it directly resolves one or more of the aud
 
 **Problems addressed:** P-001, P-018, P-022, P-026, P-036
 
+**Completion status:** Done as of 2026-05-13. Command execution now emits a stable `command_policy_checked` event before approval/execution, persists denied/rejected/failed command status into run summaries, and renders command status/reason in the web run console instead of hiding blocked actions.
+
+**Evidence:** `packages/tool-runtime/src/registry.ts`, `packages/session-store/src/types.ts`, `packages/core/src/agent-run.ts`, `apps/web/src/app/HarnessApp.tsx`, `apps/web/src/components/AgentRunSummary.tsx`, `apps/web/src/components/run-console/ToolCallList.tsx`, and regression tests.
+
 **Primary files:**
 
 - packages/tool-runtime/src/registry.ts
@@ -793,6 +803,10 @@ This task sits in position 9 because it directly resolves one or more of the aud
 ## TASK-10 — Close the realism gap with better traces, event contracts, and adversarial tests
 
 **Problems addressed:** P-023, P-024, P-030, P-033, P-034
+
+**Completion status:** Done as of 2026-05-13. The adversarial command-denial path now asserts exact trace payload keys, stream delivery, persisted run-summary command metadata, web/no-web tool-selection behavior, and context-pack budget limits.
+
+**Evidence:** `tests/unit/core.test.ts`, `tests/integration/workflow.test.ts`, `npm run build:packages`, `npm run build:apps`, `npm test`, and the final security scan report generated during closure.
 
 **Primary files:**
 

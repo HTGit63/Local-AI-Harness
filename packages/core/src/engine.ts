@@ -8,7 +8,7 @@ import { ModelAdapter, ModelRuntimeState } from '@local-harness/model-adapter';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
 import { RepoIndexer, ProjectContext, TaskContext } from '@local-harness/repo-indexer';
-import { AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
+import { AgentFallbackPath, AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
 import { LOCAL_MODEL_BUDGET_PROFILES, LocalModelBudgetProfile, TaskOrchestrator, TaskPlan, TaskStep } from '@local-harness/task-orchestrator';
 import { ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
@@ -71,10 +71,15 @@ type ManualToolDecision =
   | { kind: 'final'; content: string };
 type ImmediateChatAnswer = { content: string; action: string; source: string };
 type ToolProtocolMode = 'native' | 'manual_preferred' | 'manual_fallback';
-type ExecutionProfile = 'fast_local' | 'balanced_local' | 'deep_review' | 'api_frontier';
-type ProviderProfile = 'ollama_local' | 'openai_compatible' | 'openrouter' | 'together' | 'groq' | 'qwen_api' | 'kimi_api';
-type PromptProfile = 'gemma-local-fast' | 'qwen-coder-local' | 'deepseek-coder-local' | 'kimi-api-long-context' | 'frontier-mini-api';
-type ModelRoutePurpose = 'classify' | 'direct' | 'inspect' | 'code' | 'summarize' | 'review';
+type SessionSkillAuditState = NonNullable<SessionMetadata['skillAudit']>;
+type SkillAuditRecord = SessionSkillAuditState['records'][number];
+
+interface SkillSelectionResult {
+  requested: string[];
+  active: string[];
+  audit: SessionSkillAuditState;
+}
+
 type BootstrapPlanStep =
   | { type: 'inventory'; title: string }
   | { type: 'tool'; title: string; toolName: SupportedTool; args: Record<string, unknown> };
@@ -203,13 +208,6 @@ export interface EngineConfig {
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
   localModelBudgetProfile: LocalModelBudgetProfileName;
-  executionProfile: ExecutionProfile;
-  providerProfile: ProviderProfile;
-  promptProfile: PromptProfile;
-  fastModel: string;
-  codingModel: string;
-  reviewModel: string;
-  apiModel: string;
 }
 
 export interface PublicEngineConfig {
@@ -228,13 +226,6 @@ export interface PublicEngineConfig {
   selfCheckEnabled: boolean;
   localModelBudgetProfile: LocalModelBudgetProfileName;
   localModelBudget: LocalModelBudgetProfile;
-  executionProfile: ExecutionProfile;
-  providerProfile: ProviderProfile;
-  promptProfile: PromptProfile;
-  fastModel: string;
-  codingModel: string;
-  reviewModel: string;
-  apiModel: string;
 }
 
 export interface UpdateConfigOptions {
@@ -257,13 +248,6 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   sessionMemoryTurns: Number(process.env.HARNESS_SESSION_MEMORY_TURNS || 3),
   selfCheckEnabled: process.env.HARNESS_SELF_CHECK !== '0',
   localModelBudgetProfile: (process.env.HARNESS_LOCAL_MODEL_BUDGET_PROFILE as LocalModelBudgetProfileName) || 'balanced',
-  executionProfile: (process.env.HARNESS_EXECUTION_PROFILE as ExecutionProfile) || 'balanced_local',
-  providerProfile: (process.env.HARNESS_PROVIDER_PROFILE as ProviderProfile) || 'ollama_local',
-  promptProfile: (process.env.HARNESS_PROMPT_PROFILE as PromptProfile) || 'gemma-local-fast',
-  fastModel: process.env.HARNESS_FAST_MODEL || 'gemma4:e4b',
-  codingModel: process.env.HARNESS_CODING_MODEL || process.env.HARNESS_MODEL || 'qwen3.5:9b-q4_K_M',
-  reviewModel: process.env.HARNESS_REVIEW_MODEL || 'VladimirGav/gemma4-26b-16GB-VRAM:latest',
-  apiModel: process.env.HARNESS_API_MODEL || '',
 };
 
 function resolveSessionDataDir(workspaceRoot: string, sessionDataDir: string): string {
@@ -363,12 +347,67 @@ function mergeSkills(base: string[], additional: string[]): string[] {
   return Array.from(new Set([...base, ...additional]));
 }
 
-function sanitizeActiveSkills(skills: string[]): string[] {
-  return Array.from(new Set(
+function normalizeSkillSlug(skill: string): string {
+  return skill.trim();
+}
+
+function resolveSkillSelection(skills: string[], availableSkills: string[] = []): SkillSelectionResult {
+  const requested = Array.from(new Set(
     skills
-      .map((skill) => skill.trim())
-      .filter((skill) => skill.length > 0 && !DISABLED_SKILL_SLUGS.has(skill)),
+      .map(normalizeSkillSlug)
+      .filter((skill) => skill.length > 0),
   ));
+  const catalog = Array.from(new Set(
+    availableSkills
+      .map(normalizeSkillSlug)
+      .filter((skill) => skill.length > 0),
+  ));
+  const catalogSet = new Set(catalog);
+  const records: SkillAuditRecord[] = [];
+  const active: string[] = [];
+
+  for (const skill of requested) {
+    if (DISABLED_SKILL_SLUGS.has(skill)) {
+      records.push({
+        slug: skill,
+        status: 'filtered',
+        reason: 'disabled by harness policy',
+      });
+      continue;
+    }
+
+    if (catalog.length > 0 && !catalogSet.has(skill)) {
+      records.push({
+        slug: skill,
+        status: 'missing',
+        reason: 'not present in curated skill catalog',
+      });
+      continue;
+    }
+
+    records.push({
+      slug: skill,
+      status: 'available',
+      reason: catalog.length > 0
+        ? 'present in curated skill catalog'
+        : 'skill catalog unavailable; keeping requested skill',
+    });
+    active.push(skill);
+  }
+
+  return {
+    requested,
+    active,
+    audit: {
+      requested,
+      catalog,
+      records,
+    },
+  };
+}
+
+function sanitizeActiveSkills(skills: string[], availableSkills: string[] = []): string[] {
+  return resolveSkillSelection(skills, availableSkills).active;
 }
 
 function getRequiredStringArg(args: Record<string, unknown>, key: string, toolName: SupportedTool): string {
@@ -567,10 +606,17 @@ const STREAM_TASK_TRACE_TYPES = new Set([
   'task_checkpoint_saved',
   'task_budget_exceeded',
   'task_plan_completed',
+  'command_policy_checked',
   'tool_call_started',
   'tool_call_completed',
   'verification_started',
   'verification_completed',
+  'manual_tool_fallback',
+  'manual_tool_strategy_selected',
+  'native_tool_retry_requested',
+  'manual_tool_repair',
+  'final_noop_warning',
+  'tool_simulation_detected',
 ]);
 
 function truncateStreamPreview(value: string): string {
@@ -723,21 +769,7 @@ function buildStepScopedPrompt(taskPlan: TaskPlan, currentStep: TaskStep | null,
   ].join('\n\n');
 }
 
-function promptProfileInstruction(profile: PromptProfile): string {
-  switch (profile) {
-    case 'qwen-coder-local':
-      return 'Local Qwen coder profile: use deterministic tools first, keep patches small, prefer AST edit tools, get structured diff, run selected tests, return one tool call or one concise final answer.';
-    case 'deepseek-coder-local':
-      return 'Local DeepSeek coder profile: inspect exact code before edits, avoid broad rewrites, use checkpoint, structured diff, and targeted verification.';
-    case 'kimi-api-long-context':
-      return 'Kimi long-context profile: synthesize compact file cards before reading long files, keep citations to file paths and line ranges.';
-    case 'frontier-mini-api':
-      return 'Frontier mini profile: plan briefly, execute with tools, verify targeted tests, summarize exact diff hunks.';
-    case 'gemma-local-fast':
-    default:
-      return 'Local Gemma fast profile: no preamble before tool use, one tool call at a time, deterministic tools first, small context, max 1-2 model loops for small tasks.';
-  }
-}
+
 
 export class CoreEngine extends EventEmitter {
   public config: EngineConfig;
@@ -777,22 +809,6 @@ export class CoreEngine extends EventEmitter {
     this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
     this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
     this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
-    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
-    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
-    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
-    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
-    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
-    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
-    if (!LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]) {
-      this.config.localModelBudgetProfile = DEFAULT_ENGINE_CONFIG.localModelBudgetProfile;
-    }
-    if (!LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]) {
-      this.config.localModelBudgetProfile = DEFAULT_ENGINE_CONFIG.localModelBudgetProfile;
-    }
-    this.config.executionProfile = this.normalizeExecutionProfile(this.config.executionProfile);
-    this.config.providerProfile = this.normalizeProviderProfile(this.config.providerProfile);
-    this.config.promptProfile = this.normalizePromptProfile(this.config.promptProfile);
-
     this.modelAdapter = new ModelAdapter(this.config);
     this.workspacePolicy = new WorkspacePolicy({
       workspaceRoot: this.config.workspaceRoot,
@@ -807,6 +823,7 @@ export class CoreEngine extends EventEmitter {
     this.toolRegistry = new ToolRegistry({
       cwd: this.config.workspaceRoot,
       internetAccessEnabled: this.config.internetAccessEnabled,
+      policyMode: this.config.mode,
       emitTrace: (type: string, data: unknown) => this.traceBus.emitEvent({ type, data }),
       checkPolicy: (action: ActionType, target?: string) => this.workspacePolicy.checkAction(action, target),
       requestApproval: (request: { action: string; target: string; preview: string; metadata?: Record<string, string> }) => {
@@ -879,73 +896,10 @@ export class CoreEngine extends EventEmitter {
       selfCheckEnabled: this.config.selfCheckEnabled,
       localModelBudgetProfile: this.config.localModelBudgetProfile,
       localModelBudget: LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile],
-      executionProfile: this.config.executionProfile,
-      providerProfile: this.config.providerProfile,
-      promptProfile: this.config.promptProfile,
-      fastModel: this.config.fastModel,
-      codingModel: this.config.codingModel,
-      reviewModel: this.config.reviewModel,
-      apiModel: this.config.apiModel,
     };
   }
 
-  private normalizeExecutionProfile(value: string): ExecutionProfile {
-    return ['fast_local', 'balanced_local', 'deep_review', 'api_frontier'].includes(value)
-      ? value as ExecutionProfile
-      : DEFAULT_ENGINE_CONFIG.executionProfile;
-  }
 
-  private normalizeProviderProfile(value: string): ProviderProfile {
-    return ['ollama_local', 'openai_compatible', 'openrouter', 'together', 'groq', 'qwen_api', 'kimi_api'].includes(value)
-      ? value as ProviderProfile
-      : DEFAULT_ENGINE_CONFIG.providerProfile;
-  }
-
-  private normalizePromptProfile(value: string): PromptProfile {
-    return ['gemma-local-fast', 'qwen-coder-local', 'deepseek-coder-local', 'kimi-api-long-context', 'frontier-mini-api'].includes(value)
-      ? value as PromptProfile
-      : DEFAULT_ENGINE_CONFIG.promptProfile;
-  }
-
-  private selectModelForPurpose(purpose: ModelRoutePurpose): string {
-    const fallback = this.config.model;
-    if (this.config.executionProfile === 'api_frontier' && this.config.apiModel) {
-      return this.config.apiModel;
-    }
-
-    if (purpose === 'review' && this.config.reviewModel) {
-      return this.config.reviewModel;
-    }
-
-    if (this.config.executionProfile === 'deep_review' && purpose === 'summarize' && this.config.reviewModel) {
-      return this.config.reviewModel;
-    }
-
-    if (this.config.executionProfile === 'fast_local') {
-      return this.config.fastModel || fallback;
-    }
-
-    if (purpose === 'code' && this.config.codingModel) {
-      return this.config.codingModel;
-    }
-    if ((purpose === 'direct' || purpose === 'classify' || purpose === 'inspect' || purpose === 'summarize') && this.config.fastModel) {
-      return this.config.fastModel;
-    }
-    return fallback;
-  }
-
-  private traceModelRoute(purpose: ModelRoutePurpose, model: string) {
-    this.traceBus.emitEvent({
-      type: 'model_route_selected',
-      data: {
-        purpose,
-        model,
-        executionProfile: this.config.executionProfile,
-        providerProfile: this.config.providerProfile,
-        promptProfile: this.config.promptProfile,
-      },
-    });
-  }
 
   private async persistCurrentSession(): Promise<void> {
     if (!this.currentSession) {
@@ -1076,6 +1030,7 @@ export class CoreEngine extends EventEmitter {
     this.toolRegistry.updateContext({
       cwd: workspaceRoot,
       internetAccessEnabled: this.config.internetAccessEnabled,
+      policyMode: this.config.mode,
     });
   }
 
@@ -1088,13 +1043,12 @@ export class CoreEngine extends EventEmitter {
       sessionMemoryEnabled: this.config.sessionMemoryEnabled,
       sessionMemoryTurns: this.config.sessionMemoryTurns,
       selfCheckEnabled: this.config.selfCheckEnabled,
-      executionProfile: this.config.executionProfile,
-      promptProfile: this.config.promptProfile,
+      skillAudit: this.currentSession?.skillAudit,
     };
   }
 
-  startSession(skills: string[] = []): SessionMetadata {
-    const sanitizedSkills = sanitizeActiveSkills(skills);
+  startSession(skills: string[] = [], availableSkills: string[] = []): SessionMetadata {
+    const selection = resolveSkillSelection(skills, availableSkills);
     const session: SessionMetadata = {
       id: createSessionId(),
       createdAt: Date.now(),
@@ -1102,7 +1056,8 @@ export class CoreEngine extends EventEmitter {
       model: this.config.model,
       mode: this.config.mode,
       cwd: this.config.workspaceRoot,
-      skillsActive: sanitizedSkills,
+      skillsActive: selection.active,
+      skillAudit: selection.audit,
       toolsAllowlist: [...SUPPORTED_TOOLS],
       turnHistory: [],
     };
@@ -1110,7 +1065,7 @@ export class CoreEngine extends EventEmitter {
     this.currentSession = session;
     this.planner.setTaskSummary('Interactive coding session');
     this.planner.setPhase('ready');
-    this.planner.setActiveSkills(sanitizedSkills);
+    this.planner.setActiveSkills(selection.active);
     this.planner.setIntendedAction('Awaiting user input');
     this.planner.setRuntimeContext(this.buildPlannerRuntimeContext());
     this.traceBus.emitEvent({ type: 'session_started', data: session });
@@ -1119,24 +1074,29 @@ export class CoreEngine extends EventEmitter {
     return session;
   }
 
-  async resumeSession(id: string): Promise<SessionMetadata | null> {
+  async resumeSession(id: string, availableSkills: string[] = []): Promise<SessionMetadata | null> {
     const session = await this.sessionStore.loadSession(id);
     if (!session) {
       return null;
     }
 
-    const sanitizedSkills = sanitizeActiveSkills(session.skillsActive || []);
+    const selection = resolveSkillSelection(session.skillAudit?.requested || session.skillsActive || [], availableSkills);
     this.currentSession = {
       ...session,
-      skillsActive: sanitizedSkills,
+      skillsActive: selection.active,
+      skillAudit: selection.audit,
     };
     this.planner.setTaskSummary(`Resumed session ${session.id}`);
     this.planner.setPhase('ready');
-    this.planner.setActiveSkills(sanitizedSkills);
+    this.planner.setActiveSkills(selection.active);
     this.planner.setIntendedAction('Awaiting user input');
     this.planner.setRuntimeContext(this.buildPlannerRuntimeContext());
     this.traceBus.emitEvent({ type: 'session_resumed', data: { id: session.id } });
-    if (sanitizedSkills.length !== (session.skillsActive || []).length) {
+    const previousAudit = JSON.stringify(session.skillAudit ?? null);
+    const nextAudit = JSON.stringify(selection.audit);
+    const previousSkills = (session.skillsActive || []).join('\u0000');
+    const nextSkills = selection.active.join('\u0000');
+    if (previousAudit !== nextAudit || previousSkills !== nextSkills) {
       await this.persistCurrentSession();
     }
     return this.currentSession;
@@ -1158,13 +1118,15 @@ export class CoreEngine extends EventEmitter {
     return this.currentSession;
   }
 
-  async updateSessionSkills(skills: string[]): Promise<SessionMetadata> {
-    const sanitizedSkills = sanitizeActiveSkills(skills);
+  async updateSessionSkills(skills: string[], availableSkills: string[] = []): Promise<SessionMetadata> {
+    const selection = resolveSkillSelection(skills, availableSkills);
     if (!this.currentSession) {
-      this.startSession(sanitizedSkills);
+      this.startSession(skills, availableSkills);
     } else {
-      this.currentSession.skillsActive = [...sanitizedSkills];
-      this.planner.setActiveSkills(sanitizedSkills);
+      this.currentSession.skillsActive = [...selection.active];
+      this.currentSession.skillAudit = selection.audit;
+      this.planner.setActiveSkills(selection.active);
+      this.planner.setRuntimeContext(this.buildPlannerRuntimeContext());
       await this.persistCurrentSession();
     }
 
@@ -1223,7 +1185,7 @@ export class CoreEngine extends EventEmitter {
     });
     this.planner.setRuntimeContext(this.buildPlannerRuntimeContext());
 
-    if (workspaceChanged || internetAccessChanged) {
+    if (workspaceChanged || internetAccessChanged || modeChanged) {
       this.refreshWorkspaceRuntime(this.config.workspaceRoot);
     }
 
@@ -1364,9 +1326,9 @@ export class CoreEngine extends EventEmitter {
     toolNames: SupportedTool[],
     modelCapabilities: string[] | null,
     modelName = this.config.model,
-  ): Promise<{ manualToolProtocol: boolean; mode: ToolProtocolMode; reason?: string }> {
+  ): Promise<{ manualToolProtocol: boolean; mode: ToolProtocolMode; fallbackPath: AgentFallbackPath; reason?: string }> {
     if (toolNames.length === 0) {
-      return { manualToolProtocol: false, mode: 'native' };
+      return { manualToolProtocol: false, mode: 'native', fallbackPath: 'native_tools' };
     }
 
     const manualToolsForced = process.env.HARNESS_FORCE_MANUAL_TOOLS === '1';
@@ -1374,24 +1336,26 @@ export class CoreEngine extends EventEmitter {
       return {
         manualToolProtocol: true,
         mode: 'manual_preferred',
+        fallbackPath: 'native_tools',
         reason: 'Manual tool protocol forced by HARNESS_FORCE_MANUAL_TOOLS=1.',
       };
     }
 
     const canAttemptNativeTools = await this.modelAdapter.canAttemptNativeToolCalling(modelName, modelCapabilities);
     if (canAttemptNativeTools || !Array.isArray(modelCapabilities)) {
-      return { manualToolProtocol: false, mode: 'native' };
+      return { manualToolProtocol: false, mode: 'native', fallbackPath: 'native_tools' };
     }
 
     if (!modelCapabilities.includes('tools')) {
       return {
         manualToolProtocol: true,
         mode: 'manual_fallback',
+        fallbackPath: 'manual_fallback',
         reason: 'Model capabilities do not include native tools.',
       };
     }
 
-    return { manualToolProtocol: false, mode: 'native' };
+    return { manualToolProtocol: false, mode: 'native', fallbackPath: 'native_tools' };
   }
 
   private supportsThinking(modelCapabilities: string[] | null): boolean {
@@ -1751,6 +1715,13 @@ export class CoreEngine extends EventEmitter {
 
   private selectToolNames(latestUserMessage: string, promptMode: RunMode): SupportedTool[] {
     if (!this.isWorkspaceQuestion(latestUserMessage, promptMode)) {
+      if (this.shouldIncludeInternetTools(latestUserMessage)) {
+        const selected = new Set<SupportedTool>(['webSearch']);
+        if (extractFirstUrl(latestUserMessage)) {
+          selected.add('fetchUrl');
+        }
+        return SUPPORTED_TOOLS.filter((toolName) => selected.has(toolName));
+      }
       return [];
     }
 
@@ -2298,8 +2269,6 @@ export class CoreEngine extends EventEmitter {
       {
         role: 'system',
         content: [
-          `Prompt profile: ${this.config.promptProfile}`,
-          promptProfileInstruction(this.config.promptProfile),
           `Prompt recipe (${promptMode}):`,
           optimizationPrompt,
         ].join('\n'),
@@ -3612,8 +3581,7 @@ export class CoreEngine extends EventEmitter {
     let continuationCount = 0;
     const directOutputBudget = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]?.outputBudgetDirect
       ?? LOCAL_MODEL_BUDGET_PROFILES.lean.outputBudgetDirect;
-    const routedDirectModel = this.selectModelForPurpose('direct');
-    this.traceModelRoute('direct', routedDirectModel);
+    const routedDirectModel = this.config.model;
 
     while (true) {
       let message: EngineChatMessage | undefined;
@@ -3727,11 +3695,8 @@ export class CoreEngine extends EventEmitter {
     signal?: AbortSignal,
     think?: boolean,
     onFirstToken?: () => void,
-    routePurpose?: ModelRoutePurpose,
   ): Promise<any> {
-    const purpose = routePurpose ?? (tools && tools.length > 0 ? 'code' : 'direct');
-    const routedModel = this.selectModelForPurpose(purpose);
-    this.traceModelRoute(purpose, routedModel);
+    const routedModel = this.config.model;
     const stream = await this.modelAdapter.createChatCompletion({
       model: routedModel,
       messages: currentMessages,
@@ -3976,8 +3941,11 @@ export class CoreEngine extends EventEmitter {
       workspaceBound,
     });
     const classificationMs = Date.now() - intentStartedAt;
-    const initialRouteModel = this.selectModelForPurpose('classify');
-    this.traceModelRoute('classify', initialRouteModel);
+    const initialRouteModel = this.config.model;
+    const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
+    const capabilityRouteModel = this.config.model;
+    const modelCapabilities = await this.modelAdapter.getModelCapabilities(capabilityRouteModel);
+    const toolProtocol = await this.selectToolProtocol(selectedToolNames, modelCapabilities, capabilityRouteModel);
 
     await this.recordTurnExecution('agentic', {
       promptMode,
@@ -3992,12 +3960,15 @@ export class CoreEngine extends EventEmitter {
       workspaceRoot: this.config.workspaceRoot,
       workspaceSource,
       model: initialRouteModel,
+      toolProtocol: toolProtocol.manualToolProtocol ? 'manual' : 'native',
       promptMode,
       intent: intentDecision.intent,
       browserContextActive: browserFolderContextActive,
       workspaceBound,
       usedNativeTools: false,
       usedManualFallback: false,
+      fallbackPath: toolProtocol.fallbackPath,
+      fallbackReason: toolProtocol.mode === 'manual_fallback' ? toolProtocol.reason : undefined,
       steps: [],
       filesRead: [],
       directoriesRead: [],
@@ -4013,6 +3984,13 @@ export class CoreEngine extends EventEmitter {
         classificationMs,
       },
     });
+    const syncFallbackState = (fallbackPath: AgentFallbackPath, reason?: string) => {
+      this.planner.setRuntimeContext({
+        fallbackPath,
+        fallbackReason: reason,
+        fallbackCount: runBuilder.snapshot().metrics?.fallbackCount ?? 0,
+      });
+    };
     const runId = runBuilder.snapshot().id;
     this.planner.startRun(runId);
     this.planner.setTaskSummary(`Intent: ${intentDecision.intent}`);
@@ -4021,6 +3999,10 @@ export class CoreEngine extends EventEmitter {
       ...this.buildPlannerRuntimeContext(),
       workspaceSource,
       workspaceBound,
+      toolProtocol: toolProtocol.manualToolProtocol ? 'manual' : 'native',
+      fallbackPath: toolProtocol.fallbackPath,
+      fallbackReason: toolProtocol.mode === 'manual_fallback' ? toolProtocol.reason : undefined,
+      fallbackCount: 0,
     });
     this.planner.setActiveSkills(mergeSkills(this.currentSession?.skillsActive ?? [], this.selectOperationalSkills(intentDecision.intent, promptMode)));
     this.planner.setIntendedAction('Classifying request');
@@ -4299,11 +4281,6 @@ export class CoreEngine extends EventEmitter {
       const useStepScopedContext = ['multi_file', 'architecture_change', 'repo_wide_audit'].includes(taskPlan.complexity);
       const includeWorkspaceContext = workspaceBound && this.isWorkspaceQuestion(latestUserMessage, promptMode);
       const includeRepoContext = workspaceBound && !useStepScopedContext && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
-      const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
-      const capabilityRoutePurpose: ModelRoutePurpose = selectedToolNames.length > 0 ? 'code' : 'inspect';
-      const capabilityRouteModel = this.selectModelForPurpose(capabilityRoutePurpose);
-      const modelCapabilities = await this.modelAdapter.getModelCapabilities(capabilityRouteModel);
-      const toolProtocol = await this.selectToolProtocol(selectedToolNames, modelCapabilities, capabilityRouteModel);
       const rootManifestAnswer = workspaceBound && !['workspace_overview', 'review_diff', 'find_file', 'read_file', 'search_text'].includes(intentDecision.intent)
         ? await this.tryAnswerFromRootManifest(latestUserMessage)
         : null;
@@ -4329,8 +4306,9 @@ export class CoreEngine extends EventEmitter {
         ? 'none'
         : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
 
-      if (toolProtocol.mode !== 'native') {
+      if (toolProtocol.mode === 'manual_fallback') {
         runBuilder.markManualFallback(toolProtocol.reason);
+        syncFallbackState('manual_fallback', toolProtocol.reason);
       }
 
       if (toolProtocol.mode === 'manual_fallback') {
@@ -4655,13 +4633,7 @@ export class CoreEngine extends EventEmitter {
 
         let result: any;
         let message: any;
-        const routePurpose: ModelRoutePurpose = nativeToolDefinitions
-          ? 'code'
-          : promptMode === 'quick_inspect'
-            ? 'inspect'
-            : 'summarize';
-        const routedAgentModel = this.selectModelForPurpose(routePurpose);
-        this.traceModelRoute(routePurpose, routedAgentModel);
+        const routedAgentModel = this.config.model;
         try {
           if (streamHandlers) {
             message = await this.streamAssistantMessage(
@@ -4681,7 +4653,7 @@ export class CoreEngine extends EventEmitter {
                   this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
                 }
               },
-              routePurpose,
+
             );
           } else {
             result = await this.modelAdapter.createChatCompletion({
@@ -4921,12 +4893,15 @@ export class CoreEngine extends EventEmitter {
 
           if (planningOnlyNativeRetryCount < toolRetryMax) {
             planningOnlyNativeRetryCount += 1;
+            runBuilder.markNativeRetry(retryReason);
+            syncFallbackState('native_retry', retryReason);
             this.traceBus.emitEvent({
               type: 'native_tool_retry_requested',
               data: {
                 model: this.config.model,
                 reason: retryReason,
                 promptMode,
+                attempt: planningOnlyNativeRetryCount,
                 selectedTools: selectedToolNames,
               },
             });
@@ -4941,6 +4916,7 @@ export class CoreEngine extends EventEmitter {
           manualToolProtocol = selectedToolNames.length > 0;
           if (manualToolProtocol) {
             runBuilder.markManualFallback(retryReason);
+            syncFallbackState('manual_fallback', retryReason);
             this.traceBus.emitEvent({
               type: 'manual_tool_fallback',
               data: {
@@ -5004,6 +4980,9 @@ export class CoreEngine extends EventEmitter {
         if (manualToolProtocol) {
           if (looksLikeSimulatedToolCall(response)) {
             simulatedToolReplyCount += 1;
+            const repairReason = 'Model attempted simulated tool text instead of JSON.';
+            runBuilder.markManualRepair(repairReason);
+            syncFallbackState('manual_repair', repairReason);
             this.traceBus.emitEvent({
               type: 'tool_simulation_detected',
               data: {
@@ -5011,6 +4990,16 @@ export class CoreEngine extends EventEmitter {
                 attempt: simulatedToolReplyCount,
                 preview: response.slice(0, 240),
                 manualToolProtocol: true,
+              },
+            });
+            this.traceBus.emitEvent({
+              type: 'manual_tool_repair',
+              data: {
+                model: this.config.model,
+                reason: repairReason,
+                attempt: simulatedToolReplyCount,
+                manualToolProtocol: true,
+                selectedTools: selectedToolNames,
               },
             });
 
@@ -5023,9 +5012,20 @@ export class CoreEngine extends EventEmitter {
             }
 
             const warning = 'Model attempted to simulate tool usage in plain text. No tools were executed.';
+            runBuilder.markFinalNoopWarning(warning);
+            syncFallbackState('final_noop_warning', warning);
             this.planner.setPhase('ready');
             this.planner.setIntendedAction('Awaiting user input');
             this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
+            this.traceBus.emitEvent({
+              type: 'final_noop_warning',
+              data: {
+                model: this.config.model,
+                reason: warning,
+                manualToolProtocol: true,
+                selectedTools: selectedToolNames,
+              },
+            });
             this.traceBus.emitEvent({
               type: 'chat_response',
               data: { length: warning.length, simulatedTools: true, manualToolProtocol: true },
@@ -5156,16 +5156,55 @@ export class CoreEngine extends EventEmitter {
 
           if (selectedToolNames.length > 0 && manualProtocolCorrectionCount < toolRetryMax) {
             manualProtocolCorrectionCount += 1;
+            const repairReason = 'Manual tool JSON was malformed or missing.';
+            runBuilder.markManualRepair(repairReason);
+            syncFallbackState('manual_repair', repairReason);
+            this.traceBus.emitEvent({
+              type: 'manual_tool_repair',
+              data: {
+                model: this.config.model,
+                reason: repairReason,
+                attempt: manualProtocolCorrectionCount,
+                manualToolProtocol: true,
+                selectedTools: selectedToolNames,
+              },
+            });
             currentMessages.push({
               role: 'system',
               content: RECIPES.manualToolCorrection(),
             });
             continue;
           }
+
+          if (selectedToolNames.length > 0) {
+            const warning = 'Manual tool protocol stayed malformed after correction retries.';
+            runBuilder.markFinalNoopWarning(warning);
+            syncFallbackState('final_noop_warning', warning);
+            this.planner.setPhase('ready');
+            this.planner.setCurrentTool(undefined);
+            this.planner.setIntendedAction('Awaiting user input');
+            this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
+            this.traceBus.emitEvent({
+              type: 'final_noop_warning',
+              data: {
+                model: this.config.model,
+                reason: warning,
+                manualToolProtocol: true,
+                selectedTools: selectedToolNames,
+                repairAttempts: manualProtocolCorrectionCount,
+              },
+            });
+            this.traceBus.emitEvent({
+              type: 'chat_response',
+              data: { length: warning.length, manualToolProtocol: true, finalNoopWarning: true },
+            });
+            return await finalizeRun(`${warning} Retry request or switch models.`, warning);
+          }
         }
 
         if (nativeToolDefinitions && looksLikeSimulatedToolCall(response)) {
           simulatedToolReplyCount += 1;
+          const retryReason = 'Model attempted to simulate tool usage in plain text.';
           this.traceBus.emitEvent({
             type: 'tool_simulation_detected',
             data: {
@@ -5176,6 +5215,18 @@ export class CoreEngine extends EventEmitter {
           });
 
           if (simulatedToolReplyCount < toolRetryMax) {
+            runBuilder.markNativeRetry(retryReason);
+            syncFallbackState('native_retry', retryReason);
+            this.traceBus.emitEvent({
+              type: 'native_tool_retry_requested',
+              data: {
+                model: this.config.model,
+                reason: retryReason,
+                promptMode,
+                attempt: simulatedToolReplyCount,
+                selectedTools: selectedToolNames,
+              },
+            });
             currentMessages.push({
               role: 'system',
               content: RECIPES.toolCorrection(),
@@ -5184,15 +5235,51 @@ export class CoreEngine extends EventEmitter {
           }
 
           const warning = 'Model attempted to simulate tool usage in plain text. No tools were executed.';
+          runBuilder.markFinalNoopWarning(warning);
+          syncFallbackState('final_noop_warning', warning);
           this.planner.setPhase('ready');
           this.planner.setCurrentTool(undefined);
           this.planner.setIntendedAction('Awaiting user input');
           this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
           this.traceBus.emitEvent({
+            type: 'final_noop_warning',
+            data: {
+              model: this.config.model,
+              reason: warning,
+              promptMode,
+              selectedTools: selectedToolNames,
+            },
+          });
+          this.traceBus.emitEvent({
             type: 'chat_response',
             data: { length: warning.length, simulatedTools: true },
           });
           return await finalizeRun(`${warning} Retry request or switch models.`, warning);
+        }
+
+        if (visibleResponse.length === 0) {
+          const warning = 'Model returned no visible final answer.';
+          runBuilder.markFinalNoopWarning(warning);
+          syncFallbackState('final_noop_warning', warning);
+          this.planner.setPhase('ready');
+          this.planner.setCurrentTool(undefined);
+          this.planner.setIntendedAction('Awaiting user input');
+          this.emitChatStatus(streamHandlers, 'ready', 'Awaiting user input', loopCount);
+          this.traceBus.emitEvent({
+            type: 'final_noop_warning',
+            data: {
+              model: this.config.model,
+              reason: warning,
+              promptMode,
+              selectedTools: selectedToolNames,
+              manualToolProtocol,
+            },
+          });
+          this.traceBus.emitEvent({
+            type: 'chat_response',
+            data: { length: warning.length, finalNoopWarning: true, manualToolProtocol },
+          });
+          return await finalizeRun(warning, warning);
         }
 
         const optimizer = new PromptOptimizer(promptMode);

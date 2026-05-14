@@ -56,7 +56,7 @@ async function testToolRegistry() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-tools-'));
   const policy = new WorkspacePolicy({ workspaceRoot: tempDir, mode: 'workspace-write' });
   const approvals: Array<{ resolve: (approved: boolean) => void }> = [];
-  const traces: unknown[] = [];
+  const traces: Array<{ type: string; data: any }> = [];
 
   await fs.writeFile(path.join(tempDir, 'test.txt'), 'hello world', 'utf8');
 
@@ -96,6 +96,20 @@ async function testToolRegistry() {
   const commandEscapeResult = await registry.runCommand('cat ../outside.txt');
   assert.strictEqual(commandEscapeResult.success, false);
   assert.ok(commandEscapeResult.output.includes('outside the workspace root'));
+  assert.strictEqual(commandEscapeResult.metadata?.command?.status, 'denied');
+  assert.strictEqual(commandEscapeResult.metadata?.command?.approvalRequired, true);
+  assert.strictEqual(approvals.length, approvalsBeforeCommandEscape);
+  assert.ok(traces.some((entry) =>
+    entry.type === 'command_policy_checked' &&
+    entry.data.command === 'cat ../outside.txt' &&
+    entry.data.status === 'denied' &&
+    entry.data.approvalRequired === true,
+  ));
+
+  const shellSyntaxResult = await registry.runCommand('npm test && rm -rf .');
+  assert.strictEqual(shellSyntaxResult.success, false);
+  assert.strictEqual(shellSyntaxResult.metadata?.command?.status, 'denied');
+  assert.ok(shellSyntaxResult.output.includes('Shell operators'));
   assert.strictEqual(approvals.length, approvalsBeforeCommandEscape);
 
   await fs.mkdir(path.join(tempDir, 'nested'));
@@ -249,6 +263,12 @@ async function testSaferEditTools() {
   const testSelection = await registry.selectTestsForChangedFiles(['packages/tool-runtime/src/registry.ts']);
   assert.strictEqual(testSelection.success, true);
   assert.ok(testSelection.output.includes('tests/integration/workflow.test.ts'));
+
+  const contextPack = await registry.buildContextPack('RunState command approval safety', 2000);
+  assert.strictEqual(contextPack.success, true);
+  assert.ok((contextPack.metadata?.contextBudgetUsed || 0) <= 2000);
+  assert.strictEqual(contextPack.metadata?.contextBudgetLimit, 2000);
+  assert.ok((contextPack.metadata?.fileReads || []).length <= 5);
 
   const checkpoint = await registry.createCheckpoint('before test edit');
   assert.strictEqual(checkpoint.success, true);

@@ -1,4 +1,5 @@
 import {
+  AgentFallbackPath,
   AgentRun,
   AgentRunApproval,
   AgentRunCommand,
@@ -67,6 +68,23 @@ function mergeLineStats(current: AgentRunLineStats | undefined, incoming?: Agent
   };
 }
 
+function describeFallbackPath(path?: AgentFallbackPath): string {
+  switch (path) {
+    case 'native_tools':
+      return 'native tools';
+    case 'native_retry':
+      return 'native retry';
+    case 'manual_fallback':
+      return 'manual fallback';
+    case 'manual_repair':
+      return 'manual repair';
+    case 'final_noop_warning':
+      return 'final no-op warning';
+    default:
+      return 'native tools';
+  }
+}
+
 export function summarizeRun(run: AgentRun): string {
   const facts: string[] = [];
   if (run.filesRead.length > 0 || run.directoriesRead.length > 0) {
@@ -85,7 +103,18 @@ export function summarizeRun(run: AgentRun): string {
     facts.push(`fetched ${run.webFetches.length} web page${run.webFetches.length === 1 ? '' : 's'}`);
   }
   if (run.commands.length > 0) {
-    facts.push(`ran ${run.commands.length} command${run.commands.length === 1 ? '' : 's'}`);
+    const failedCommands = run.commands.filter((entry) => !entry.success).length;
+    facts.push(
+      failedCommands > 0
+        ? `attempted ${run.commands.length} command${run.commands.length === 1 ? '' : 's'} (${failedCommands} blocked/failed)`
+        : `ran ${run.commands.length} command${run.commands.length === 1 ? '' : 's'}`,
+    );
+  }
+  if (run.toolProtocol) {
+    facts.push(`tool protocol ${run.toolProtocol}`);
+  }
+  if (run.fallbackPath) {
+    facts.push(`path ${describeFallbackPath(run.fallbackPath)}`);
   }
   if (run.git && run.git.changedFiles > 0) {
     facts.push(`changed ${run.git.changedFiles} file${run.git.changedFiles === 1 ? '' : 's'} (+${run.git.addedLines} / -${run.git.removedLines})`);
@@ -171,12 +200,31 @@ export class AgentRunBuilder {
     this.run.usedNativeTools = true;
   }
 
+  setFallbackPath(fallbackPath: AgentFallbackPath, reason?: string) {
+    this.run.fallbackPath = fallbackPath;
+    this.run.fallbackReason = reason;
+    if (fallbackPath !== 'native_tools') {
+      this.setMetric({
+        fallbackCount: (this.run.metrics?.fallbackCount ?? 0) + 1,
+      });
+    }
+  }
+
+  markNativeRetry(reason?: string) {
+    this.setFallbackPath('native_retry', reason);
+  }
+
   markManualFallback(reason?: string) {
     this.run.usedManualFallback = true;
-    this.run.fallbackReason = reason;
-    this.setMetric({
-      fallbackCount: (this.run.metrics?.fallbackCount ?? 0) + 1,
-    });
+    this.setFallbackPath('manual_fallback', reason);
+  }
+
+  markManualRepair(reason?: string) {
+    this.setFallbackPath('manual_repair', reason);
+  }
+
+  markFinalNoopWarning(reason?: string) {
+    this.setFallbackPath('final_noop_warning', reason);
   }
 
   setLoopCount(modelLoops: number) {

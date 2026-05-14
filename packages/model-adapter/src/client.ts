@@ -11,6 +11,12 @@ import { DEFAULT_CONFIG, PROFILES } from './config';
 
 type ReasoningEffort = ChatCompletionRequest['reasoning_effort'];
 
+const MODEL_PRELOAD_KEEP_ALIVE = '2m';
+const MODEL_UNLOAD_KEEP_ALIVE = 0;
+const MODEL_CHAT_TIMEOUT_MIN_MS = 180_000;
+const MODEL_PRELOAD_TIMEOUT_MIN_MS = 120_000;
+const MODEL_UNLOAD_TIMEOUT_MIN_MS = 30_000;
+
 function extractText(value: unknown): string {
   if (typeof value === 'string') {
     return value;
@@ -573,10 +579,10 @@ export class ModelAdapter {
         headers: this.headers,
         body: JSON.stringify({
           model: modelName,
-          keep_alive: 0,
+          keep_alive: MODEL_UNLOAD_KEEP_ALIVE,
         }),
       },
-      Math.max(this.timeoutMs, 30_000),
+      Math.max(this.timeoutMs, MODEL_UNLOAD_TIMEOUT_MIN_MS),
     );
   }
 
@@ -590,10 +596,10 @@ export class ModelAdapter {
           model: modelName,
           prompt: '',
           stream: false,
-          keep_alive: '2m',
+          keep_alive: MODEL_PRELOAD_KEEP_ALIVE,
         }),
       },
-      Math.max(this.timeoutMs * 4, 120_000),
+      Math.max(this.timeoutMs * 4, MODEL_PRELOAD_TIMEOUT_MIN_MS),
     );
   }
 
@@ -641,6 +647,10 @@ export class ModelAdapter {
     const runningModels = runningInfo.models;
     const configuredModelActive = runningModels.find((entry) => entry.model === this.model || entry.name === this.model);
     const configuredModelCapabilities = await this.getModelCapabilities(this.model);
+    const reasoningSupported = Array.isArray(configuredModelCapabilities)
+      ? configuredModelCapabilities.some((capability) => capability === 'thinking' || capability === 'reasoning')
+      : undefined;
+    const nativeToolCallingSupported = await this.canAttemptNativeToolCalling(this.model, configuredModelCapabilities);
 
     const runtimeState = {
       configuredModel: this.model,
@@ -649,6 +659,15 @@ export class ModelAdapter {
       installedModels,
       availableModels,
       supportsLifecycle: runningInfo.supportsLifecycle,
+      lifecyclePolicy: {
+        preloadKeepAlive: MODEL_PRELOAD_KEEP_ALIVE,
+        unloadKeepAlive: MODEL_UNLOAD_KEEP_ALIVE,
+        chatTimeoutMs: Math.max(this.timeoutMs * 4, MODEL_CHAT_TIMEOUT_MIN_MS),
+        preloadTimeoutMs: Math.max(this.timeoutMs * 4, MODEL_PRELOAD_TIMEOUT_MIN_MS),
+        unloadTimeoutMs: Math.max(this.timeoutMs, MODEL_UNLOAD_TIMEOUT_MIN_MS),
+      },
+      reasoningSupported,
+      nativeToolCallingSupported,
       configuredModelCapabilities: configuredModelCapabilities ?? undefined,
       lastSwitchResult: this.lastSwitchResult,
     };

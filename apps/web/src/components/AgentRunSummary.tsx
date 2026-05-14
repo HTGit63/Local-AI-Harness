@@ -10,6 +10,10 @@ interface AgentRunCommand {
   command: string;
   success: boolean;
   durationMs?: number;
+  status?: 'executed' | 'denied' | 'rejected' | 'failed';
+  reason?: string;
+  policyMode?: string;
+  approvalRequired?: boolean;
 }
 
 interface AgentRunApproval {
@@ -25,6 +29,10 @@ interface AgentRunMetrics {
 export interface AgentRunSummaryData {
   workspaceSource: 'backend' | 'browser_snapshot';
   workspaceBound: boolean;
+  toolProtocol?: 'native' | 'manual';
+  fallbackPath?: string;
+  fallbackReason?: string;
+  fallbackCount?: number;
   filesRead: string[];
   directoriesRead: string[];
   filesWritten: string[];
@@ -40,9 +48,25 @@ export interface AgentRunSummaryData {
   fileChanges?: StructuredDiffFile[];
   checkpointIds?: string[];
   usedManualFallback: boolean;
-  fallbackReason?: string;
   metrics?: AgentRunMetrics;
   summary?: string;
+}
+
+function formatFallbackPath(path?: string): string {
+  switch (path) {
+    case 'native_tools':
+      return 'native tools';
+    case 'native_retry':
+      return 'native retry';
+    case 'manual_fallback':
+      return 'manual fallback';
+    case 'manual_repair':
+      return 'manual repair';
+    case 'final_noop_warning':
+      return 'final no-op warning';
+    default:
+      return 'native tools';
+  }
 }
 
 function formatDuration(totalMs?: number): string {
@@ -76,6 +100,13 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
     ...run.directoriesCreated,
   ];
   const fileChangesCount = run.fileChanges?.length ?? run.structuredDiff?.files.length ?? 0;
+  const fallbackLabel = run.fallbackPath ? formatFallbackPath(run.fallbackPath) : 'native tools';
+  const failedCommands = run.commands.filter((entry) => !entry.success).length;
+  const commandDetails = run.commands.map((entry) => {
+    const status = entry.status || (entry.success ? 'executed' : 'failed');
+    const approval = entry.approvalRequired ? 'approval' : 'auto';
+    return `${entry.command} (${status}, ${entry.policyMode || 'mode unknown'}, ${approval}${entry.reason ? `: ${entry.reason}` : ''})`;
+  });
 
   return (
     <div className="tool-execution-tracker">
@@ -124,9 +155,9 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
             <span className="tool-call-name">Commands</span>
-            <span className="tool-call-state">{run.commands.length}</span>
+            <span className="tool-call-state">{run.commands.length}{failedCommands ? ` / ${failedCommands} failed` : ''}</span>
           </div>
-          <div className="tool-call-input">{summarizeList(run.commands.map((entry) => entry.command))}</div>
+          <div className="tool-call-input">{summarizeList(commandDetails)}</div>
         </div>
         <div className="tool-call-card tool-call-card-done">
           <div className="tool-call-card-top">
@@ -141,6 +172,16 @@ export function AgentRunSummary({ run }: { run: AgentRunSummaryData }) {
             <span className="tool-call-state">{run.checkpointIds?.length ? 'created' : 'none'}</span>
           </div>
           <div className="tool-call-input">{run.checkpointIds?.slice(-1)[0] || 'No rollback checkpoint recorded'}</div>
+        </div>
+        <div className="tool-call-card tool-call-card-done">
+          <div className="tool-call-card-top">
+            <span className="tool-call-name">Tool Path</span>
+            <span className="tool-call-state">{run.toolProtocol || 'native'}</span>
+          </div>
+          <div className="tool-call-input">
+            {fallbackLabel}
+            {run.fallbackReason ? ` · ${run.fallbackReason}` : ''}
+          </div>
         </div>
         <div className={`tool-call-card ${run.usedManualFallback ? 'tool-call-card-error' : 'tool-call-card-done'}`}>
           <div className="tool-call-card-top">

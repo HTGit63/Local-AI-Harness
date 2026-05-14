@@ -1,4 +1,4 @@
-import { ApprovalDecision, StructuredDiff, ToolActionContext, ToolDiffStats, ToolResult } from './types';
+import { ApprovalDecision, StructuredDiff, ToolActionContext, ToolCommandStatus, ToolDiffStats, ToolResult } from './types';
 import {
   addInterfaceProperty,
   buildContextPack as buildCodeContextPack,
@@ -1754,66 +1754,150 @@ export class ToolRegistry {
   async runCommand(command: string): Promise<ToolResult> {
     return this.wrapExecution('run_command', 'Running shell command', async () => {
       const policy = this.context.checkPolicy('execute', '.');
+      const policyMode = this.context.policyMode || 'workspace-write';
+      const startedAt = Date.now();
+      const commandMetadata = (
+        success: boolean,
+        status: ToolCommandStatus,
+        reason?: string,
+        durationMs = Date.now() - startedAt,
+      ) => ({
+        command,
+        success,
+        status,
+        reason,
+        policyMode,
+        approvalRequired: policy.requiresApproval,
+        durationMs,
+      });
+      const emitPolicyTrace = (status: ToolCommandStatus | 'approval_required' | 'allowed', reason?: string) => {
+        this.context.emitTrace('command_policy_checked', {
+          command,
+          allowed: policy.allowed,
+          approvalRequired: policy.requiresApproval,
+          policyMode,
+          status,
+          reason,
+          workspaceRoot: this.context.cwd,
+          shellOperatorsAllowed: false,
+        });
+      };
+
       if (!policy.allowed) {
-        return { success: false, output: `Denied: ${policy.reason}` };
+        const reason = policy.reason || 'Command execution is denied by workspace policy.';
+        emitPolicyTrace('denied', reason);
+        return {
+          success: false,
+          output: `Denied: ${reason}`,
+          metadata: {
+            command: commandMetadata(false, 'denied', reason),
+          },
+        };
       }
 
       if (containsUnsupportedShellSyntax(command)) {
+        const reason = 'Shell operators, redirection, and command substitution are not supported.';
+        emitPolicyTrace('denied', reason);
         return {
           success: false,
-          output: 'Safe command execution only supports a single executable with arguments. Shell operators, redirection, and command substitution are not supported.',
+          output: `Safe command execution only supports a single executable with arguments. ${reason}`,
+          metadata: {
+            command: commandMetadata(false, 'denied', reason),
+          },
         };
       }
 
       const preview = `Run command: ${command}`;
-      const tokens = tokenizeCommand(command);
+      let tokens: string[];
+      try {
+        tokens = tokenizeCommand(command);
+      } catch (error: any) {
+        const reason = error?.message || 'Command could not be parsed.';
+        emitPolicyTrace('denied', reason);
+        return {
+          success: false,
+          output: `Denied: ${reason}`,
+          preview,
+          metadata: {
+            command: commandMetadata(false, 'denied', reason),
+          },
+        };
+      }
       const [commandName, ...commandArgs] = tokens;
 
       if (!commandName) {
+        const reason = 'Command is empty.';
+        emitPolicyTrace('denied', reason);
         return {
           success: false,
-          output: 'Command is empty.',
+          output: reason,
           preview,
+          metadata: {
+            command: commandMetadata(false, 'denied', reason),
+          },
         };
       }
 
       const escapedArg = this.findCommandPathEscape(commandArgs);
       if (escapedArg) {
+        const reason = `Command argument "${escapedArg}" resolves outside the workspace root.`;
+        emitPolicyTrace('denied', reason);
         return {
           success: false,
-          output: `Denied: Command argument "${escapedArg}" resolves outside the workspace root.`,
+          output: `Denied: ${reason}`,
           preview,
+          metadata: {
+            command: commandMetadata(false, 'denied', reason),
+          },
         };
       }
 
+      emitPolicyTrace(policy.requiresApproval ? 'approval_required' : 'allowed', policy.requiresApproval ? 'Approval required before execution.' : undefined);
       if (policy.requiresApproval) {
         const approved = await this.withApproval('run_command', command, preview);
         if (!approved) {
-          return { success: false, output: 'Rejected by user.', preview };
+          return {
+            success: false,
+            output: 'Rejected by user.',
+            preview,
+            metadata: {
+              command: commandMetadata(false, 'rejected', 'Rejected by user.'),
+            },
+          };
         }
       }
 
       const commandStartedAt = Date.now();
-      const { stdout, stderr } = await execFileAsync(commandName, commandArgs, {
-        cwd: this.context.cwd,
-        timeout: 30000,
-        maxBuffer: MAX_BUFFER_BYTES,
-      });
-      const truncated = truncateOutputResult(stdout || stderr || 'No output');
+      try {
+        const { stdout, stderr } = await execFileAsync(commandName, commandArgs, {
+          cwd: this.context.cwd,
+          timeout: 30000,
+          maxBuffer: MAX_BUFFER_BYTES,
+        });
+        const truncated = truncateOutputResult(stdout || stderr || 'No output');
 
-      return {
-        success: true,
-        output: truncated.text,
-        preview,
-        metadata: {
-          command: {
-            command,
-            success: true,
-            durationMs: Date.now() - commandStartedAt,
+        return {
+          success: true,
+          output: truncated.text,
+          preview,
+          metadata: {
+            command: commandMetadata(true, 'executed', undefined, Date.now() - commandStartedAt),
+            truncated: truncated.truncated,
           },
-          truncated: truncated.truncated,
-        },
-      };
+        };
+      } catch (error: any) {
+        const output = truncateOutput(error?.stdout || error?.stderr || error?.message || 'Command failed.');
+        return {
+          success: false,
+          output,
+          preview,
+          error: error?.message || output,
+          metadata: {
+            command: commandMetadata(false, 'failed', error?.message || output, Date.now() - commandStartedAt),
+            truncated: output.includes('... output truncated ...'),
+          },
+        };
+      }
     });
   }
 }
