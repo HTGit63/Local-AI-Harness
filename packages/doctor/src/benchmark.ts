@@ -25,7 +25,7 @@ interface BenchmarkMessage {
 interface BenchmarkScenario {
   name: string;
   note: string;
-  agentic: boolean;
+  mode: 'chat' | 'agent';
   thinking: boolean;
   messages: BenchmarkMessage[];
   images?: string[];
@@ -78,38 +78,38 @@ function resolveModel(options: BenchmarkOptions): string {
 function createBenchmarkScenarios(): BenchmarkScenario[] {
   return [
     {
-      name: 'Direct chat',
+      name: 'Chat Mode',
       note: 'Baseline plain turn with thinking off.',
-      agentic: false,
+      mode: 'chat',
       thinking: false,
       messages: [{ role: 'user', content: 'Reply with the word ok.' }],
     },
     {
-      name: 'Agentic chat',
+      name: 'Agent Work',
       note: 'Planner and trace route without tool pressure.',
-      agentic: true,
+      mode: 'agent',
       thinking: false,
       messages: [{ role: 'user', content: 'Reply with the word ok.' }],
     },
     {
       name: 'Tool call',
       note: 'Native tool loop on workspace file read.',
-      agentic: true,
+      mode: 'agent',
       thinking: false,
       messages: [{ role: 'user', content: 'Read package.json and return the package name.' }],
     },
     {
       name: 'Image turn',
       note: 'Multimodal pass through raw image bytes.',
-      agentic: false,
+      mode: 'chat',
       thinking: false,
       messages: [{ role: 'user', content: 'Describe this image in one short sentence.' }],
       images: [ONE_PIXEL_PNG_BASE64],
     },
     {
       name: 'Think on',
-      note: 'Same direct prompt with thinking enabled.',
-      agentic: false,
+      note: 'Same chat prompt with thinking enabled.',
+      mode: 'chat',
       thinking: true,
       messages: [{ role: 'user', content: 'Reply with the word ok.' }],
     },
@@ -146,7 +146,7 @@ async function measureChatTurn(apiBaseUrl: string, scenario: BenchmarkScenario, 
       },
       body: JSON.stringify({
         messages: scenario.messages,
-        agentic: scenario.agentic,
+        mode: scenario.mode,
         thinking: scenario.thinking,
         images: scenario.images,
       }),
@@ -362,7 +362,7 @@ function formatTurnTiming(turn: TurnTiming): string {
 }
 
 function printScenarioResult(result: BenchmarkScenarioResult) {
-  console.log(`- ${result.name} (${result.agentic ? 'agentic' : 'direct'}, think ${result.thinking ? 'on' : 'off'})`);
+  console.log(`- ${result.name} (${result.mode}, think ${result.thinking ? 'on' : 'off'})`);
   console.log(`  note: ${result.note}`);
   console.log(`  cold: ${formatTurnTiming(result.cold)}`);
   console.log(`  warm: ${formatTurnTiming(result.warm)}`);
@@ -379,7 +379,7 @@ export async function runBenchmarks(options: BenchmarkOptions = {}): Promise<Ben
     console.log('--- Gamma 4 Harness Benchmarks ---');
     console.log(`API base: ${apiBaseUrl}`);
     console.log(`Model: ${model}`);
-    console.log('Matrix: direct chat, agentic chat, tool call, image turn, think on/off');
+    console.log('Matrix: Chat Mode, Agent Work, tool call, image turn, think on/off');
   }
 
   const matrix: BenchmarkScenarioResult[] = [];

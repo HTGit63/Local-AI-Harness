@@ -84,6 +84,8 @@ export interface ModelLifecyclePolicy {
 export interface ModelRuntimeState {
   configuredModel: string;
   activeModel: string | null;
+  runtimeStatus: 'ready' | 'idle' | 'configured_not_loaded' | 'unavailable';
+  statusMessage: string;
   runningModels: RunningModel[];
   installedModels: string[];
   availableModels: AvailableModel[];

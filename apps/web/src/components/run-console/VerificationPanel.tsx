@@ -17,9 +17,12 @@ export function VerificationPanel({ traces }: VerificationPanelProps) {
         <span>{data ? (success ? 'passed' : 'failed') : 'waiting'}</span>
       </div>
       {data ? (
-        <pre className={`verification-output ${success ? 'verification-output-ok' : 'verification-output-failed'}`}>
-          {outputPreview}
-        </pre>
+        <details className="run-console-advanced-details">
+          <summary>Advanced Details · Verification output</summary>
+          <pre className={`verification-output ${success ? 'verification-output-ok' : 'verification-output-failed'}`}>
+            {outputPreview}
+          </pre>
+        </details>
       ) : (
         <div className="empty-note">No verification result yet</div>
       )}

@@ -40,6 +40,14 @@ async function testConfigShow() {
   assert.ok(config.baseUrl.includes('11434'));
 }
 
+async function testHelp() {
+  const output = await runCli(['help']);
+  assert.ok(output.includes('Default: Chat Mode'));
+  assert.ok(output.includes('harness agent'));
+  assert.ok(output.includes('harness inspect'));
+  assert.ok(output.includes('prompt --agent'));
+}
+
 async function testSessionList() {
   const output = await runCli(['session', 'list', '--json']);
   const result = JSON.parse(output);
@@ -50,6 +58,13 @@ async function testWorkspaceStatus() {
   const output = await runCli(['workspace', 'status', '--json']);
   const result = JSON.parse(output);
   assert.ok(result.workspaceRoot || result.mode);
+}
+
+async function testInspectJson() {
+  const output = await runCli(['inspect', '--json']);
+  const result = JSON.parse(output);
+  assert.strictEqual(result.inspection.projectName, 'gamma4-local-harness');
+  assert.ok(result.inspection.summary.includes('gamma4-local-harness'));
 }
 
 async function testSkillsList() {
@@ -67,9 +82,11 @@ async function testDoctorJson() {
 }
 
 async function run() {
+  await testHelp();
   await testConfigShow();
   await testSessionList();
   await testWorkspaceStatus();
+  await testInspectJson();
   await testSkillsList();
   await testDoctorJson();
   console.log('e2e tests passed');

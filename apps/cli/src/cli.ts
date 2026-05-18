@@ -9,10 +9,11 @@ import { loadCuratedSkills } from '@local-harness/skills';
 const args = process.argv.slice(2);
 const command = args[0] || 'chat';
 const isJson = args.includes('--json');
+const showThinkingOutput = args.includes('--show-thinking');
 
 const engine = new CoreEngine({
   workspaceRoot: process.cwd(),
-  profile: 'fast',
+  profile: 'balanced',
 });
 
 function printJson(value: unknown) {
@@ -28,6 +29,26 @@ function printOutput(value: unknown) {
   console.log(typeof value === 'string' ? value : JSON.stringify(value, null, 2));
 }
 
+function printHelp() {
+  printOutput([
+    'Gamma Harness CLI',
+    '',
+    'Commands:',
+    '  harness chat [--show-thinking]',
+    '  harness agent [--advanced-tools] [--show-thinking]',
+    '  harness inspect [--json]',
+    '  harness prompt [--agent] [--advanced-tools] <text>',
+    '  harness status [--json]',
+    '  harness config [show] [--json]',
+    '  harness model <status|list|use>',
+    '  harness workspace <status|use|list|read|search|git-status|git-diff>',
+    '  harness session <list|resume|delete>',
+    '  harness doctor [--json]',
+    '',
+    'Default: Chat Mode. Agent Work only via `agent` or `prompt --agent`.',
+  ].join('\n'));
+}
+
 function splitThinkingBlocks(content: string): { thinking: string[]; answer: string } {
   const thinking = Array.from(content.matchAll(/<think>([\s\S]*?)<\/think>/gi))
     .map((match) => match[1]?.trim() || '')
@@ -36,15 +57,15 @@ function splitThinkingBlocks(content: string): { thinking: string[]; answer: str
   return { thinking, answer };
 }
 
-function renderAssistantOutput(content: string) {
+function renderAssistantOutput(content: string, showThinking = false) {
   const { thinking, answer } = splitThinkingBlocks(content);
 
-  if (thinking.length > 0) {
+  if (showThinking && thinking.length > 0) {
     console.log('\nThinking:');
     console.log(thinking.join('\n\n'));
   }
 
-  console.log(`\n${answer || content}\n`);
+  console.log(`\n${answer || content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()}\n`);
 }
 
 function pushStepStatus(stepHistory: string[], nextStatus: string) {
@@ -90,9 +111,11 @@ async function handlePrompt() {
   const promptIndex = args.indexOf('prompt');
   const promptText = args.slice(promptIndex + 1).filter((arg) => !arg.startsWith('--')).join(' ');
   if (!promptText) {
-    throw new Error('Usage: harness prompt [--thinking|--nothinking] <text>');
+    throw new Error('Usage: harness prompt [--agent] [--advanced-tools] [--thinking|--nothinking] [--show-thinking] <text>');
   }
 
+  const useAgent = args.includes('--agent');
+  const useAdvancedTools = useAgent && args.includes('--advanced-tools');
   const thinkingEnabled = args.includes('--nothinking') ? false : args.includes('--thinking') ? true : undefined;
   const runtime = thinkingEnabled === true ? await engine.getModelRuntime() : null;
   const thinkingWarning = thinkingEnabled === true && !supportsThinking(runtime?.configuredModelCapabilities)
@@ -100,23 +123,30 @@ async function handlePrompt() {
     : null;
 
   if (isJson) {
-    const response = await engine.chat([
-      { role: 'user', content: promptText },
-    ], thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
-    printOutput({ input: promptText, output: response, ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
+    const promptMessages = [{ role: 'user' as const, content: promptText }];
+    const response = useAgent
+      ? await engine.agentWork(promptMessages, { ...(thinkingEnabled === undefined ? {} : { think: thinkingEnabled }), advancedTools: useAdvancedTools })
+      : await engine.directChat(promptMessages, thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
+    printOutput({ input: promptText, output: response, executionMode: useAgent ? 'agent' : 'chat', advancedTools: useAdvancedTools, ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
     return;
   }
 
   const stepHistory: string[] = [];
-  const response = await engine.chatStream([
-    { role: 'user', content: promptText },
-  ], {
+  const promptMessages = [{ role: 'user' as const, content: promptText }];
+  if (useAgent) {
+    console.log(`[mode] Agent Work · tools ${useAdvancedTools ? 'advanced' : 'basic'}`);
+  } else {
+    console.log('[mode] Chat');
+  }
+  const response = useAgent ? await engine.agentWorkStream(promptMessages, {
     onStatus: (event) => pushStepStatus(stepHistory, event.action || event.phase),
     onTool: (event) => renderToolProgress(event),
     onRunSummary: (event) => renderRunSummary(event.summary),
+  }, { ...(thinkingEnabled === undefined ? {} : { think: thinkingEnabled }), advancedTools: useAdvancedTools }) : await engine.directChatStream(promptMessages, {
+    onStatus: (event) => pushStepStatus(stepHistory, event.action || event.phase),
   }, thinkingEnabled === undefined ? undefined : { think: thinkingEnabled });
 
-  renderAssistantOutput(response);
+  renderAssistantOutput(response, showThinkingOutput);
 }
 
 async function handleSession() {
@@ -128,8 +158,8 @@ async function handleSession() {
         model: session.model,
         mode: session.mode,
         skills: session.skillsActive,
-        turns: session.turnHistory?.length || 0,
-        lastTurnMode: session.turnHistory?.length ? session.turnHistory[session.turnHistory.length - 1].executionMode : 'none',
+        turns: session.turnHistory ? session.turnHistory.length : 'not loaded',
+        lastTurnMode: session.turnHistory?.length ? session.turnHistory[session.turnHistory.length - 1].executionMode : 'load session to inspect',
         updatedAt: new Date(session.updatedAt).toLocaleString(),
       })));
       return;
@@ -165,6 +195,7 @@ async function handleSession() {
 
 async function handleWorkspace() {
   switch (args[1]) {
+    case undefined:
     case 'status':
       printOutput(engine.getPublicConfig());
       return;
@@ -230,6 +261,11 @@ async function handleSkills() {
 
 async function handleModel() {
   switch (args[1]) {
+    case undefined:
+    case 'status': {
+      printOutput(await engine.getModelRuntime());
+      return;
+    }
     case 'list': {
       const models = await engine.listModels();
       const runtime = await engine.getModelRuntime();
@@ -239,10 +275,6 @@ async function handleModel() {
         runningModels: runtime.runningModels.map((entry: { model: string }) => entry.model),
         models,
       });
-      return;
-    }
-    case 'status': {
-      printOutput(await engine.getModelRuntime());
       return;
     }
     case 'use': {
@@ -267,24 +299,27 @@ async function handleModel() {
 }
 
 async function handleConfig() {
-  if (args[1] !== 'show') {
-    throw new Error('Usage: harness config show');
+  if (args[1] && args[1] !== 'show') {
+    throw new Error('Usage: harness config [show]');
   }
 
   printOutput(engine.getPublicConfig());
 }
 
-function startRepl() {
+function startRepl(executionMode: 'chat' | 'agent' = 'chat') {
   const history: { role: 'user' | 'assistant'; content: string }[] = [];
   const session = engine.startSession();
   let thinkingEnabled = false;
+  let advancedTools = executionMode === 'agent' && args.includes('--advanced-tools');
   const initialConfig = engine.getPublicConfig();
 
   console.log('Gamma Harness CLI');
   console.log(
-    `Session: ${session.id}  Model: ${session.model}  Mode: ${session.mode}  Execution: agentic  Thinking: ${thinkingEnabled ? 'on' : 'off'}  Memory: ${initialConfig.sessionMemoryEnabled ? `${initialConfig.sessionMemoryTurns} turns` : 'off'}  Retries: ${initialConfig.toolRetryMax}`,
+    `Session: ${session.id}  Model: ${session.model}  Mode: ${session.mode}  Execution: ${executionMode === 'agent' ? 'Agent Work' : 'Chat'}  Tools: ${advancedTools ? 'advanced' : 'basic'}  Thinking: ${thinkingEnabled ? 'on' : 'off'}  Memory: ${initialConfig.sessionMemoryEnabled ? `${initialConfig.sessionMemoryTurns} turns` : 'off'}  Retries: ${initialConfig.toolRetryMax}`,
   );
-  console.log("Commands: /help /exit /status /agent /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>");
+  console.log('Commands: /help /status /runtime /plan /exit');
+  console.log('Agent-only: /advanced /basic /approvals /approve <id> /reject <id>');
+  console.log('Config: /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /sessions /doctor /skills');
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -320,7 +355,9 @@ function startRepl() {
       }
 
       if (input === '/help') {
-        console.log('Slash commands: /exit /quit /bye /clear /help /status /agent /plan /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /permissions [value] /sessions /doctor /approvals /approve <id> /reject <id> /skills /activate <slug>');
+        console.log('Slash commands: /help /status /runtime /plan /clear /exit');
+        console.log('Agent-only: /advanced /basic /approvals /approve <id> /reject <id>');
+        console.log('Config: /thinking /nothinking /model /model list /model use <name> /workspace /workspace use <path> /mode [value] /sessions /doctor /skills /activate <slug>');
         rl.prompt();
         return;
       }
@@ -345,18 +382,38 @@ function startRepl() {
         return;
       }
 
+      if (input === '/advanced') {
+        if (executionMode !== 'agent') {
+          console.log('Advanced tools only apply in Agent Work.');
+          rl.prompt();
+          return;
+        }
+        advancedTools = true;
+        console.log('Advanced Agent tools enabled for this CLI session');
+        rl.prompt();
+        return;
+      }
+
+      if (input === '/basic') {
+        advancedTools = false;
+        console.log('Basic Agent tools enabled');
+        rl.prompt();
+        return;
+      }
+
       if (input === '/status') {
         console.log(JSON.stringify({
           session: engine.getSession(),
           config: engine.getPublicConfig(),
-          executionMode: 'agentic',
+          executionMode,
           thinkingEnabled,
+          advancedTools,
         }, null, 2));
         rl.prompt();
         return;
       }
 
-      if (input === '/agent') {
+      if (input === '/runtime') {
         const config = engine.getPublicConfig();
         console.log(JSON.stringify({
           contextBudget: config.contextBudget,
@@ -364,6 +421,8 @@ function startRepl() {
           sessionMemoryEnabled: config.sessionMemoryEnabled,
           sessionMemoryTurns: config.sessionMemoryTurns,
           selfCheckEnabled: config.selfCheckEnabled,
+          advancedAgentToolsEnabled: config.advancedAgentToolsEnabled,
+          currentSessionAdvancedTools: advancedTools,
           internetAccessEnabled: config.internetAccessEnabled,
           streamIdleTimeoutMs: config.streamIdleTimeoutMs,
         }, null, 2));
@@ -495,24 +554,34 @@ function startRepl() {
 
       history.push({ role: 'user', content: input });
       const stepHistory: string[] = [];
-      const response = await engine.chatStream([
-        { role: 'system', content: 'You are a helpful coding assistant. Be concise. Use tools when file actions are needed.' },
+      const replMessages = [
+        { role: 'system' as const, content: executionMode === 'agent' ? 'You are a helpful coding assistant. Be concise. Use tools when file actions are needed.' : 'You are a helpful local chat assistant. Be concise.' },
         ...history,
-      ], {
-        onStatus: (event: { action: string; phase: string }) => {
-          pushStepStatus(stepHistory, event.action || event.phase);
-        },
-        onTool: (event: { name: string; state: 'start' | 'done'; inputSummary: string; success?: boolean }) => {
-          renderToolProgress(event);
-        },
-        onRunSummary: (event: { summary: { summary?: string } }) => {
-          renderRunSummary(event.summary);
-        },
-      }, {
-        think: thinkingEnabled,
-      });
+      ];
+      const response = executionMode === 'agent'
+        ? await engine.agentWorkStream(replMessages, {
+            onStatus: (event: { action: string; phase: string }) => {
+              pushStepStatus(stepHistory, event.action || event.phase);
+            },
+            onTool: (event: { name: string; state: 'start' | 'done'; inputSummary: string; success?: boolean }) => {
+              renderToolProgress(event);
+            },
+            onRunSummary: (event: { summary: { summary?: string } }) => {
+              renderRunSummary(event.summary);
+            },
+          }, {
+            think: thinkingEnabled,
+            advancedTools,
+          })
+        : await engine.directChatStream(replMessages, {
+            onStatus: (event: { action: string; phase: string }) => {
+              pushStepStatus(stepHistory, event.action || event.phase);
+            },
+          }, {
+            think: thinkingEnabled,
+          });
       history.push({ role: 'assistant', content: response });
-      renderAssistantOutput(response);
+      renderAssistantOutput(response, showThinkingOutput);
     } catch (error: any) {
       console.error(error?.message || error);
     }
@@ -527,11 +596,19 @@ function startRepl() {
 
 async function main() {
   switch (command) {
+    case 'help':
+    case '--help':
+    case '-h':
+      printHelp();
+      return;
     case 'doctor':
       printOutput(await runDiagnostics({ repoRoot: process.cwd(), quiet: isJson }));
       return;
     case 'benchmark':
       printOutput(await runBenchmarks({ quiet: isJson }));
+      return;
+    case 'status':
+      printOutput(engine.getPublicConfig());
       return;
     case 'prompt':
       await handlePrompt();
@@ -540,8 +617,19 @@ async function main() {
       if (isJson) {
         throw new Error('JSON mode is not supported for interactive chat.');
       }
-      startRepl();
+      startRepl('chat');
       return;
+    case 'agent':
+      if (isJson) {
+        throw new Error('JSON mode is not supported for interactive agent.');
+      }
+      startRepl('agent');
+      return;
+    case 'inspect': {
+      const inspection = await engine.inspectProject();
+      printOutput(isJson ? { inspection } : inspection.summary);
+      return;
+    }
     case 'session':
       await handleSession();
       return;
@@ -558,7 +646,7 @@ async function main() {
       await handleConfig();
       return;
     default:
-      throw new Error('Available commands: doctor | benchmark | prompt | chat | session | workspace | skills | model | config');
+      throw new Error('Unknown command. Run `harness help` for commands.');
   }
 }
 

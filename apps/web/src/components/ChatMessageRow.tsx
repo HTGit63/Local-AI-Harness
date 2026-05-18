@@ -22,7 +22,7 @@ export interface ChatMessageRowData {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  executionMode: 'direct' | 'agentic';
+  executionMode: 'chat' | 'agent';
   createdAt: number;
   toolEvents: ChatToolEvent[];
   status?: 'sending' | 'streaming' | 'sent' | 'error';
@@ -102,7 +102,7 @@ function formatTime(timestamp: number): string {
 
 function ChatMessageRowComponent({ message }: { message: ChatMessageRowData }) {
   const hasUserImages = message.role === 'user' && (message.attachments?.length || 0) > 0;
-  const fallbackAssistantContent = message.role === 'assistant' && message.executionMode === 'agentic' && !hasRenderableContent(message.content)
+  const fallbackAssistantContent = message.role === 'assistant' && message.executionMode === 'agent' && !hasRenderableContent(message.content)
     ? buildHonestFallback(message)
     : '';
   const renderedMessageContent = message.role === 'assistant' && fallbackAssistantContent
@@ -123,10 +123,10 @@ function ChatMessageRowComponent({ message }: { message: ChatMessageRowData }) {
             <span className="chat-msg-name">{message.role === 'user' ? 'You' : 'Assistant'}</span>
             <span className="chat-msg-time">{formatTime(message.createdAt)}</span>
           </div>
-          {message.role === 'assistant' && message.executionMode === 'agentic' && (message.runSteps?.length || 0) > 0 && (
+          {message.role === 'assistant' && message.executionMode === 'agent' && (message.runSteps?.length || 0) > 0 && (
             <AgentRunSteps steps={message.runSteps || []} />
           )}
-          {message.role === 'assistant' && message.executionMode === 'agentic' && message.toolEvents.length > 0 && (
+          {message.role === 'assistant' && message.executionMode === 'agent' && message.toolEvents.length > 0 && (
             <div className="tool-call-list">
               {message.toolEvents.map((event) => {
                 const stateClass = event.state === 'start'

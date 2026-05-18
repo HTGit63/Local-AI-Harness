@@ -9,10 +9,16 @@ import {
   AgentRunStep,
   AgentRunStepStatus,
   AgentRunStepType,
+  AgentRunStructuredDiffFile,
   AgentRunWebFetch,
   AgentRunWebSearch,
+  CompactRunOutcome,
+  CompactRunSummary,
 } from '@local-harness/session-store';
 import { ToolResultMetadata } from '@local-harness/tool-runtime';
+
+const COMPACT_RUN_PATH_LIMIT = 16;
+const COMPACT_RUN_COMMAND_LIMIT = 8;
 
 function uniquePush(target: string[], values: string[] | undefined) {
   for (const value of values ?? []) {
@@ -66,6 +72,81 @@ function mergeLineStats(current: AgentRunLineStats | undefined, incoming?: Agent
     addedLines: current.addedLines + incoming.addedLines,
     removedLines: current.removedLines + incoming.removedLines,
   };
+}
+
+function cloneDiffFile(file: AgentRunStructuredDiffFile): AgentRunStructuredDiffFile {
+  return {
+    ...file,
+    hunks: file.hunks.map((hunk) => ({
+      ...hunk,
+      lines: hunk.lines.map((line) => ({ ...line })),
+    })),
+  };
+}
+
+function hunkSignature(hunk: AgentRunStructuredDiffFile['hunks'][number]): string {
+  return `${hunk.oldStart}:${hunk.oldLines}:${hunk.newStart}:${hunk.newLines}:${hunk.lines
+    .map((line) => `${line.type}:${line.oldLine ?? ''}:${line.newLine ?? ''}:${line.content}`)
+    .join('\n')}`;
+}
+
+function mergeStructuredDiffFiles(
+  existing: AgentRunStructuredDiffFile[],
+  incoming: AgentRunStructuredDiffFile[],
+): AgentRunStructuredDiffFile[] {
+  const byPath = new Map<string, AgentRunStructuredDiffFile>();
+  for (const file of [...existing, ...incoming]) {
+    const key = `${file.oldPath ?? ''}->${file.path}`;
+    const current = byPath.get(key);
+    if (!current) {
+      byPath.set(key, cloneDiffFile(file));
+      continue;
+    }
+
+    const seenHunks = new Set(current.hunks.map(hunkSignature));
+    for (const hunk of file.hunks) {
+      const signature = hunkSignature(hunk);
+      if (!seenHunks.has(signature)) {
+        current.hunks.push({
+          ...hunk,
+          lines: hunk.lines.map((line) => ({ ...line })),
+        });
+        seenHunks.add(signature);
+      }
+    }
+    current.addedLines = Math.max(current.addedLines, file.addedLines);
+    current.removedLines = Math.max(current.removedLines, file.removedLines);
+  }
+  return Array.from(byPath.values());
+}
+
+function compactList(values: string[], limit: number): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    result.push(value);
+    if (result.length >= limit) {
+      break;
+    }
+  }
+  return result;
+}
+
+function inferCompactOutcome(run: AgentRun): CompactRunOutcome {
+  if (run.error) {
+    return 'failed';
+  }
+  if (run.fallbackPath === 'final_noop_warning') {
+    return 'safe_idle';
+  }
+  if (run.approvals.some((approval) => approval.approved !== true)) {
+    return 'blocked';
+  }
+  return 'done';
 }
 
 function describeFallbackPath(path?: AgentFallbackPath): string {
@@ -138,6 +219,40 @@ export function buildFinalAnswer(baseAnswer: string, run: AgentRun): string {
   const summaryBlock = ['What I did: ' + facts, changedLine].join('\n');
   const trimmed = baseAnswer.trim();
   return trimmed ? `${trimmed}\n\n${summaryBlock}` : summaryBlock;
+}
+
+export function compactRunSummary(run: AgentRun): CompactRunSummary {
+  const filesChanged = compactList(
+    [
+      ...run.filesWritten,
+      ...run.filesDeleted,
+      ...run.directoriesCreated,
+      ...(run.fileChanges ?? []).flatMap((file) => [file.path, file.oldPath].filter(Boolean) as string[]),
+    ],
+    COMPACT_RUN_PATH_LIMIT,
+  );
+
+  return {
+    runId: run.id,
+    mode: run.executionMode,
+    intent: run.intent,
+    goal: run.steps.find((step) => step.type === 'model')?.detail,
+    outcome: inferCompactOutcome(run),
+    filesRead: compactList([...run.filesRead, ...run.directoriesRead], COMPACT_RUN_PATH_LIMIT),
+    filesChanged,
+    commandsRun: compactList(run.commands.map((command) => command.command), COMPACT_RUN_COMMAND_LIMIT),
+    approvals: run.approvals.length,
+    toolProtocol: run.toolProtocol,
+    fallbackPath: run.fallbackPath,
+    usedManualFallback: run.usedManualFallback,
+    fallbackReason: run.fallbackReason,
+    summary: run.summary || summarizeRun(run),
+    error: run.error,
+    startedAt: run.startedAt,
+    endedAt: run.endedAt,
+    firstTokenMs: run.metrics?.firstTokenMs,
+    totalDurationMs: run.metrics?.totalMs,
+  };
 }
 
 export class AgentRunBuilder {
@@ -296,7 +411,7 @@ export class AgentRunBuilder {
     if (metadata.structuredDiff) {
       const existingFiles = this.run.structuredDiff?.files ?? [];
       this.run.structuredDiff = {
-        files: [...existingFiles, ...metadata.structuredDiff.files],
+        files: mergeStructuredDiffFiles(existingFiles, metadata.structuredDiff.files),
       };
       this.run.fileChanges = this.run.structuredDiff.files;
     }

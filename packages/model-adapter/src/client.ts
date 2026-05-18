@@ -16,6 +16,12 @@ const MODEL_UNLOAD_KEEP_ALIVE = 0;
 const MODEL_CHAT_TIMEOUT_MIN_MS = 180_000;
 const MODEL_PRELOAD_TIMEOUT_MIN_MS = 120_000;
 const MODEL_UNLOAD_TIMEOUT_MIN_MS = 30_000;
+const MODEL_OUTPUT_CAPS = {
+  default: 2048,
+  gemma: 2048,
+  deepseek: 2048,
+  qwen: 1536,
+} as const;
 
 function extractText(value: unknown): string {
   if (typeof value === 'string') {
@@ -82,6 +88,24 @@ function combineThinkingAndContent(thinking: string, content: string): string {
   }
 
   return content;
+}
+
+function outputTokenCapForModel(modelName: string): number {
+  const lowerModel = modelName.toLowerCase();
+  if (lowerModel.includes('qwen')) {
+    return MODEL_OUTPUT_CAPS.qwen;
+  }
+  if (lowerModel.includes('gemma')) {
+    return MODEL_OUTPUT_CAPS.gemma;
+  }
+  if (lowerModel.includes('deepseek')) {
+    return MODEL_OUTPUT_CAPS.deepseek;
+  }
+  return MODEL_OUTPUT_CAPS.default;
+}
+
+function clampOutputTokens(modelName: string, requestedTokens: number): number {
+  return Math.max(1, Math.min(requestedTokens, outputTokenCapForModel(modelName)));
 }
 
 function mapToolCallsToOllama(toolCalls: unknown): Array<{ function: { name: string; arguments: Record<string, unknown> } }> | undefined {
@@ -339,16 +363,15 @@ export class ModelAdapter {
     let optTemperature = request.temperature ?? profile.temperature;
     let optMaxTokens = request.max_tokens ?? profile.max_tokens;
 
-    // Architectural parameter tuning based on AI model name
+    // Model-specific tuning keeps local output bounded; context is handled outside num_predict.
     if (lowerModel.includes('gemma')) {
-      // Gemma 4 supports up to 128k context, raise the token ceiling
-      optMaxTokens = Math.min(optMaxTokens, 16384);
       optTemperature = Math.max(0.01, optTemperature * 0.8);
     } else if (lowerModel.includes('deepseek')) {
-      optMaxTokens = Math.max(optMaxTokens, 16384);
+      optTemperature = Math.max(0.01, optTemperature * 0.95);
     } else if (lowerModel.includes('qwen')) {
       optTemperature = Math.min(1.0, optTemperature * 1.1);
     }
+    optMaxTokens = clampOutputTokens(targetModel, optMaxTokens);
 
     const body: Record<string, unknown> = {
       model: targetModel,
@@ -646,6 +669,20 @@ export class ModelAdapter {
     const runningInfo = await this.tryListRunningModels();
     const runningModels = runningInfo.models;
     const configuredModelActive = runningModels.find((entry) => entry.model === this.model || entry.name === this.model);
+    const runtimeStatus: ModelRuntimeState['runtimeStatus'] = !runningInfo.supportsLifecycle
+      ? 'unavailable'
+      : configuredModelActive
+        ? 'ready'
+        : runningModels.length > 0
+          ? 'configured_not_loaded'
+          : 'idle';
+    const statusMessage = !runningInfo.supportsLifecycle
+      ? 'Model lifecycle status is unavailable for this provider.'
+      : configuredModelActive
+        ? `Configured model ${this.model} is loaded.`
+        : runningModels.length > 0
+          ? `Configured model ${this.model} is not loaded; ${runningModels.length} other model${runningModels.length === 1 ? ' is' : 's are'} running.`
+          : `Configured model ${this.model} is idle.`;
     const configuredModelCapabilities = await this.getModelCapabilities(this.model);
     const reasoningSupported = Array.isArray(configuredModelCapabilities)
       ? configuredModelCapabilities.some((capability) => capability === 'thinking' || capability === 'reasoning')
@@ -655,6 +692,8 @@ export class ModelAdapter {
     const runtimeState = {
       configuredModel: this.model,
       activeModel: configuredModelActive?.model || (runningModels.length === 1 ? runningModels[0].model : null),
+      runtimeStatus,
+      statusMessage,
       runningModels,
       installedModels,
       availableModels,
@@ -769,19 +808,10 @@ export class ModelAdapter {
       return result;
     }
 
-    const unloadCandidates = Array.from(
-      new Set(
-        runningInfo.models
-          .map((entry) => entry.model || entry.name)
-          .filter((modelName) => modelName && modelName !== targetModel),
-      ),
-    );
-
-    for (const modelName of unloadCandidates) {
-      await this.unloadModel(modelName);
+    const targetAlreadyRunning = runningInfo.models.find((entry) => entry.model === targetModel || entry.name === targetModel);
+    if (!targetAlreadyRunning) {
+      await this.preloadModel(targetModel);
     }
-
-    await this.preloadModel(targetModel);
     this.runtimeStateCache = null;
     const runtime = await this.getRuntimeState(0);
     const loadedTarget = runtime.runningModels.find((entry) => entry.model === targetModel || entry.name === targetModel);
@@ -795,12 +825,12 @@ export class ModelAdapter {
       requestedModel: targetModel,
       activeModel: loadedTarget.model,
       runningModels: runtime.runningModels,
-      unloadedModels: unloadCandidates,
+      unloadedModels: [],
       loadedModel: loadedTarget.model,
       supportsLifecycle: true,
-      message: unloadCandidates.length > 0
-        ? `Stopped ${unloadCandidates.join(', ')} and activated ${loadedTarget.model}.`
-        : `Activated ${loadedTarget.model}.`,
+      message: targetAlreadyRunning
+        ? `${loadedTarget.model} was already loaded.`
+        : `Activated ${loadedTarget.model}; other running models were left unchanged.`,
     };
 
     this.lastSwitchResult = result;
@@ -887,13 +917,13 @@ export class ModelAdapter {
     let optMaxTokens = request.max_tokens ?? profile.max_tokens;
 
     if (lowerModel.includes('gemma')) {
-      optMaxTokens = Math.min(optMaxTokens, 8192);
       optTemperature = Math.max(0.01, optTemperature * 0.8);
     } else if (lowerModel.includes('deepseek')) {
-      optMaxTokens = Math.max(optMaxTokens, 16384);
+      optTemperature = Math.max(0.01, optTemperature * 0.95);
     } else if (lowerModel.includes('qwen')) {
       optTemperature = Math.min(1.0, optTemperature * 1.1);
     }
+    optMaxTokens = clampOutputTokens(targetModel, optMaxTokens);
     
     const payload = {
       model: targetModel,

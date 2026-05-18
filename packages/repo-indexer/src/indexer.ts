@@ -1,18 +1,36 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import type { TaskComplexity } from '@local-harness/task-orchestrator';
+import type { TaskIntent, TaskSizeEstimate } from '@local-harness/task-orchestrator';
 
 const IGNORED_DIR_NAMES = new Set([
+  '.cache',
   '.git',
   '.gamma-harness',
   '.next',
+  '.nuxt',
+  '.playwright',
   '.playwright-cli',
+  '.turbo',
+  '.vite',
   'base_repos',
   'build',
+  'coverage',
   'dist',
   'node_modules',
   'third_party',
 ]);
+const IGNORED_FILE_NAMES = new Set([
+  '.env',
+  'id_ed25519',
+  'id_rsa',
+]);
+const SECRET_FILE_PATTERNS = [
+  /^\.env\./,
+  /\.key$/i,
+  /\.p12$/i,
+  /\.pfx$/i,
+  /\.pem$/i,
+];
 const MAX_MANIFEST_PREVIEW = 8;
 const MAX_ENTRY_POINT_PREVIEW = 8;
 const MAX_README_PREVIEW = 4;
@@ -45,6 +63,25 @@ export interface WorkspaceInventory {
   packages: WorkspaceModuleInfo[];
   references: WorkspaceReferenceInfo[];
   topLevelAreas: string[];
+}
+
+export interface ProjectInspection {
+  cwd: string;
+  projectName: string;
+  likelyProjectType: string;
+  frameworkSignals: string[];
+  frontendSignals: string[];
+  backendSignals: string[];
+  mainEntryPoints: string[];
+  viewDirectories: string[];
+  staticDirectories: string[];
+  packageScripts: Record<string, string>;
+  packageManager: string;
+  howToRun: string[];
+  obviousMissingFiles: string[];
+  nextRecommendedCheck: string;
+  inspectedFiles: string[];
+  summary: string;
 }
 
 export type TaskArea =
@@ -87,6 +124,10 @@ function resolveCacheTtlMs(): number {
   }
 
   return Math.max(1_000, Math.floor(rawValue));
+}
+
+function shouldIgnoreFileName(name: string): boolean {
+  return IGNORED_FILE_NAMES.has(name) || SECRET_FILE_PATTERNS.some((pattern) => pattern.test(name));
 }
 
 export class RepoIndexer {
@@ -145,7 +186,7 @@ export class RepoIndexer {
     try {
       const entries = await fs.readdir(this.cwd, { withFileTypes: true });
       topLevelEntries = entries
-        .filter((entry) => !IGNORED_DIR_NAMES.has(entry.name))
+        .filter((entry) => !IGNORED_DIR_NAMES.has(entry.name) && !shouldIgnoreFileName(entry.name))
         .map((entry) => entry.name)
         .sort((left, right) => left.localeCompare(right));
     } catch {
@@ -168,6 +209,9 @@ export class RepoIndexer {
       const list = await fs.readdir(dir, { withFileTypes: true });
       for (const item of list) {
         if (item.isDirectory() && IGNORED_DIR_NAMES.has(item.name)) {
+          continue;
+        }
+        if (item.isFile() && shouldIgnoreFileName(item.name)) {
           continue;
         }
         
@@ -290,6 +334,227 @@ export class RepoIndexer {
     return inventory;
   }
 
+  async inspectProject(): Promise<ProjectInspection> {
+    type PackageJson = {
+      name?: unknown;
+      scripts?: unknown;
+      dependencies?: Record<string, unknown>;
+      devDependencies?: Record<string, unknown>;
+      workspaces?: unknown;
+    };
+
+    const readText = async (relativePath: string): Promise<string | null> => {
+      if (shouldIgnoreFileName(path.basename(relativePath))) {
+        return null;
+      }
+      try {
+        return await fs.readFile(path.join(this.cwd, relativePath), 'utf8');
+      } catch {
+        return null;
+      }
+    };
+    const exists = async (relativePath: string): Promise<boolean> => {
+      if (shouldIgnoreFileName(path.basename(relativePath))) {
+        return false;
+      }
+      try {
+        await fs.access(path.join(this.cwd, relativePath));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const existingFrom = async (candidates: string[]): Promise<string[]> => {
+      const checks = await Promise.all(candidates.map(async (candidate) => [candidate, await exists(candidate)] as const));
+      return checks.filter(([, found]) => found).map(([candidate]) => candidate);
+    };
+    const listDirectory = async (relativePath: string): Promise<string[]> => {
+      try {
+        const entries = await fs.readdir(path.join(this.cwd, relativePath), { withFileTypes: true });
+        return entries
+          .filter((entry) => !IGNORED_DIR_NAMES.has(entry.name) && !shouldIgnoreFileName(entry.name))
+          .map((entry) => entry.name)
+          .sort((left, right) => left.localeCompare(right));
+      } catch {
+        return [];
+      }
+    };
+
+    const packageRaw = await readText('package.json');
+    let manifest: PackageJson = {};
+    if (packageRaw) {
+      try {
+        manifest = JSON.parse(packageRaw) as PackageJson;
+      } catch {
+        manifest = {};
+      }
+    }
+
+    const scripts = manifest.scripts && typeof manifest.scripts === 'object' && !Array.isArray(manifest.scripts)
+      ? Object.fromEntries(
+          Object.entries(manifest.scripts)
+            .filter((entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string')
+            .map(([scriptName, command]) => [scriptName.trim(), command.trim()])
+            .filter(([scriptName, command]) => scriptName.length > 0 && command.length > 0),
+        )
+      : {};
+    const deps = new Set([
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.devDependencies ?? {}),
+    ]);
+    const projectName = typeof manifest.name === 'string' && manifest.name.trim()
+      ? manifest.name.trim()
+      : path.basename(this.cwd);
+
+    const entryCandidates = [
+      'server.js',
+      'app.js',
+      'index.js',
+      'main.js',
+      'src/index.ts',
+      'src/index.tsx',
+      'src/index.js',
+      'src/index.jsx',
+      'src/main.ts',
+      'src/main.tsx',
+      'src/main.js',
+      'src/main.jsx',
+      'src/App.tsx',
+      'src/App.jsx',
+      'src/App.ts',
+      'src/App.js',
+    ];
+    const configCandidates = [
+      'vite.config.ts',
+      'vite.config.js',
+      'next.config.js',
+      'next.config.mjs',
+      'next.config.ts',
+      'tsconfig.json',
+    ];
+    const lockfileCandidates = ['pnpm-lock.yaml', 'yarn.lock', 'bun.lockb', 'package-lock.json'];
+    const [mainEntryPoints, configFiles, lockfiles, readme, views, publicFiles] = await Promise.all([
+      existingFrom(entryCandidates),
+      existingFrom(configCandidates),
+      existingFrom(lockfileCandidates),
+      readText('README.md'),
+      listDirectory('views'),
+      listDirectory('public'),
+    ]);
+
+    const frameworkSignals = new Set<string>();
+    const frontendSignals = new Set<string>();
+    const backendSignals = new Set<string>();
+
+    if (deps.has('react')) {
+      frameworkSignals.add('React');
+      frontendSignals.add('React UI');
+    }
+    if (deps.has('vite') || configFiles.some((file) => file.startsWith('vite.config'))) {
+      frameworkSignals.add('Vite');
+      frontendSignals.add('Vite dev/build tooling');
+    }
+    if (deps.has('next') || configFiles.some((file) => file.startsWith('next.config'))) {
+      frameworkSignals.add('Next.js');
+      frontendSignals.add('Next.js app');
+    }
+    if (deps.has('express')) {
+      frameworkSignals.add('Express');
+      backendSignals.add('Express HTTP server');
+    }
+    if (deps.has('ejs')) {
+      frameworkSignals.add('EJS');
+      backendSignals.add('server-rendered EJS views');
+    }
+    if (deps.has('typescript') || configFiles.includes('tsconfig.json') || mainEntryPoints.some((file) => /\.(ts|tsx)$/.test(file))) {
+      frameworkSignals.add('TypeScript');
+    }
+    if (publicFiles.length > 0) {
+      frontendSignals.add('public static assets');
+    }
+    if (views.length > 0) {
+      backendSignals.add('views directory');
+    }
+
+    const hasWorkspaces = Array.isArray(manifest.workspaces) || mainEntryPoints.some((entry) => entry.startsWith('apps/'));
+    const likelyProjectType = deps.has('next')
+      ? 'Next.js web app'
+      : deps.has('vite') && deps.has('react')
+        ? 'Vite React frontend'
+        : deps.has('express') && views.length > 0
+          ? 'Express server-rendered web app'
+          : deps.has('express')
+            ? 'Node/Express backend'
+            : hasWorkspaces
+              ? 'Node workspace/monorepo'
+              : packageRaw
+                ? 'Node.js package'
+                : 'unclassified local project';
+
+    const packageManager = lockfiles.includes('pnpm-lock.yaml')
+      ? 'pnpm'
+      : lockfiles.includes('yarn.lock')
+        ? 'yarn'
+        : lockfiles.includes('bun.lockb')
+          ? 'bun'
+          : lockfiles.includes('package-lock.json')
+            ? 'npm'
+            : packageRaw
+              ? 'npm or compatible'
+              : 'unknown';
+
+    const howToRun = ['dev', 'start', 'serve', 'preview', 'test']
+      .filter((scriptName) => typeof scripts[scriptName] === 'string')
+      .map((scriptName) => `${packageManager} run ${scriptName}`);
+    const obviousMissingFiles = [
+      packageRaw ? null : 'package.json missing',
+      readme ? null : 'README.md missing',
+      mainEntryPoints.length > 0 ? null : 'no common entry file found',
+      Object.keys(scripts).length > 0 ? null : 'no package scripts found',
+      typeof scripts.test === 'string' && !/no test specified/i.test(scripts.test) ? null : 'no real test script detected',
+    ].filter((entry): entry is string => Boolean(entry));
+
+    const inspectedFiles = [
+      packageRaw ? 'package.json' : null,
+      readme ? 'README.md' : null,
+      ...mainEntryPoints,
+      ...configFiles,
+      ...lockfiles,
+      views.length > 0 ? 'views/' : null,
+      publicFiles.length > 0 ? 'public/' : null,
+    ].filter((entry): entry is string => Boolean(entry));
+    const nextRecommendedCheck = typeof scripts.test === 'string' && !/no test specified/i.test(scripts.test)
+      ? `${packageManager} run test`
+      : howToRun[0] ?? 'open the main entry file and add a real test script';
+    const summary = [
+      `${projectName}: ${likelyProjectType}.`,
+      frameworkSignals.size > 0 ? `Signals: ${Array.from(frameworkSignals).join(', ')}.` : 'Signals: no framework dependency detected.',
+      mainEntryPoints.length > 0 ? `Entry points: ${mainEntryPoints.join(', ')}.` : 'Entry points: none of the common entry files found.',
+      howToRun.length > 0 ? `Run commands: ${howToRun.join('; ')}.` : 'Run commands: none detected.',
+      obviousMissingFiles.length > 0 ? `Missing/weak spots: ${obviousMissingFiles.join('; ')}.` : 'Missing/weak spots: none obvious from lightweight inspection.',
+      `Next check: ${nextRecommendedCheck}.`,
+    ].join(' ');
+
+    return {
+      cwd: this.cwd,
+      projectName,
+      likelyProjectType,
+      frameworkSignals: Array.from(frameworkSignals),
+      frontendSignals: Array.from(frontendSignals),
+      backendSignals: Array.from(backendSignals),
+      mainEntryPoints,
+      viewDirectories: views.length > 0 ? ['views/'] : [],
+      staticDirectories: publicFiles.length > 0 ? ['public/'] : [],
+      packageScripts: scripts,
+      packageManager,
+      howToRun,
+      obviousMissingFiles,
+      nextRecommendedCheck,
+      inspectedFiles,
+      summary,
+    };
+  }
+
   async buildContext(forceRefresh = false): Promise<{ context: ProjectContext; cached: boolean }> {
     if (!forceRefresh && this.contextCache && this.contextCache.expiresAt > Date.now()) {
       return { context: this.contextCache.value, cached: true };
@@ -349,11 +614,12 @@ export class RepoIndexer {
   async buildTaskContext(input: {
     userRequest: string;
     intent: string;
-    complexity: TaskComplexity;
+    taskIntent: TaskIntent;
+    sizeEstimate: TaskSizeEstimate;
   }): Promise<TaskContext> {
     const normalized = input.userRequest.toLowerCase();
     const area = this.classifyTaskArea(normalized, input.intent);
-    const candidates = this.getTaskAreaCandidates(area, input.complexity);
+    const candidates = this.getTaskAreaCandidates(area, input.taskIntent, input.sizeEstimate);
     const [relevantFiles, likelyTests] = await Promise.all([
       this.filterExistingPaths(candidates.files),
       this.filterExistingPaths(candidates.tests),
@@ -363,7 +629,7 @@ export class RepoIndexer {
     const ignoredFiles = candidates.files.filter((entry) => !relevantFiles.includes(entry));
     const reason = [
       `Matched task area ${area} from intent ${input.intent}.`,
-      `Complexity ${input.complexity} limits context to likely entry points and tests.`,
+      `Task intent ${input.taskIntent} and size ${input.sizeEstimate} limit context to likely entry points and tests.`,
     ].join(' ');
 
     return {
@@ -397,7 +663,7 @@ export class RepoIndexer {
     if (/\b(orchestrator|orchestration|task plan|taskplan|complex task|decomposition|checkpoint|agent loop)\b/.test(normalizedRequest)) {
       return 'task_orchestration';
     }
-    if (/\b(core|engine|agentic|planner|session|trace|approval queue|workspace policy)\b/.test(normalizedRequest)) {
+    if (/\b(core|engine|agent work|planner|session|trace|approval queue|workspace policy)\b/.test(normalizedRequest)) {
       return 'core_engine';
     }
     if (/\b(tool|patch|edit tool|file edit|shell|command|replace range|unified patch)\b/.test(normalizedRequest)) {
@@ -424,11 +690,11 @@ export class RepoIndexer {
     return 'unknown';
   }
 
-  private getTaskAreaCandidates(area: TaskArea, complexity: TaskComplexity): { files: string[]; entryPoints: string[]; tests: string[] } {
+  private getTaskAreaCandidates(area: TaskArea, taskIntent: TaskIntent, sizeEstimate: TaskSizeEstimate): { files: string[]; entryPoints: string[]; tests: string[] } {
     const sharedTests = ['tests/unit/core.test.ts', 'tests/integration/workflow.test.ts', 'tests/e2e/api.test.ts'];
     const areaFiles: Record<TaskArea, string[]> = {
       web_ui: [
-        'apps/web/src/HarnessApp.tsx',
+        'apps/web/src/app/HarnessApp.tsx',
         'apps/web/src/App.tsx',
         'apps/web/src/main.tsx',
         'apps/web/src/index.css',
@@ -503,17 +769,17 @@ export class RepoIndexer {
         'views/index.ejs',
         'packages/core/src/engine.ts',
         'apps/api/src/server.ts',
-        'apps/web/src/HarnessApp.tsx',
+        'apps/web/src/app/HarnessApp.tsx',
       ],
     };
 
     const expanded = new Set<string>(areaFiles[area]);
-    if (complexity === 'architecture_change' || complexity === 'multi_file') {
+    if (sizeEstimate !== 'small' && sizeEstimate !== 'none') {
       for (const file of [
         'package.json',
         'packages/core/src/engine.ts',
         'apps/api/src/server.ts',
-        'apps/web/src/HarnessApp.tsx',
+        'apps/web/src/app/HarnessApp.tsx',
         'apps/web/src/index.css',
         'tests/unit/core.test.ts',
       ]) {

@@ -37,10 +37,10 @@ export function CurrentTaskCard({ plan, currentStepId, progress, phase, streamSt
     <section className="run-console-section run-console-current">
       <div className="run-console-section-head">
         <span>Current Task</span>
-        <span>{plan?.complexity || 'idle'}</span>
+        <span>{plan?.intent || 'idle'}</span>
       </div>
       <h2>{plan?.title || 'No active run'}</h2>
-      <p>{plan?.summary || 'Agentic work appears here when a run starts.'}{fallbackReason ? ` · ${fallbackReason}` : ''}</p>
+      <p>{plan?.summary || 'Agent Work appears here when a run starts.'}{fallbackReason ? ` · ${fallbackReason}` : ''}</p>
       <div className="run-console-metric-strip">
         <div>
           <span>Phase</span>

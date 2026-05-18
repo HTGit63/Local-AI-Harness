@@ -22,7 +22,7 @@ export const DEFAULT_CONFIG: Required<Omit<AdapterOptions, 'profile'>> & { profi
   baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1',
   apiKey: process.env.OPENAI_API_KEY || 'ollama',
   model: process.env.HARNESS_MODEL || 'gemma4:e4b',
-  profile: 'fast',
+  profile: 'balanced',
   timeoutMs: 60000,
   retries: 1
 };

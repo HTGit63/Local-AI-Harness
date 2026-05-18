@@ -10,21 +10,68 @@ import { WorkspacePolicy } from '@local-harness/workspace-policy';
 async function testSessionStore() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-sessions-'));
   const store = new FileSessionStore(tempDir);
+  const now = Date.now();
 
   await store.saveSession({
     id: 'session-1',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+    createdAt: now,
+    updatedAt: now,
     model: 'gemma4:e4b',
     mode: 'workspace-write',
     cwd: tempDir,
     skillsActive: ['engineering-frontend-developer'],
     toolsAllowlist: ['read_file'],
+    turnHistory: Array.from({ length: 55 }, (_, index) => ({
+      timestamp: now + index,
+      executionMode: 'agent',
+      promptMode: 'implementation',
+      messageCount: 2,
+      intent: 'implementation',
+      summary: index === 54 ? 'stored token=sk-testsecret1234567890 for redaction' : `turn ${index}`,
+      runSummary: index === 54 ? {
+        id: 'run-heavy',
+        executionMode: 'agent',
+        intent: 'implementation',
+        startedAt: now,
+        endedAt: now + 10,
+        filesRead: ['src/index.ts'],
+        directoriesRead: [],
+        filesWritten: ['src/index.ts'],
+        filesDeleted: [],
+        directoriesCreated: [],
+        commands: [{ command: 'npm test', success: true }],
+        approvals: [],
+        summary: 'finished with apiKey=sk-testsecret1234567890',
+        finalAnswer: 'large answer should not persist',
+        structuredDiff: {
+          files: [
+            { path: 'src/index.ts', addedLines: 1, removedLines: 0, hunks: [] },
+            { path: 'src/index.ts', addedLines: 1, removedLines: 0, hunks: [] },
+          ],
+        },
+      } : undefined,
+    })) as any,
   });
 
   const loaded = await store.loadSession('session-1');
   assert.ok(loaded);
   assert.strictEqual(loaded?.model, 'gemma4:e4b');
+  assert.strictEqual(loaded?.turnHistory?.length, 48);
+  assert.ok(loaded?.turnHistory);
+  const latestTurn = loaded.turnHistory[loaded.turnHistory.length - 1];
+  assert.ok(latestTurn?.summary?.includes('[REDACTED_SECRET]'));
+  assert.strictEqual(latestTurn?.runSummary?.runId, 'run-heavy');
+  assert.deepStrictEqual(latestTurn?.runSummary?.commandsRun, ['npm test']);
+  assert.deepStrictEqual(latestTurn?.runSummary?.filesChanged, ['src/index.ts']);
+  assert.ok(!JSON.stringify(latestTurn?.runSummary).includes('finalAnswer'));
+  assert.ok(!JSON.stringify(latestTurn?.runSummary).includes('structuredDiff'));
+
+  const mainFile = await fs.readFile(path.join(tempDir, 'session-1.json'), 'utf8');
+  assert.ok(!mainFile.includes('turnHistory'));
+  const turnsFile = await fs.readFile(path.join(tempDir, 'session-1-turns.jsonl'), 'utf8');
+  assert.ok(turnsFile.split('\n').filter(Boolean).length <= 48);
+  assert.ok(!turnsFile.includes('sk-testsecret'));
+  assert.ok(!turnsFile.includes('large answer should not persist'));
   assert.strictEqual((await store.listSessions()).length, 1);
   assert.strictEqual(await store.deleteSession('session-1'), true);
   await fs.rm(tempDir, { recursive: true, force: true });

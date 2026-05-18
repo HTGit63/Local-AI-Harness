@@ -60,6 +60,23 @@ const engine = new CoreEngine({
 });
 let modelRuntimeCache: { value: ModelRuntimeState; expiresAt: number } | null = null;
 let skillsCatalogPromise: Promise<Array<{ slug: string }>> | null = null;
+type ApiExecutionMode = 'chat' | 'agent';
+
+function parseExecutionMode(body: Record<string, unknown>): ApiExecutionMode {
+  if (body.mode === 'agent') {
+    return 'agent';
+  }
+  if (body.mode === 'chat') {
+    return 'chat';
+  }
+  if (body.agentic === true) {
+    return 'agent';
+  }
+  if (body.agentic === false) {
+    return 'chat';
+  }
+  return 'chat';
+}
 
 async function getCachedModelRuntime(force = false): Promise<ModelRuntimeState> {
   const now = Date.now();
@@ -526,16 +543,16 @@ const server = http.createServer(async (req, res) => {
       }
       if (
         body.contextBudget !== undefined &&
-        (typeof body.contextBudget !== 'number' || !Number.isFinite(body.contextBudget) || body.contextBudget < 4000)
+        (typeof body.contextBudget !== 'number' || !Number.isFinite(body.contextBudget) || body.contextBudget < 4000 || body.contextBudget > 16000)
       ) {
-        sendBadRequest(req, res, 'contextBudget must be a number greater than or equal to 4000.');
+        sendBadRequest(req, res, 'contextBudget must be a number between 4000 and 16000.');
         return;
       }
       if (
         body.toolRetryMax !== undefined &&
-        (typeof body.toolRetryMax !== 'number' || !Number.isFinite(body.toolRetryMax) || body.toolRetryMax < 0)
+        (typeof body.toolRetryMax !== 'number' || !Number.isFinite(body.toolRetryMax) || body.toolRetryMax < 0 || body.toolRetryMax > 2)
       ) {
-        sendBadRequest(req, res, 'toolRetryMax must be a non-negative number.');
+        sendBadRequest(req, res, 'toolRetryMax must be a number between 0 and 2.');
         return;
       }
       if (body.sessionMemoryEnabled !== undefined && typeof body.sessionMemoryEnabled !== 'boolean') {
@@ -544,13 +561,17 @@ const server = http.createServer(async (req, res) => {
       }
       if (
         body.sessionMemoryTurns !== undefined &&
-        (typeof body.sessionMemoryTurns !== 'number' || !Number.isFinite(body.sessionMemoryTurns) || body.sessionMemoryTurns < 1)
+        (typeof body.sessionMemoryTurns !== 'number' || !Number.isFinite(body.sessionMemoryTurns) || body.sessionMemoryTurns < 1 || body.sessionMemoryTurns > 3)
       ) {
-        sendBadRequest(req, res, 'sessionMemoryTurns must be a number greater than or equal to 1.');
+        sendBadRequest(req, res, 'sessionMemoryTurns must be a number between 1 and 3.');
         return;
       }
       if (body.selfCheckEnabled !== undefined && typeof body.selfCheckEnabled !== 'boolean') {
         sendBadRequest(req, res, 'selfCheckEnabled must be a boolean.');
+        return;
+      }
+      if (body.advancedAgentToolsEnabled !== undefined && typeof body.advancedAgentToolsEnabled !== 'boolean') {
+        sendBadRequest(req, res, 'advancedAgentToolsEnabled must be a boolean.');
         return;
       }
       const streamIdleTimeoutMs = body.streamIdleTimeoutMs;
@@ -648,8 +669,13 @@ const server = http.createServer(async (req, res) => {
       try {
         const body = await readBody(req);
         let messages = Array.isArray(body.messages) ? body.messages : [];
-        const isAgentic = body.agentic !== false;
+        const executionMode = parseExecutionMode(body);
         const thinkingEnabled = typeof body.thinking === 'boolean' ? body.thinking : undefined;
+        if (body.advancedTools !== undefined && typeof body.advancedTools !== 'boolean') {
+          sendBadRequest(req, res, 'advancedTools must be a boolean.');
+          return;
+        }
+        const advancedTools = body.advancedTools === true;
         const images = Array.isArray(body.images) ? body.images.filter((img): img is string => typeof img === 'string') : [];
         const imageValidationError = validateChatImages(images);
         if (imageValidationError) {
@@ -667,17 +693,17 @@ const server = http.createServer(async (req, res) => {
           }
         }
 
-        if (!isAgentic) {
+        if (executionMode === 'chat') {
           const content = await engine.directChat(
             messages as { role: 'system' | 'user' | 'assistant' | 'tool'; content: string }[],
             { signal: abortController.signal, think: thinkingEnabled },
           );
-          sendJson(req, res, 200, { response: content, executionMode: 'direct', ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
+          sendJson(req, res, 200, { response: content, executionMode: 'chat', ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
           return;
         }
 
-        const response = await engine.chat(messages as { role: 'system' | 'user' | 'assistant' | 'tool'; content: string }[], { signal: abortController.signal, think: thinkingEnabled });
-        sendJson(req, res, 200, { response, executionMode: 'agentic', ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
+        const response = await engine.agentWork(messages as { role: 'system' | 'user' | 'assistant' | 'tool'; content: string }[], { signal: abortController.signal, think: thinkingEnabled, advancedTools });
+        sendJson(req, res, 200, { response, executionMode: 'agent', ...(thinkingWarning ? { warning: thinkingWarning } : {}) });
       } catch (error: any) {
         if (error?.name === 'AbortError') {
           return;
@@ -698,8 +724,15 @@ const server = http.createServer(async (req, res) => {
       try {
         const body = await readBody(req);
         let messages = Array.isArray(body.messages) ? body.messages : [];
-        const isAgentic = body.agentic !== false;
+        const executionMode = parseExecutionMode(body);
         const thinkingEnabled = typeof body.thinking === 'boolean' ? body.thinking : undefined;
+        if (body.advancedTools !== undefined && typeof body.advancedTools !== 'boolean') {
+          startNdjson(req, res);
+          writeNdjson(res, { type: 'error', message: 'advancedTools must be a boolean.' });
+          res.end();
+          return;
+        }
+        const advancedTools = body.advancedTools === true;
         const images = Array.isArray(body.images) ? body.images.filter((img): img is string => typeof img === 'string') : [];
         const imageValidationError = validateChatImages(images);
         if (imageValidationError) {
@@ -721,7 +754,7 @@ const server = http.createServer(async (req, res) => {
 
         startNdjson(req, res);
 
-        if (!isAgentic) {
+        if (executionMode === 'chat') {
           if (thinkingWarning) {
             writeNdjson(res, { type: 'status', phase: 'warning', action: thinkingWarning, loop: 0 });
           }
@@ -742,12 +775,12 @@ const server = http.createServer(async (req, res) => {
             { signal: abortController.signal, think: thinkingEnabled }
           );
 
-          writeNdjson(res, { type: 'done', response });
+          writeNdjson(res, { type: 'done', response, executionMode: 'chat' });
           res.end();
           return;
         }
 
-        const response = await engine.chatStream(
+        const response = await engine.agentWorkStream(
           messages as { role: 'system' | 'user' | 'assistant' | 'tool'; content: string }[],
           {
             onStatus: (event: { phase: string; action: string; loop: number }) => writeNdjson(res, { type: 'status', ...event }),
@@ -760,9 +793,9 @@ const server = http.createServer(async (req, res) => {
             onRunSummary: (event) => writeNdjson(res, event),
             onTrace: (event) => writeTraceNdjson(res, event),
           },
-          { signal: abortController.signal, think: thinkingEnabled },
+          { signal: abortController.signal, think: thinkingEnabled, advancedTools },
         );
-        writeNdjson(res, { type: 'done', response });
+        writeNdjson(res, { type: 'done', response, executionMode: 'agent' });
         res.end();
       } catch (error: any) {
         if (error?.name === 'AbortError') {

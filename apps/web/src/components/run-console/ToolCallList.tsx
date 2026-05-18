@@ -44,7 +44,7 @@ export function ToolCallList({ traces, currentTool }: ToolCallListProps) {
             const ok = data.success === true;
             const failed = data.success === false || data.status === 'denied' || data.status === 'rejected' || data.status === 'failed';
             const title = asText(data.tool) || asText(data.command) || 'verification';
-            const body = asText(data.inputSummary) || asText(data.outputPreview) || asText(data.reason) || asText(data.status) || 'Running.';
+            const body = asText(data.inputSummary) || asText(data.reason) || asText(data.status) || 'Running.';
             const duration = asDuration(data.durationMs);
             return (
               <div key={`${trace.timestamp}-${trace.type}-${index}`} className={`tool-call-row ${ok ? 'tool-call-row-ok' : failed ? 'tool-call-row-failed' : ''}`}>
@@ -55,7 +55,12 @@ export function ToolCallList({ traces, currentTool }: ToolCallListProps) {
                 </div>
                 <strong>{title}</strong>
                 <p>{body}</p>
-                {asText(data.outputPreview) && asText(data.inputSummary) && <p className="tool-call-output">Output: {asText(data.outputPreview)}</p>}
+                {asText(data.outputPreview) && (
+                  <details className="run-console-advanced-details tool-call-output-details">
+                    <summary>Advanced Details · Tool output</summary>
+                    <p className="tool-call-output">{asText(data.outputPreview)}</p>
+                  </details>
+                )}
               </div>
             );
           })}

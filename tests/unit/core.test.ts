@@ -10,9 +10,9 @@ import { TaskOrchestrator } from '@local-harness/task-orchestrator';
 import { WorkspacePolicy } from '@local-harness/workspace-policy';
 import { createMockFetch, MOCK_CHAT_RESPONSE, MOCK_MODEL_CAPABILITIES, MOCK_MODEL_LIST } from '../mocks/model-responses';
 
-function assertAgenticResponse(response: string, expectedPrefix: string) {
+function assertAgentWorkResponse(response: string, expectedPrefix: string) {
   assert.ok(response.startsWith(expectedPrefix), `Expected response to start with "${expectedPrefix}" but got: ${response}`);
-  assert.ok(response.includes('What I did:'), 'Expected agentic run summary in response.');
+  assert.ok(response.includes('What I did:'), 'Expected agent run summary in response.');
   assert.ok(response.includes('Files changed:'), 'Expected changed-file summary in response.');
 }
 
@@ -20,10 +20,10 @@ function assertLeanThinkingControl(value: unknown) {
   assert.ok(value === false || value === 'low', `Expected lean thinking control, got: ${String(value)}`);
 }
 
-function getLatestAgenticRunSummary(engine: CoreEngine) {
+function getLatestAgentRunSummary(engine: CoreEngine) {
   return [...(engine.getSession()?.turnHistory || [])]
     .reverse()
-    .find((turn) => turn.executionMode === 'agentic')
+    .find((turn) => turn.executionMode === 'agent')
     ?.runSummary;
 }
 
@@ -34,9 +34,10 @@ async function testConfigDefaults() {
   assert.ok(config.baseUrl.includes('11434'));
   assert.strictEqual(config.model, 'gemma4:e4b');
   assert.strictEqual(config.mode, 'workspace-write');
-  assert.strictEqual(config.profile, 'fast');
-  assert.strictEqual(config.contextBudget, 24000);
+  assert.strictEqual(config.profile, 'balanced');
+  assert.strictEqual(config.contextBudget, 16000);
   assert.strictEqual(config.toolRetryMax, 2);
+  assert.strictEqual(config.internetAccessEnabled, false);
   assert.strictEqual(config.sessionMemoryEnabled, true);
   assert.strictEqual(config.sessionMemoryTurns, 3);
   assert.strictEqual(config.selfCheckEnabled, true);
@@ -82,59 +83,67 @@ function testWorkspacePolicy() {
   assert.deepStrictEqual(dangerPolicy.checkAction('write', '/etc/passwd').allowed, false);
 }
 
-function testTaskOrchestratorClassifiesComplexity() {
+function testTaskOrchestratorClassifiesIntent() {
   const orchestrator = new TaskOrchestrator();
 
   assert.strictEqual(orchestrator.classifyComplexity({
     userRequest: 'Which model is active?',
     intent: 'model_status',
-  }), 'direct_answer');
+  }), 'chat');
 
   assert.strictEqual(orchestrator.classifyComplexity({
-    userRequest: 'Fix apps/web/src/HarnessApp.tsx',
+    userRequest: 'Fix apps/web/src/app/HarnessApp.tsx',
     intent: 'edit_code',
-  }), 'single_file');
+  }), 'edit_file');
 
   assert.strictEqual(orchestrator.classifyComplexity({
     userRequest: 'Refactor the web UI into components and add a run console',
     intent: 'edit_code',
-  }), 'multi_file');
+  }), 'edit_file');
 
   assert.strictEqual(orchestrator.classifyComplexity({
     userRequest: 'Add a task orchestrator and fix complex agent execution architecture',
     intent: 'edit_code',
-  }), 'architecture_change');
+  }), 'edit_file');
 
   assert.strictEqual(orchestrator.classifyComplexity({
     userRequest: 'Audit the whole codebase and find all bottlenecks',
     intent: 'read_repo',
-  }), 'repo_wide_audit');
+  }), 'full_audit');
 
   assert.strictEqual(orchestrator.classifyComplexity({
-    userRequest: 'Look at the art gallery website and tell me what kind of project it is and if there are any bugs',
+    userRequest: 'Look at the sample website and tell me what kind of project it is and if there are any bugs',
     intent: 'general_chat',
-  }), 'repo_wide_audit');
+  }), 'inspect_project');
 
   assert.strictEqual(orchestrator.classifyComplexity({
-    userRequest: 'Rewrite the whole project from scratch',
-    intent: 'edit_code',
-  }), 'unsafe_or_too_broad');
+    userRequest: 'Run npm test',
+    intent: 'run_command',
+  }), 'run_command');
+
+  assert.strictEqual(orchestrator.classifyComplexity({
+    userRequest: 'Summarize current git diff',
+    intent: 'review_diff',
+  }), 'summarize_changes');
 }
 
 function testTaskOrchestratorPlanAndStepTransitions() {
   const orchestrator = new TaskOrchestrator();
   const plan = orchestrator.createPlan({
-    userRequest: 'Fix apps/web/src/HarnessApp.tsx',
+    userRequest: 'Fix apps/web/src/app/HarnessApp.tsx',
     intent: 'edit_code',
     workspaceRoot: '/repo',
   });
 
-  assert.strictEqual(plan.complexity, 'single_file');
+  assert.strictEqual(plan.intent, 'edit_file');
+  assert.strictEqual(plan.sizeEstimate, 'small');
+  assert.strictEqual((plan as any).complexity, undefined);
   assert.deepStrictEqual(plan.steps.map((step) => step.type), ['inspect', 'edit', 'verify', 'summarize']);
+  assert.ok(plan.stopCondition.includes('minimal patch'));
 
   const first = orchestrator.getNextStep(plan);
   assert.ok(first);
-  assert.strictEqual(first?.id, 'inspect_target');
+  assert.strictEqual(first?.id, 'inspect');
 
   const running = orchestrator.markStepRunning(plan, first!.id);
   assert.strictEqual(running.steps[0].status, 'running');
@@ -142,16 +151,26 @@ function testTaskOrchestratorPlanAndStepTransitions() {
   const done = orchestrator.markStepDone(running, first!.id, 'Read target file');
   assert.strictEqual(done.steps[0].status, 'done');
   assert.strictEqual(done.steps[0].detail, 'Read target file');
-  assert.strictEqual(orchestrator.getNextStep(done)?.id, 'focused_action');
+  assert.ok(done.evidence.includes('Read target file'));
+  assert.strictEqual(orchestrator.getNextStep(done)?.id, 'edit');
 
-  const failed = orchestrator.markStepFailed(done, 'focused_action', 'Patch rejected');
+  const revised = orchestrator.revisePlan(done, { nextAction: 'Narrow edit scope', evidence: ['Need smaller patch'] });
+  assert.strictEqual(revised.nextAction, 'Narrow edit scope');
+  assert.ok(revised.evidence.includes('Need smaller patch'));
+  assert.ok(revised.revisedAt);
+
+  const failed = orchestrator.markStepFailed(done, 'edit', 'Patch rejected');
   assert.strictEqual(failed.steps[1].status, 'failed');
   assert.ok(failed.failedAt);
 
-  const blocked = orchestrator.markStepBlocked(done, 'focused_action', 'Approval pending');
+  const blocked = orchestrator.markStepBlocked(done, 'edit', 'Approval pending');
   assert.strictEqual(blocked.steps[1].status, 'blocked');
   assert.strictEqual(orchestrator.isComplete(blocked), false);
   assert.ok(orchestrator.summarizeProgress(blocked).includes('1/4 steps done'));
+
+  const safeIdle = orchestrator.markSafeIdle(done, 'Approval rejected');
+  assert.strictEqual(safeIdle.status, 'safe_idle');
+  assert.ok(safeIdle.evidence.includes('Approval rejected'));
 }
 
 async function testModelAdapter() {
@@ -170,6 +189,7 @@ async function testModelAdapter() {
     assert.strictEqual(response.choices[0].message.content, MOCK_CHAT_RESPONSE.choices[0].message.content);
     const runtimeBefore = await adapter.getRuntimeState();
     assert.strictEqual(runtimeBefore.activeModel, null);
+    assert.strictEqual(runtimeBefore.runtimeStatus, 'idle');
     assert.ok(runtimeBefore.installedModels.includes('qwen3.5:9b-q4_K_M'));
     assert.deepStrictEqual(runtimeBefore.configuredModelCapabilities, MOCK_MODEL_CAPABILITIES['gemma4:e4b']);
     assert.strictEqual(runtimeBefore.reasoningSupported, true);
@@ -180,12 +200,18 @@ async function testModelAdapter() {
     const switchResult = await adapter.activateModel('qwen3.5:9b-q4_K_M', 'gemma4:e4b');
     assert.strictEqual(switchResult.activeModel, 'qwen3.5:9b-q4_K_M');
     assert.deepStrictEqual(switchResult.runningModels.map((entry) => entry.model), ['qwen3.5:9b-q4_K_M']);
+    assert.deepStrictEqual(switchResult.unloadedModels, []);
 
     const runtimeAfter = await adapter.getRuntimeState();
     assert.strictEqual(runtimeAfter.activeModel, 'qwen3.5:9b-q4_K_M');
+    assert.strictEqual(runtimeAfter.runtimeStatus, 'configured_not_loaded');
     assert.strictEqual(runtimeAfter.lastSwitchResult?.requestedModel, 'qwen3.5:9b-q4_K_M');
     assert.strictEqual(runtimeAfter.lifecyclePolicy.chatTimeoutMs >= 180_000, true);
     assert.strictEqual(PROFILES.fast.max_tokens, 512);
+
+    const secondSwitch = await adapter.activateModel('gemma4:e4b', 'qwen3.5:9b-q4_K_M');
+    assert.deepStrictEqual(secondSwitch.unloadedModels, []);
+    assert.deepStrictEqual(secondSwitch.runningModels.map((entry) => entry.model).sort(), ['gemma4:e4b', 'qwen3.5:9b-q4_K_M'].sort());
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -221,6 +247,36 @@ async function testModelAdapterPrefersNativeOllamaChat() {
   }
 }
 
+async function testModelAdapterCapsLocalOutputTokens() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+  }) as typeof fetch;
+
+  try {
+    const cases: Array<[string, number]> = [
+      ['gemma4:e4b', 2048],
+      ['deepseek-coder-v2:latest', 2048],
+      ['qwen3.5:9b-q4_K_M', 1536],
+    ];
+
+    for (const [model, expectedCap] of cases) {
+      const adapter = new ModelAdapter({ model, profile: 'deep' });
+      await adapter.createChatCompletion({
+        messages: [{ role: 'user', content: 'write a bounded response' }],
+        max_tokens: 50000,
+      });
+      const latestRequest = chatRequests[chatRequests.length - 1];
+      assert.strictEqual(latestRequest.options.num_predict, expectedCap);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function testEnginePromptRecipeSelection() {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = createMockFetch() as typeof fetch;
@@ -230,7 +286,7 @@ async function testEnginePromptRecipeSelection() {
     const response = await engine.chat([
       { role: 'user', content: 'Review this diff for regressions' },
     ]);
-    assertAgenticResponse(response, MOCK_CHAT_RESPONSE.choices[0].message.content);
+    assertAgentWorkResponse(response, MOCK_CHAT_RESPONSE.choices[0].message.content);
     assert.ok(engine.getTraceLog().some((entry) => entry.type === 'prompt_recipe_selected'));
   } finally {
     globalThis.fetch = originalFetch;
@@ -311,7 +367,7 @@ async function testEngineChatStream() {
       },
     );
 
-    assertAgenticResponse(response, '<think>Inspecting files</think>Streamed answer');
+    assertAgentWorkResponse(response, '<think>Inspecting files</think>Streamed answer');
     assert.ok(deltas.join('').includes('<think>Inspecting files</think>Streamed answer'));
     assert.ok(statuses.some((entry) => entry.includes('Generating assistant response')));
     assert.ok(statuses.some((entry) => entry.includes('Awaiting user input')));
@@ -399,19 +455,19 @@ async function testEngineRecordsExecutionModes() {
 
   try {
     const engine = new CoreEngine();
-    await engine.recordTurnExecution('direct', { messageCount: 1, thinkingEnabled: false });
+    await engine.recordTurnExecution('chat', { messageCount: 1, thinkingEnabled: false });
 
     const firstSession = engine.getSession();
-    assert.strictEqual(firstSession?.turnHistory?.[0]?.executionMode, 'direct');
-    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'chat_turn_mode' && (entry.data as { executionMode?: string }).executionMode === 'direct'));
+    assert.strictEqual(firstSession?.turnHistory?.[0]?.executionMode, 'chat');
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'chat_turn_mode' && (entry.data as { executionMode?: string }).executionMode === 'chat'));
 
     await engine.chat([
       { role: 'user', content: 'Reply with exactly: PING' },
     ]);
 
     const modes = engine.getSession()?.turnHistory?.map((turn) => turn.executionMode) || [];
-    assert.ok(modes.includes('agentic'));
-    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'chat_turn_mode' && (entry.data as { executionMode?: string }).executionMode === 'agentic'));
+    assert.ok(modes.includes('agent'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'chat_turn_mode' && (entry.data as { executionMode?: string }).executionMode === 'agent'));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -468,6 +524,117 @@ async function testDirectChatDoesNotCreateTaskPlan() {
   }
 }
 
+async function testDirectChatStreamRetriesVisibleOnIdle() {
+  const originalFetch = globalThis.fetch;
+  const fallbackFetch = createMockFetch({
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [
+        {
+          ...MOCK_CHAT_RESPONSE.choices[0],
+          message: { role: 'assistant', content: 'Recovered from stalled stream.' },
+        },
+      ],
+    }),
+  });
+  let stalledStreamCalls = 0;
+
+  globalThis.fetch = (async (url: any, opts?: any) => {
+    const requestUrl = String(url);
+    const body = typeof opts?.body === 'string' && opts.body.trim() ? JSON.parse(opts.body) : {};
+    if (requestUrl.includes('/api/chat') && body.stream) {
+      stalledStreamCalls += 1;
+      const error = new Error('stream stalled') as Error & { code: string; receivedContent: boolean };
+      error.code = 'stream_idle_timeout';
+      error.receivedContent = false;
+      return {
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.error(error);
+          },
+        }),
+      } as any;
+    }
+    return fallbackFetch(requestUrl, opts);
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ streamIdleTimeoutMs: 1 });
+    const statuses: string[] = [];
+    const deltas: string[] = [];
+    const response = await engine.directChatStream(
+      [{ role: 'user', content: 'Reply after a stall' }],
+      {
+        onStatus(event) {
+          statuses.push(event.phase);
+        },
+        onDelta(chunk) {
+          deltas.push(chunk);
+        },
+      },
+    );
+
+    assert.strictEqual(stalledStreamCalls, 1);
+    assert.ok(response.includes('Recovered from stalled stream.'));
+    assert.ok(deltas.join('').includes('Recovered from stalled stream.'));
+    assert.ok(statuses.includes('model_loading'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'stream_idle_timeout_retry'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testProjectInspectionUsesDeterministicPathWithoutCheckpoint() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sample-vite-app-'));
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({
+    name: 'sample-vite-app',
+    scripts: {
+      dev: 'vite',
+      build: 'vite build',
+    },
+    dependencies: {
+      '@vitejs/plugin-react': '^5.0.0',
+      vite: '^8.0.0',
+      react: '^19.0.0',
+    },
+    devDependencies: {
+      typescript: '^5.0.0',
+    },
+  }), 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'main.tsx'), 'import React from "react";\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'vite.config.ts'), 'export default {};\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n', 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot });
+    const response = await engine.directChat([
+      { role: 'user', content: 'What kind of project is this app?' },
+    ]);
+
+    assert.ok(response.includes('Project: sample-vite-app'));
+    assert.ok(response.includes('Type: Vite React frontend'));
+    assert.ok(response.includes('Package manager: pnpm'));
+    assert.strictEqual(chatRequests.length, 0);
+    assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'task_plan_created'));
+    const runs = await engine.listRuns();
+    assert.strictEqual(runs.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testEngineCreatesTaskPlanTraceAndCheckpoint() {
   const originalFetch = globalThis.fetch;
   const chatRequests: any[] = [];
@@ -496,13 +663,14 @@ async function testEngineCreatesTaskPlanTraceAndCheckpoint() {
       { role: 'user', content: 'Add a task orchestrator and fix complex agent execution architecture' },
     ]);
 
-    assertAgenticResponse(response, 'Architecture pass scoped into visible steps.');
+    assertAgentWorkResponse(response, 'Architecture pass scoped into visible steps.');
     assert.ok(chatRequests.length >= 1);
     const promptPayload = JSON.stringify(chatRequests[0].messages);
     assert.ok(promptPayload.includes('[Current Task Plan]'));
     assert.ok(promptPayload.includes('[Current Step]'));
     assert.ok(promptPayload.includes('[Task Relevant Context]'));
-    assert.ok(promptPayload.includes('Task complexity: architecture_change'));
+    assert.ok(promptPayload.includes('Task intent: edit_file'));
+    assert.ok(promptPayload.includes('Task size: small'));
 
     const traceTypes = engine.getTraceLog().map((entry) => entry.type);
     assert.ok(traceTypes.includes('task_plan_created'));
@@ -511,13 +679,18 @@ async function testEngineCreatesTaskPlanTraceAndCheckpoint() {
     assert.ok(traceTypes.includes('task_checkpoint_saved'));
 
     const taskPlanTrace = engine.getTraceLog().find((entry) => entry.type === 'task_plan_created');
-    assert.strictEqual((taskPlanTrace?.data as { plan?: { complexity?: string } } | undefined)?.plan?.complexity, 'architecture_change');
+    const tracedPlan = (taskPlanTrace?.data as { plan?: { intent?: string; sizeEstimate?: string; complexity?: string } } | undefined)?.plan;
+    assert.strictEqual(tracedPlan?.intent, 'edit_file');
+    assert.strictEqual(tracedPlan?.sizeEstimate, 'small');
+    assert.strictEqual(tracedPlan?.complexity, undefined);
 
     const runFiles = await fs.readdir(path.join(workspaceRoot, '.gamma-harness', 'runs'));
     assert.ok(runFiles.some((file) => file.endsWith('.json')));
     const runs = await engine.listRuns();
     assert.ok(runs.length >= 1);
-    assert.strictEqual(runs[0].taskPlan.complexity, 'architecture_change');
+    assert.strictEqual(runs[0].taskPlan.intent, 'edit_file');
+    assert.strictEqual(runs[0].taskPlan.sizeEstimate, 'small');
+    assert.strictEqual((runs[0].taskPlan as any).complexity, undefined);
   } finally {
     globalThis.fetch = originalFetch;
     await fs.rm(workspaceRoot, { recursive: true, force: true });
@@ -582,13 +755,49 @@ async function testRepoIndexerBuildsWorkspaceInventory() {
   }
 }
 
+async function testRepoIndexerInspectsGenericExpressProject() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sample-express-app-'));
+  await fs.mkdir(path.join(workspaceRoot, 'views'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'public'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({
+    name: 'sample-express-app',
+    scripts: {
+      start: 'node server.js',
+      test: 'node --test',
+    },
+    dependencies: {
+      express: '^5.0.0',
+      ejs: '^3.1.0',
+    },
+  }), 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'server.js'), 'import express from "express";\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'views', 'index.ejs'), '<main>ok</main>\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'public', 'app.css'), 'body {}\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'package-lock.json'), '{}\n', 'utf8');
+
+  try {
+    const indexer = new RepoIndexer(workspaceRoot);
+    const inspection = await indexer.inspectProject();
+    assert.strictEqual(inspection.projectName, 'sample-express-app');
+    assert.strictEqual(inspection.likelyProjectType, 'Express server-rendered web app');
+    assert.ok(inspection.frameworkSignals.includes('Express'));
+    assert.ok(inspection.frameworkSignals.includes('EJS'));
+    assert.ok(inspection.mainEntryPoints.includes('server.js'));
+    assert.ok(inspection.staticDirectories.includes('public/'));
+    assert.strictEqual(inspection.packageManager, 'npm');
+    assert.ok(inspection.howToRun.includes('npm run start'));
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testRepoIndexerBuildsTaskContext() {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-task-context-'));
-  await fs.mkdir(path.join(workspaceRoot, 'apps', 'web', 'src'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'apps', 'web', 'src', 'app'), { recursive: true });
   await fs.mkdir(path.join(workspaceRoot, 'packages', 'core', 'src'), { recursive: true });
   await fs.mkdir(path.join(workspaceRoot, 'packages', 'planner', 'src'), { recursive: true });
   await fs.mkdir(path.join(workspaceRoot, 'tests', 'unit'), { recursive: true });
-  await fs.writeFile(path.join(workspaceRoot, 'apps', 'web', 'src', 'HarnessApp.tsx'), 'export default function App() { return null; }\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'apps', 'web', 'src', 'app', 'HarnessApp.tsx'), 'export default function App() { return null; }\n', 'utf8');
   await fs.writeFile(path.join(workspaceRoot, 'apps', 'web', 'src', 'index.css'), ':root {}\n', 'utf8');
   await fs.writeFile(path.join(workspaceRoot, 'packages', 'core', 'src', 'engine.ts'), 'export const engine = true;\n', 'utf8');
   await fs.writeFile(path.join(workspaceRoot, 'packages', 'planner', 'src', 'planner.ts'), 'export const planner = true;\n', 'utf8');
@@ -599,16 +808,18 @@ async function testRepoIndexerBuildsTaskContext() {
     const webContext = await indexer.buildTaskContext({
       userRequest: 'Redesign the messy web UI and add a right run console',
       intent: 'edit_code',
-      complexity: 'multi_file',
+      taskIntent: 'edit_file',
+      sizeEstimate: 'medium',
     });
     assert.strictEqual(webContext.taskArea, 'web_ui');
-    assert.ok(webContext.relevantFiles.includes('apps/web/src/HarnessApp.tsx'));
+    assert.ok(webContext.relevantFiles.includes('apps/web/src/app/HarnessApp.tsx'));
     assert.ok(webContext.relevantFiles.includes('apps/web/src/index.css'));
 
     const architectureContext = await indexer.buildTaskContext({
       userRequest: 'Add task orchestration to the agent loop architecture',
       intent: 'edit_code',
-      complexity: 'architecture_change',
+      taskIntent: 'edit_file',
+      sizeEstimate: 'medium',
     });
     assert.strictEqual(architectureContext.taskArea, 'task_orchestration');
     assert.ok(architectureContext.relevantFiles.includes('packages/core/src/engine.ts'));
@@ -634,7 +845,7 @@ async function testEngineKeepsSimplePromptsLean() {
       { role: 'user', content: 'Reply with exactly: PING' },
     ]);
 
-    assertAgenticResponse(response, MOCK_CHAT_RESPONSE.choices[0].message.content);
+    assertAgentWorkResponse(response, MOCK_CHAT_RESPONSE.choices[0].message.content);
     assert.ok(chatRequests.length >= 1);
     const payload = JSON.stringify(chatRequests[0]);
     assert.ok(!payload.includes('[Repo Context Summary]'));
@@ -665,7 +876,7 @@ async function testEnginePrefersNativeToolsForGemmaTargetedEdits() {
       { role: 'user', content: 'Fix src/index.ts so it exports a default value' },
     ]);
 
-    assertAgenticResponse(response, 'export const ok = true;');
+    assertAgentWorkResponse(response, 'export const ok = true;');
     assert.ok(chatRequests.length >= 1);
     assert.ok(Array.isArray(chatRequests[0].tools));
     assert.ok(chatRequests[0].tools.length > 0);
@@ -697,13 +908,13 @@ async function testEngineKeepsNativeToolsWhenCapabilitiesOmitTools() {
       { role: 'user', content: 'Fix src/index.ts so it exports a default value' },
     ]);
 
-    assertAgenticResponse(response, 'Native tool trial stayed active.');
+    assertAgentWorkResponse(response, 'Native tool trial stayed active.');
     assert.ok(chatRequests.length >= 1);
     assert.ok(Array.isArray(chatRequests[0].tools));
     assert.ok(chatRequests[0].tools.length > 0);
     assert.ok(!JSON.stringify(chatRequests[0].messages).includes('Use exactly one JSON tool action at a time.'));
     assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'manual_tool_fallback'));
-    const runSummary = getLatestAgenticRunSummary(engine);
+    const runSummary = getLatestAgentRunSummary(engine);
     assert.strictEqual(runSummary?.toolProtocol, 'native');
     assert.strictEqual(runSummary?.fallbackPath, 'native_tools');
     assert.strictEqual(runSummary?.usedManualFallback, false);
@@ -766,12 +977,12 @@ async function testEngineRecoversFromPlanningOnlyNativeReply() {
       { role: 'user', content: 'Read src/index.ts and tell me what it exports.' },
     ]);
 
-    assertAgenticResponse(response, 'Recovered after tool call.');
+    assertAgentWorkResponse(response, 'Recovered after tool call.');
     assert.ok(chatRequests.length >= 2);
     assert.ok(chatRequests.some((body) => Array.isArray(body.tools) && body.tools.length > 0));
     assert.ok(chatRequests.some((body) => JSON.stringify(body.messages).includes('Planning-only text is not enough.')));
     assert.ok(engine.getTraceLog().some((entry) => entry.type === 'native_tool_retry_requested'));
-    const runSummary = getLatestAgenticRunSummary(engine);
+    const runSummary = getLatestAgentRunSummary(engine);
     assert.strictEqual(runSummary?.toolProtocol, 'native');
     assert.strictEqual(runSummary?.fallbackPath, 'native_retry');
   } finally {
@@ -812,14 +1023,14 @@ async function testEngineUsesManualToolProtocolWhenModelLacksNativeTools() {
       { role: 'user', content: 'Inspect src/index.ts and answer with its content' },
     ]);
 
-    assertAgenticResponse(response, 'export const ok = true;');
+    assertAgentWorkResponse(response, 'export const ok = true;');
     assert.ok(chatRequests.length >= 2);
     assert.strictEqual(chatRequests[0].tools, undefined);
     assert.ok(
       JSON.stringify(chatRequests[0].messages).includes('Use exactly one JSON tool action at a time.'),
     );
     assertLeanThinkingControl(chatRequests[0].think ?? chatRequests[0].reasoning_effort);
-    const runSummary = getLatestAgenticRunSummary(engine);
+    const runSummary = getLatestAgentRunSummary(engine);
     assert.strictEqual(runSummary?.toolProtocol, 'manual');
     assert.strictEqual(runSummary?.fallbackPath, 'manual_fallback');
     assert.ok(runSummary?.usedManualFallback);
@@ -870,7 +1081,7 @@ async function testEngineAnswersRootManifestNameFromLocalInventory() {
       { role: 'user', content: 'Inspect package.json and answer with its package name only.' },
     ]);
 
-    assertAgenticResponse(response, 'gamma4-local-harness');
+    assertAgentWorkResponse(response, 'gamma4-local-harness');
     assert.strictEqual(chatRequests.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -882,7 +1093,7 @@ async function testEngineDoesNotShortCircuitWritePromptsThatMentionProjectMetada
   const chatRequests: any[] = [];
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-root-manifest-write-'));
   await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({
-    name: 'art-gallery',
+    name: 'sample-express-app',
     scripts: {
       start: 'node server.js',
     },
@@ -894,7 +1105,7 @@ async function testEngineDoesNotShortCircuitWritePromptsThatMentionProjectMetada
     },
     chatResponder: () => ({
       ...MOCK_CHAT_RESPONSE,
-      choices: [{ index: 0, message: { role: 'assistant', content: 'AGENTIC_PROBE.md' }, finish_reason: 'stop' }],
+      choices: [{ index: 0, message: { role: 'assistant', content: 'AGENT_PROBE.md' }, finish_reason: 'stop' }],
     }),
   }) as typeof fetch;
 
@@ -903,11 +1114,11 @@ async function testEngineDoesNotShortCircuitWritePromptsThatMentionProjectMetada
     const response = await engine.chat([
       {
         role: 'user',
-        content: 'Create AGENTIC_PROBE.md in this workspace with exactly three bullets: project name, start command, main server file. Then reply with the file path only.',
+        content: 'Create AGENT_PROBE.md in this workspace with exactly three bullets: project name, start command, main server file. Then reply with the file path only.',
       },
     ]);
 
-    assertAgenticResponse(response, 'AGENTIC_PROBE.md');
+    assertAgentWorkResponse(response, 'AGENT_PROBE.md');
     assert.ok(chatRequests.length >= 1);
   } finally {
     globalThis.fetch = originalFetch;
@@ -938,7 +1149,7 @@ async function testEnginePrefersNativeToolsForGemmaQuickInspect() {
       { role: 'user', content: 'Inspect src/index.ts and answer with its content' },
     ]);
 
-    assertAgenticResponse(response, 'export const ok = true;');
+    assertAgentWorkResponse(response, 'export const ok = true;');
     assert.ok(chatRequests.length >= 1);
     assert.ok(Array.isArray(chatRequests[0].tools));
     assert.ok(chatRequests[0].tools.length > 0);
@@ -973,7 +1184,7 @@ async function testEngineWarnsWhenThinkingUnsupported() {
       { role: 'user', content: 'Explain the plan briefly' },
     ], { think: true });
 
-    assertAgenticResponse(response, 'Thinking unavailable response');
+    assertAgentWorkResponse(response, 'Thinking unavailable response');
     assert.strictEqual(chatRequests[0].think, true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -995,7 +1206,7 @@ async function testEngineAnswersStatusOnlyQuestionsFromLocalState() {
       { role: 'user', content: 'Which workspace folder is open? Reply with the absolute path only.' },
     ]);
 
-    assertAgenticResponse(response, '/tmp/gamma-status-test');
+    assertAgentWorkResponse(response, '/tmp/gamma-status-test');
     assert.strictEqual(chatRequests.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1074,7 +1285,7 @@ async function testEngineSkipsWorkspaceShortcutsWhenBrowserFolderContextIsAttach
   try {
     const engine = new CoreEngine({ workspaceRoot: '/tmp/gamma-browser-context-test' });
     const response = await engine.chat([
-      { role: 'system', content: '[Browser Folder Context]\nFolder label: art-gallery\nTree:\n- src/\n  - index.ts' },
+      { role: 'system', content: '[Browser Folder Context]\nFolder label: sample-express-app\nTree:\n- src/\n  - index.ts' },
       { role: 'user', content: 'List all files in the workspace' },
     ]);
 
@@ -1350,7 +1561,7 @@ async function testEngineContinuesTruncatedResponses() {
       { role: 'user', content: 'Explain this harness behavior in one answer without stopping midway.' },
     ]);
 
-    assertAgenticResponse(response, 'First half of the answer continues here.');
+    assertAgentWorkResponse(response, 'First half of the answer continues here.');
     assert.ok(chatRequests.length >= 2);
     assert.ok(engine.getTraceLog().some((entry) => entry.type === 'response_continuation_requested'));
   } finally {
@@ -1486,22 +1697,78 @@ async function testEngineSelectsInternetToolsOnlyForExplicitWebIntent() {
 
   try {
     const engine = new CoreEngine({ internetAccessEnabled: true });
-    await engine.chat([
+    await engine.agentWork([
       { role: 'user', content: 'Find TODO text in src/index.ts.' },
     ]);
-    await engine.chat([
+    await engine.agentWork([
       { role: 'user', content: 'Look up the latest TypeScript release notes online.' },
     ]);
+    await engine.agentWork([
+      { role: 'user', content: 'Look up the latest TypeScript release notes online.' },
+    ], { advancedTools: true });
 
-    assert.ok(chatRequests.length >= 2);
+    assert.ok(chatRequests.length >= 3);
     const localToolNames = (chatRequests[0].tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name);
-    const webToolNames = (chatRequests[1].tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name);
+    const defaultWebToolNames = (chatRequests[1].tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name);
+    const advancedWebToolNames = (chatRequests[2].tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name);
     assert.ok(localToolNames.includes('searchText'));
     assert.ok(!localToolNames.includes('webSearch'));
-    assert.ok(webToolNames.includes('webSearch'));
-    assert.ok(!webToolNames.includes('fetchUrl'));
+    assert.ok(!defaultWebToolNames.includes('webSearch'));
+    assert.ok(advancedWebToolNames.includes('webSearch'));
+    assert.ok(!advancedWebToolNames.includes('fetchUrl'));
   } finally {
     globalThis.fetch = originalFetch;
+  }
+}
+
+async function testEngineGatesAdvancedToolProfile() {
+  const originalFetch = globalThis.fetch;
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-advanced-tools-'));
+
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({ name: 'advanced-tools-test' }), 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export function run() { return true; }\n', 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Tool profile inspected.' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, internetAccessEnabled: true });
+    const getLatestToolPlan = () =>
+      [...engine.getTraceLog()]
+        .reverse()
+        .find((entry) => entry.type === 'chat_execution_plan')?.data as { toolNames?: string[]; toolProfile?: string; advancedToolsEnabled?: boolean } | undefined;
+
+    await engine.agentWork([
+      { role: 'user', content: 'Fix src/index.ts and inspect symbol references before patching.' },
+    ]);
+    const basicPlan = getLatestToolPlan();
+    assert.strictEqual(basicPlan?.toolProfile, 'basic');
+    assert.strictEqual(basicPlan?.advancedToolsEnabled, false);
+    assert.ok(basicPlan?.toolNames?.includes('readFile'));
+    assert.ok(basicPlan?.toolNames?.includes('patchFile'));
+    assert.ok(!basicPlan?.toolNames?.includes('findSymbol'));
+    assert.ok(!basicPlan?.toolNames?.includes('createCheckpoint'));
+    assert.ok(!basicPlan?.toolNames?.includes('webSearch'));
+
+    await engine.agentWork([
+      { role: 'user', content: 'Fix src/index.ts and inspect symbol references before patching.' },
+    ], { advancedTools: true });
+    const advancedPlan = getLatestToolPlan();
+    assert.strictEqual(advancedPlan?.toolProfile, 'advanced');
+    assert.strictEqual(advancedPlan?.advancedToolsEnabled, true);
+    assert.ok(advancedPlan?.toolNames?.includes('findSymbol'));
+    assert.ok(advancedPlan?.toolNames?.includes('findFunction'));
+    assert.ok(advancedPlan?.toolNames?.includes('createCheckpoint'));
+    assert.ok(advancedPlan?.toolNames?.includes('getStructuredDiff'));
+    assert.ok(advancedPlan?.toolNames?.includes('selectTestsForChangedFiles'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
 }
 
@@ -1569,11 +1836,10 @@ async function testEngineRecordsDeniedCommandEventContract() {
     assert.strictEqual((policyTrace?.data as { status?: string }).status, 'denied');
     assert.ok(streamedTraces.some((entry) => entry.type === 'command_policy_checked'));
 
-    const runSummary = getLatestAgenticRunSummary(engine);
-    assert.strictEqual(runSummary?.commands.length, 1);
-    assert.strictEqual(runSummary?.commands[0].success, false);
-    assert.strictEqual(runSummary?.commands[0].status, 'denied');
-    assert.strictEqual(runSummary?.commands[0].approvalRequired, true);
+    const runSummary = getLatestAgentRunSummary(engine);
+    assert.strictEqual(runSummary?.commandsRun.length, 1);
+    assert.strictEqual(runSummary?.commandsRun[0], 'npm test && rm -rf .');
+    assert.strictEqual(runSummary?.outcome, 'blocked');
     assert.ok(runSummary?.summary?.includes('attempted 1 command'));
   } finally {
     globalThis.fetch = originalFetch;
@@ -1586,10 +1852,11 @@ async function run() {
   testPromptRecipes();
   await testPromptAnalyzerIsPassThrough();
   testWorkspacePolicy();
-  testTaskOrchestratorClassifiesComplexity();
+  testTaskOrchestratorClassifiesIntent();
   testTaskOrchestratorPlanAndStepTransitions();
   await testModelAdapter();
   await testModelAdapterPrefersNativeOllamaChat();
+  await testModelAdapterCapsLocalOutputTokens();
   await testEnginePromptRecipeSelection();
   await testEngineSanitizesDisabledSkills();
   await testEngineTracksSkillAudit();
@@ -1598,9 +1865,12 @@ async function run() {
   await testEngineRecordsExecutionModes();
   await testEnginePrioritizesEditsWithoutAutoRepoContext();
   await testDirectChatDoesNotCreateTaskPlan();
+  await testProjectInspectionUsesDeterministicPathWithoutCheckpoint();
+  await testDirectChatStreamRetriesVisibleOnIdle();
   await testEngineCreatesTaskPlanTraceAndCheckpoint();
   await testRepoIndexerExcludesVendoredAndSessionDirs();
   await testRepoIndexerBuildsWorkspaceInventory();
+  await testRepoIndexerInspectsGenericExpressProject();
   await testRepoIndexerBuildsTaskContext();
   await testEngineKeepsSimplePromptsLean();
   await testEnginePrefersNativeToolsForGemmaTargetedEdits();
@@ -1624,6 +1894,7 @@ async function run() {
   await testDirectChatCompactsConversationHistory();
   await testEngineCompactsLargeToolOutputsForModel();
   await testEngineSelectsInternetToolsOnlyForExplicitWebIntent();
+  await testEngineGatesAdvancedToolProfile();
   await testEngineRecordsDeniedCommandEventContract();
   console.log('unit tests passed');
 }

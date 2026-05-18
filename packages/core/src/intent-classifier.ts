@@ -1,5 +1,6 @@
 export type TaskIntent =
   | 'status_query'
+  | 'inspect_project'
   | 'workspace_overview'
   | 'find_file'
   | 'read_file'
@@ -65,6 +66,13 @@ function isMutatingRequest(text: string): boolean {
   return /\b(add|change|create|delete|edit|fix|implement|make|patch|refactor|remove|rename|update|write)\b/i.test(text);
 }
 
+function isProjectInspectionRequest(text: string): boolean {
+  const projectTarget = /\b(app|application|codebase|project|repo|repository|site|website|workspace)\b/.test(text);
+  const asksProjectType = /\b(what kind|what type|kind of project|type of project|what is this project|what kind of app)\b/.test(text);
+  const asksStructure = /\b(explain|inspect|look at|summarize|tell me)\b/.test(text) && /\b(stack|structure|structured|entry points?|how .* organized)\b/.test(text);
+  return projectTarget && (asksProjectType || asksStructure);
+}
+
 export function classifyIntent(input: {
   latestUserMessage: string;
   browserContextActive: boolean;
@@ -93,6 +101,14 @@ export function classifyIntent(input: {
     /\bwhich workspace folder is open\b/.test(text)
   ) {
     return { intent: 'status_query', confidence: 'high', reasons: ['Status query.'] };
+  }
+
+  if (isProjectInspectionRequest(text)) {
+    return { intent: 'inspect_project', confidence: 'high', reasons: ['Lightweight project inspection request.'] };
+  }
+
+  if (isMutatingRequest(text)) {
+    return { intent: 'edit_code', confidence: 'high', reasons: ['Edit request.'] };
   }
 
   if (/\b(architecture|project structure|repo overview|explain project|workspace overview|main packages|main apps)\b/.test(text)) {
@@ -137,10 +153,6 @@ export function classifyIntent(input: {
       reasons: ['Workspace text search request.'],
       searchQuery: extractSearchQuery(rawText),
     };
-  }
-
-  if (isMutatingRequest(text)) {
-    return { intent: 'edit_code', confidence: 'high', reasons: ['Edit request.'] };
   }
 
   if (/\b(explain|summarize|teach me|what does this do)\b/.test(text)) {

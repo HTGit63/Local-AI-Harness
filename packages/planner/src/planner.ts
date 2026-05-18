@@ -56,14 +56,15 @@ export class Planner {
         | 'sessionMemoryEnabled'
         | 'sessionMemoryTurns'
         | 'selfCheckEnabled'
-        | 'executionProfile'
-        | 'promptProfile'
+        | 'advancedAgentToolsEnabled'
         | 'fallbackPath'
         | 'fallbackReason'
         | 'fallbackCount'
         | 'taskPlan'
         | 'currentStepId'
-        | 'complexity'
+        | 'taskIntent'
+        | 'taskStatus'
+        | 'sizeEstimate'
         | 'stepProgress'
       >
     >,
@@ -83,7 +84,9 @@ export class Planner {
       currentTool: undefined,
       taskPlan: undefined,
       currentStepId: undefined,
-      complexity: undefined,
+      taskIntent: undefined,
+      taskStatus: undefined,
+      sizeEstimate: undefined,
       stepProgress: undefined,
     });
     this.traceBus.emitEvent({
@@ -95,7 +98,9 @@ export class Planner {
   setTaskPlan(runId: string, taskPlan: TaskPlan) {
     this.emitStateChange('task_plan_update', {
       taskPlan,
-      complexity: taskPlan.complexity,
+      taskIntent: taskPlan.intent,
+      taskStatus: taskPlan.status,
+      sizeEstimate: taskPlan.sizeEstimate,
       currentStepId: taskPlan.steps.find((entry) => entry.status === 'running')?.id,
       stepProgress: this.computeStepProgress(taskPlan),
     });
@@ -108,7 +113,9 @@ export class Planner {
   updateTaskPlan(runId: string, taskPlan: TaskPlan) {
     this.emitStateChange('task_plan_update', {
       taskPlan,
-      complexity: taskPlan.complexity,
+      taskIntent: taskPlan.intent,
+      taskStatus: taskPlan.status,
+      sizeEstimate: taskPlan.sizeEstimate,
       currentStepId: taskPlan.steps.find((entry) => entry.status === 'running')?.id,
       stepProgress: this.computeStepProgress(taskPlan),
     });
@@ -124,7 +131,9 @@ export class Planner {
     this.emitStateChange('task_plan_update', {
       taskPlan,
       currentStepId: step.id,
-      complexity: taskPlan.complexity,
+      taskIntent: taskPlan.intent,
+      taskStatus: taskPlan.status,
+      sizeEstimate: taskPlan.sizeEstimate,
       stepProgress: this.computeStepProgress(taskPlan),
       currentPhase: step.type,
       intendedNextAction: step.title,
@@ -139,7 +148,9 @@ export class Planner {
     this.emitStateChange('task_plan_update', {
       taskPlan,
       currentStepId: taskPlan.steps.find((entry) => entry.status === 'running')?.id,
-      complexity: taskPlan.complexity,
+      taskIntent: taskPlan.intent,
+      taskStatus: taskPlan.status,
+      sizeEstimate: taskPlan.sizeEstimate,
       stepProgress: this.computeStepProgress(taskPlan),
       currentPhase: step.type,
       intendedNextAction: step.title,
@@ -154,7 +165,9 @@ export class Planner {
     this.emitStateChange('task_plan_update', {
       taskPlan,
       currentStepId: step.id,
-      complexity: taskPlan.complexity,
+      taskIntent: taskPlan.intent,
+      taskStatus: taskPlan.status,
+      sizeEstimate: taskPlan.sizeEstimate,
       stepProgress: this.computeStepProgress(taskPlan),
       currentPhase: step.type,
       intendedNextAction: step.title,
@@ -169,7 +182,9 @@ export class Planner {
     this.emitStateChange('task_plan_update', {
       taskPlan,
       currentStepId: step.id,
-      complexity: taskPlan.complexity,
+      taskIntent: taskPlan.intent,
+      taskStatus: taskPlan.status,
+      sizeEstimate: taskPlan.sizeEstimate,
       stepProgress: this.computeStepProgress(taskPlan),
       currentPhase: step.type,
       intendedNextAction: step.title,

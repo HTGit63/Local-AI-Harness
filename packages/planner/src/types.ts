@@ -1,4 +1,4 @@
-import type { TaskComplexity, TaskPlan } from '@local-harness/task-orchestrator';
+import type { TaskIntent, TaskPlan, TaskPlanStatus, TaskSizeEstimate } from '@local-harness/task-orchestrator';
 
 export type SkillAuditStatus = 'available' | 'filtered' | 'missing';
 
@@ -33,8 +33,7 @@ export interface PlanState {
   sessionMemoryEnabled?: boolean;
   sessionMemoryTurns?: number;
   selfCheckEnabled?: boolean;
-  executionProfile?: string;
-  promptProfile?: string;
+  advancedAgentToolsEnabled?: boolean;
   fallbackPath?: string;
   fallbackReason?: string;
   fallbackCount?: number;
@@ -43,7 +42,9 @@ export interface PlanState {
   currentTool?: string;
   taskPlan?: TaskPlan;
   currentStepId?: string;
-  complexity?: TaskComplexity;
+  taskIntent?: TaskIntent;
+  taskStatus?: TaskPlanStatus;
+  sizeEstimate?: TaskSizeEstimate;
   stepProgress?: {
     total: number;
     completed: number;

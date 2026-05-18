@@ -1,5113 +1,1842 @@
 # AGENTS.md
 
-> Generated on 2026-04-19 for **HTGit63/Local-AI-Harness**.
-> Purpose: make the current harness converge into a trustworthy local coding operator centered on Gemma 4 E4B and Qwen 3.5 9B class models, without rewriting the TypeScript architecture.
+> Repository: `HTGit63/Local-AI-Harness`
+> Active branch to work on: `rescue/lightweight-harness-reset`
+> Primary operator: Hunde Tefera Entele
+> Target machine: local Linux laptop, 16 GB RAM, Ollama local models, CPU/iGPU-class performance
+> Mission: make the Local AI Harness reliable, lightweight, understandable, and usable before adding advanced agent features.
 
-# 0. 2026-05-13 completion ledger
+---
 
-- `TASK-01 [done]` Workspace/mode/runtime truth now converges better through shared engine state, planner runtime context, session continuity state, and visible workspace-bound vs snapshot-only surfaces.
-- `TASK-02 [done]` Small-model agent loop now carries qwe-qwe-style long-run mechanisms: truncated-response continuation, bounded loop compaction, and compacted tool-result reinjection instead of uncontrolled context growth.
-- `TASK-03 [done]` Direct mode now reuses the same engine-owned path for stream and non-stream responses, with direct-chat history compaction and continuation recovery instead of split behavior.
-- `TASK-04 [done]` Live progress no longer freezes during active runs: web polling stays on during sends, recent planner state stays fresh, and current run state is promoted into first-class UI.
-- `TASK-05 [done]` Agent progress presentation is stronger: main web surface now shows live phase, next action, current tool, recent run steps, and recent trace without forcing the user into the settings drawer.
-- `TASK-06 [done]` Osaurus-inspired web refresh landed in lightweight form: cleaner command-center shell, stronger ambient layout, improved direct/agent posture cards, and no extra heavy runtime dependencies.
-- `TASK-07 [done]` Long-session stability improved through conversation compaction, loop compaction, and large tool-output truncation for model context, which reduces local RAM/context pressure during extended work.
-- `TASK-08 [done]` Internet/retrieval/context discipline is now explicit: web tools are selected only for real web intent or URLs, context packs carry budget telemetry, repo summaries stay compact, and tests cover no-web-by-default vs explicit-web selection.
-- `TASK-09 [done]` Command safety is now durable and visible: command policy checks emit `command_policy_checked`, denied/rejected/failed commands persist in run summaries, UI shows command status/reason, and workspace confinement still blocks escape before approval.
-- `TASK-10 [done]` Realism/event-contract closure added: adversarial command-denial flow asserts exact trace payload keys, stream delivery, persisted run-summary fields, context-pack budget limits, and full build/test evidence.
+# 0. Read this first
 
-# 0.1 2026-04-28 smart-agent tool ledger
+This file is a full replacement for the current `AGENTS.md`.
 
-- `TASK-11 [done]` Deterministic code-structure tools added: `findSymbol`, `findFunction`, `findComponent`, import graph queries, affected-file discovery, context packs, project command detection, and targeted test selection.
-- `TASK-12 [done]` Precision edit tools added: `replaceFunction`, `insertImport`, `addTypeProperty`, and `renameIdentifier`, all routed through existing policy/approval/diff paths instead of whole-file rewrites.
-- `TASK-13 [done]` Structured diff and rollback trust path added: `getStructuredDiff`, structured run summary fields, checkpoint creation, rollback-to-checkpoint, and API endpoints for UI/runtime use.
-- `TASK-14 [done]` Run console now shows inline diff hunks with old/new line numbers, file-level change totals, why-file-selected notes, context-budget telemetry, and richer tool transparency with duration/output previews.
-- `TASK-15 [done]` Model routing foundation added: execution profiles, provider profile labels, prompt profiles, fast/code/review/API model slots, route selection traces, and model-per-purpose calls for direct/code/summarize paths.
-- `TASK-16 [done]` Regression coverage added for deterministic repo tools, AST edits, import graph, targeted test selection, command detection, checkpoint rollback, and full `npm test` passes.
+Do **not** preserve the old completion-ledger framing.
 
-Status: complete as of 2026-05-13; all checklist items in sections 0 and 0.1 are marked [done].
+The previous `AGENTS.md` treated the overbuilt smart-agent architecture as complete. That framing is now considered part of the problem.
 
-Implementation audit note:
-- `qwe-qwe` mechanisms selectively ported: response continuation, context compaction mindset, bounded retry/continuation loop, compacted tool reinjection.
-- `osaurus` ideas selectively ported: clearer direct-vs-agent posture, stronger live command-center framing, better visible session/activity shell.
-- Official Codex docs influence applied selectively: explicit runtime/status surfaces, approval/state clarity, local-first constraints preserved.
-- Cleanup completed: stale untracked `docs/recovery-note.md` was removed because it described rollback/removal goals that conflict with the current implemented smart-agent/tooling state.
-- Final audit evidence: `npm run build:packages`, `node --import tsx tests/unit/core.test.ts`, `node --import tsx tests/integration/workflow.test.ts`, `npm run build:apps`, and full `npm test` passed during the TASK-08/09/10 closure pass.
-- Manual-only residual remains: live Ollama smoke with the operator’s preferred Gemma/Qwen models on this exact machine is still recommended after code/test completion.
+The current recovery effort must simplify the harness around:
 
-# 1. Core contract
+- clear Chat Mode
+- clear Agent Work
+- one active local model by default
+- lightweight deterministic project inspection
+- reduced default tool exposure
+- compact memory
+- clean API, CLI, and web mode contracts
+- clean UI with advanced details hidden by default
+- safe workspace binding
+- explicit approval outcomes
+- conservative local model budgets
+- tests that prevent the old heavy behavior from returning
 
-This file is the single operational playbook for any agent working inside `HTGit63/Local-AI-Harness`. It exists because the current harness already contains serious architecture, but the audit concludes that the parts do not yet converge into one trustworthy operator loop. The goal is therefore not to rebuild the harness from scratch, but to tighten the loop between policy, engine, adapter, tools, planner, API, traces, and UI so the system feels coherent, decisive, and inspectable.
+The goal is not to build the most impressive local agent.
 
-The audit’s ranked diagnosis should be treated as the root ordering principle for all work. The most important failure is **system coherence**, followed by **workspace truth**, then **agent execution**, then **visibility quality**, then **continuity**, then **capability integration**, then the **realism gap in tests**. Any implementation plan that improves one small symptom while preserving those higher-level fractures is incomplete.
+The goal is to build a local harness that Hunde can actually use without fighting it.
 
-# 2. Product truth to preserve
+---
 
-- Direct mode is the everyday general-purpose path and should stay lean, fast, and conversational.
-- Agentic mode is the coding/operator path and must inspect, act, verify, recover, and explain.
-- Reuse the current TypeScript architecture rather than replacing it.
-- Keep the planner, trace bus, approval workflow, session store, and workspace policy as the primary backbone.
-- Do not fabricate hidden reasoning; only show provider-emitted thinking if explicitly returned.
-- Optimize for CPU-only local use on 16 GB RAM realities before fancy abstractions.
+# 1. Branch discipline
 
-# 3. Non-goals and forbidden moves
+## 1.1 Work only on the active recovery branch
 
-- Do not rewrite the project into Python, Swift, Electron, or a second orchestration core.
-- Do not remove the current planner, trace bus, approval workflow, or workspace policy system.
-- Do not cargo-cult external repos wholesale.
-- Do not copy Apple-specific MLX/macOS internals from Osaurus.
-- Do not assume the user-provided `deepfounder-ai/qwe-qwe` repo is publicly resolvable; verify it first.
-- Do not dump giant debug blobs into the UI and call that observability.
-- Do not rely on prompts alone to solve architectural failures.
-- Do not make the agent more autonomous by making it less inspectable.
-
-# 4. External references the agent must understand before making changes
-
-The agent is allowed to learn from external systems, but only in a selective, architecture-compatible way. The external references fall into two groups: **product references** (Codex, Claude Code, Cursor, Windsurf) and **code references** (Osaurus and the Qwen-family terminal-agent reference). The point is not imitation for its own sake. The point is to identify transferable behavior patterns that close the exact gaps documented in the audit.
-
-## 4.1 Product references: what to study and what to borrow
-
-### Codex
-
-Codex is a reference system, not an implementation template. Borrow the parts below selectively and only where they close a diagnosed Local-AI-Harness problem.
-
-**Borrow**
-
-- clear separation between pairing locally and delegating in cloud
-- approval-mode clarity (suggest / auto edit / full auto style mental model)
-- sandboxed execution framing and explicit status surfaces
-- multi-agent and long-horizon framing, especially context compaction mindset
-- skills/worktrees/automations as organized capability layers rather than random extras
-
-**Avoid**
-
-- blindly copying cloud assumptions into a local CPU harness
-- background orchestration patterns that require server infrastructure
-- complexity that makes direct mode feel heavy
-
-### Claude Code
-
-Claude Code is a reference system, not an implementation template. Borrow the parts below selectively and only where they close a diagnosed Local-AI-Harness problem.
-
-**Borrow**
-
-- fine-grained permissions model and explicit user-visible permission state
-- hooks as a mental model for pre/post tool policy points
-- slash commands and subagents as controlled specialization, not anarchy
-- clear terminal-first identity with readable status and health surfaces
-
-**Avoid**
-
-- assuming Claude’s tool semantics or hook architecture can be copied 1:1
-- overfitting the harness around Anthropic-specific concepts
-
-### Cursor
-
-Cursor is a reference system, not an implementation template. Borrow the parts below selectively and only where they close a diagnosed Local-AI-Harness problem.
-
-**Borrow**
-
-- mode separation (Agent vs Ask vs manual/custom mindset)
-- rules and AGENTS.md as persistent prompt-level context
-- tool inventory discipline and configurable modes
-- auto-run/auto-fix mindset without surrendering control
-
-**Avoid**
-
-- IDE-specific assumptions that do not transfer to this harness UI
-- pretending all IDE affordances exist locally in the current app
-
-### Windsurf
-
-Windsurf is a reference system, not an implementation template. Borrow the parts below selectively and only where they close a diagnosed Local-AI-Harness problem.
-
-**Borrow**
-
-- AGENTS.md and rules engine alignment, especially directory-scoped instructions
-- clear activity timeline and command auto-execution levels
-- memories vs rules vs workflows vs skills as separate customization primitives
-- context-awareness/RAG mental model for repo understanding
-- current-tool / current-phase / current-runtime visibility
-
-**Avoid**
-
-- assuming a heavyweight IDE context engine is free on CPU-only local hardware
-- letting auto-generated memory replace durable rules or explicit AGENTS content
-
-## 4.2 Code references: repo inspection protocol
-
-The user explicitly wants two external repos placed under a `base_repos/` style area so a coding agent can inspect them and port useful ideas into the current TypeScript harness. Treat the following as the required clone-and-inspect policy.
-
-- Primary external UI/runtime reference: `osaurus-ai/osaurus`.
-- Primary external small-model terminal-agent reference requested by the user: `deepfounder-ai/qwe-qwe`.
-- Public-source verification note: a publicly verifiable `deepfounder-ai/qwe-qwe` repository could not be confirmed in this research pass; the closest verified and highly relevant open-source terminal agent is `QwenLM/qwen-code`.
-- Therefore the execution policy is: first attempt to clone exactly the user-specified repo; if it does not resolve, record the failure and substitute `QwenLM/qwen-code` as the verified fallback reference.
+All implementation work must happen on:
 
 ```bash
-mkdir -p base_repos
-cd base_repos
-
-# UI/runtime reference
-if [ ! -d osaurus ]; then
-  git clone https://github.com/osaurus-ai/osaurus.git osaurus \
-  || git clone https://github.com/dinoki-ai/osaurus.git osaurus
-fi
-
-# Small-model terminal-agent reference requested by user
-if [ ! -d qwe-qwe ]; then
-  git clone https://github.com/deepfounder-ai/qwe-qwe.git qwe-qwe \
-  || git clone https://github.com/QwenLM/qwen-code.git qwe-qwe
-fi
+git switch rescue/lightweight-harness-reset
 ```
 
-The agent must document which clone path succeeded. If the user-specified repository is unavailable, the fallback substitution is not something to hide; it should be written into notes, traces, and any architecture appendix. That preserves trust and keeps the implementation grounded.
-
-# 5. Source hierarchy
-
-- Highest authority for Local-AI-Harness current problems: `local_ai_harness_deep_audit.md`.
-- Highest authority for the external-integration intent: `Pasted text.txt` provided by the user.
-- Highest authority for current product/tool docs: official docs from OpenAI, Anthropic, Cursor, and Windsurf.
-- Highest authority for external reference code when clone succeeds: checked-out repos under `base_repos/`.
-- When sources disagree, prefer: local code reality > user-provided integration instructions > official current docs > repo marketing copy.
-
-# 6. Condensed audit truth the agent must carry into every task
-
-- Direct mode is broadly correct in intent, but internally split across inconsistent code paths.
-- Agentic mode weakness is real and rooted in orchestration, not just in Gemma quality.
-- System coherence is the root problem: docs, engine, API, UI, and policy do not yet speak with one voice.
-- Workspace truth is muddy: browser snapshot, bound backend root, and danger-mode expectations diverge.
-- Planner/session continuity is too shallow for long coding work.
-- Tool runtime is stronger than the agent’s ability to exploit it.
-- Internet capability exists below the surface but not yet as a trustworthy product-level behavior.
-- UI observability exists, but its storytelling and change-ledger quality are weak.
-- The system already anticipates planning-only and simulated-tool failures; recovery is not yet strong enough.
-- Tests validate many mocked happy paths but under-model the real local-model pain that matters.
-
-# 7. Ten-task program, ranked by problem proximity
-
-The user asked for ten tasks divided by proximity of the problem. In this file, **proximity** means closeness to the root causes ranked by the audit. Tasks 1–3 hit the deepest execution fractures. Tasks 4–6 turn those engine improvements into operator trust. Tasks 7–10 harden persistence, retrieval, safety, and realism. Every task below includes the problem mapping, the external inspirations allowed, the files to touch first, and the acceptance criteria the agent must satisfy before calling the task complete.
-
-## TASK-01 — Converge system truth around workspace, mode, and operator expectations
-
-**Problems addressed:** P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036
-
-**Primary files:**
-
-- packages/core/src/engine.ts
-- packages/workspace-policy/src/policy.ts
-- apps/api/src/server.ts
-- apps/web/src/HarnessApp.tsx
-- packages/session-store/src/store.ts
-
-**External patterns allowed:**
-
-- Codex approval-mode clarity
-- Claude Code permissions surface
-- Cursor mode separation
-- Windsurf AGENTS.md and rules scoping
-
-### Why this task is near the root
-
-This task sits in position 1 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-- One visible workspace root, one effective workspace root, one truth model.
-- Direct vs agentic must be understandable before any request is run.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-
-### Concrete engineering directives
-
-- Unify the meaning of current workspace root across engine, API, UI, planner, and run summary.
-- Expose whether the session is `backend_bound` or `browser_snapshot_only` in a machine-readable field on every agentic run.
-- Normalize direct and agentic mode state into one clearly typed execution-mode contract.
-- Do not let danger-mode docs imply capabilities the runtime still denies.
-- When workspace rebinding resets state, surface that reset explicitly instead of letting the user infer memory loss.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-- Switching or binding workspace no longer creates silent truth mismatches.
-- Mode and policy names visible in UI match backend reality.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-02 — Rebuild the small-model agent loop so Gemma/Qwen act instead of hesitating
-
-**Problems addressed:** P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035
-
-**Primary files:**
-
-- packages/core/src/engine.ts
-- packages/planner/src/planner.ts
-- packages/model-adapter/src/client.ts
-
-**External patterns allowed:**
-
-- Qwen Code parser resilience and terminal-agent discipline
-- Codex long-horizon context compaction mindset
-- Claude Code subagents/permissions thinking without copying the stack
-
-### Why this task is near the root
-
-This task sits in position 2 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-- Agentic mode must inspect, decide, act, verify, and recover with less hedging.
-- Complex tasks must decompose internally instead of repeatedly bouncing back to the user.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-- Bias toward deterministic helpers around parsing, retries, and fallback path choice rather than letting the model improvise endlessly.
-- Bound recovery loops, but make the bounds smarter instead of simply smaller.
-
-### Concrete engineering directives
-
-- Add internal decomposition for multi-step requests: inspect → identify target files → plan action → execute → verify → summarize.
-- Treat planning-only text from the model as insufficient when tool/action intent is required.
-- Reduce tool exposure per turn to the smallest relevant set for the detected task class.
-- Use stronger anti-hedge nudges for small models: if executable with current context, act before asking.
-- Carry forward compact task state so the next loop knows what has already been tried, what failed, and what remains.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-- The agent performs more inspect-act-verify loops before asking for more information.
-- Hesitation and planning-only behavior drop on benchmark prompts.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-- Do not let the model stay in meta-protocol longer than the task itself.
-- Do not consume all loop budget on repair chatter.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-03 — Make manual fallback a first-class, inspectable operating path
-
-**Problems addressed:** P-006, P-007, P-008, P-020, P-025, P-030
-
-**Primary files:**
-
-- packages/core/src/engine.ts
-- packages/model-adapter/src/client.ts
-- apps/api/src/server.ts
-- apps/web/src/components/ChatMessageRow.tsx
-
-**External patterns allowed:**
-
-- Qwen Code robust parser adaptations
-- Codex explicit approval/fallback clarity
-- Claude Code permission-state transparency
-
-### Why this task is near the root
-
-This task sits in position 3 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-- Bias toward deterministic helpers around parsing, retries, and fallback path choice rather than letting the model improvise endlessly.
-- Bound recovery loops, but make the bounds smarter instead of simply smaller.
-
-### Concrete engineering directives
-
-- Make fallback mode explicit: `native_tools`, `native_retry`, `manual_fallback`, `manual_repair`, `final_noop_warning`.
-- Implement JSON/tool-call repair helpers around malformed arguments and formatting noise.
-- When native tools fail, retry once with a targeted correction, then shift paths cleanly instead of oscillating.
-- Surface the fallback path in traces, planner, and UI so the operator can see why behavior changed.
-- Never allow manual fallback to become an invisible degraded mode.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-- Fallback path is explicitly visible and understandable.
-- Malformed tool payloads recover more often without user babysitting.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-- Do not let the model stay in meta-protocol longer than the task itself.
-- Do not consume all loop budget on repair chatter.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-04 — Redesign operational visibility so the UI tells the right story
-
-**Problems addressed:** P-019, P-020, P-021, P-022, P-033, P-034
-
-**Primary files:**
-
-- apps/web/src/HarnessApp.tsx
-- apps/web/src/components/ChatMessageRow.tsx
-- apps/web/src/components/AgentRunSummary.tsx
-- apps/web/src/components/AgentRunSteps.tsx
-- packages/trace-bus/src/*
-
-**External patterns allowed:**
-
-- Osaurus product-grade chat/runtime feel
-- Windsurf activity timeline clarity
-- Codex agent-command-center mental model
-
-### Why this task is near the root
-
-This task sits in position 4 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-- The UI must answer: what is the agent doing now, what did it change, what remains blocked, and what path is active.
-- Reasoning must never visually bury the actual result.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-- Make runtime state visible to the UI as typed event payloads and explicit run-summary fields.
-- Do not smuggle important state only in prose.
-
-### Concrete engineering directives
-
-- Rebuild the activity timeline around phase, current tool, tool start, tool done, preview, command, file changes, approvals, and run summary.
-- Separate three visual lanes: assistant answer, operational activity, optional provider-emitted thinking.
-- Add a precise change ledger view listing files read, written, deleted, and changed-file stats in a human-readable order.
-- Upgrade the activity tab from trace headers to selectively inspectable structured payloads.
-- Use concise grouped status text rather than giant undifferentiated blocks.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-- A user can answer ‘what changed?’ from the UI alone.
-- Thinking never dominates final outcome presentation.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-- Do not turn direct mode into a debug shell.
-- Do not let reasoning panels overshadow the answer.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-05 — Strengthen direct chat as a lean everyday mode with minimal agent overhead
-
-**Problems addressed:** P-003, P-027, P-031
-
-**Primary files:**
-
-- apps/api/src/server.ts
-- packages/core/src/engine.ts
-- packages/model-adapter/src/client.ts
-- apps/web/src/HarnessApp.tsx
-
-**External patterns allowed:**
-
-- Cursor Ask/Agent distinction
-- Codex pair-vs-delegate separation
-- Osaurus fast local chat feel
-
-### Why this task is near the root
-
-This task sits in position 5 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-- Make runtime state visible to the UI as typed event payloads and explicit run-summary fields.
-- Do not smuggle important state only in prose.
-
-### Concrete engineering directives
-
-- Keep direct chat on the shortest reliable path and avoid planner/tool overhead for ordinary use.
-- Eliminate drift between stream and non-stream direct routes or make one canonical implementation path.
-- Expose only direct-chat-relevant runtime information, not the full agent stack, when the user is in direct mode.
-- Preserve multimodal capability and model switching without leaking agentic complexity.
-- Use direct mode as the clean control condition against which agentic mode is judged.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-- Do not turn direct mode into a debug shell.
-- Do not let reasoning panels overshadow the answer.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-06 — Improve runtime/model control, loading policy, and stall handling
-
-**Problems addressed:** P-016, P-017, P-025, P-027, P-032
-
-**Primary files:**
-
-- packages/model-adapter/src/client.ts
-- packages/core/src/engine.ts
-- apps/api/src/server.ts
-- apps/web/src/HarnessApp.tsx
-
-**External patterns allowed:**
-
-- Osaurus runtime status monitor
-- Windsurf terminal/runtime controls
-- Codex environment/status visibility
-
-### Why this task is near the root
-
-This task sits in position 6 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-- Make runtime state visible to the UI as typed event payloads and explicit run-summary fields.
-- Do not smuggle important state only in prose.
-
-### Concrete engineering directives
-
-- Strengthen timeouts, retries, and stall detection for local Ollama chat and streaming.
-- Make keep-alive and unload policy visible enough that RAM drops are interpretable, not mysterious.
-- Expose active model, configured model, reasoning support, tool-path mode, and current policy mode in runtime status.
-- If the stream goes idle beyond policy, fail visibly and explain why.
-- Do not let long server timeouts masquerade as healthy work.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-07 — Fix skill, instruction, and durable-context hygiene
-
-**Problems addressed:** P-012, P-013, P-015, P-028, P-029
-
-**Primary files:**
-
-- apps/api/src/server.ts
-- packages/core/src/engine.ts
-- packages/planner/src/planner.ts
-- packages/session-store/src/store.ts
-
-**External patterns allowed:**
-
-- Windsurf AGENTS.md + rules engine concepts
-- Cursor AGENTS.md and rules layering
-- Codex Skills mindset without copying cloud assumptions
-
-### Why this task is near the root
-
-This task sits in position 7 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-- Use durable rules/AGENTS/session summaries for reusable context; do not force raw history to carry every burden.
-- For small models, contextual precision beats contextual volume.
-
-### Concrete engineering directives
-
-- Decouple skill discovery from fragile workspace-root assumptions where possible.
-- Normalize AGENTS/rules/memory/skills so each mechanism has a clear job and precedence.
-- Record whether a skill is available, filtered, or missing, and why.
-- Treat durable repo guidance as versioned instructions, not as transient chat trivia.
-- Keep Caveman filtered and make the filtering state auditable.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-08 — Add internet, retrieval, and repo-understanding improvements without bloating small-model prompts
-
-**Problems addressed:** P-002, P-014, P-015, P-028, P-032, P-035
-
-**Completion status:** Done as of 2026-05-13. The runtime now keeps web tools out of normal workspace turns, selects `webSearch` only for explicit web intent, selects `fetchUrl` only when a URL is present, and keeps context-pack behavior budgeted and test-covered.
-
-**Evidence:** `packages/core/src/engine.ts`, `tests/unit/core.test.ts`, `tests/integration/workflow.test.ts`, and the full `npm test` sweep.
-
-**Primary files:**
-
-- packages/core/src/engine.ts
-- packages/tool-runtime/src/registry.ts
-- packages/model-adapter/src/client.ts
-- packages/planner/src/planner.ts
-
-**External patterns allowed:**
-
-- Windsurf RAG/context awareness ideas
-- Codex repo/environment grounding
-- Qwen Code disciplined context exposure
-
-### Why this task is near the root
-
-This task sits in position 8 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-- Use durable rules/AGENTS/session summaries for reusable context; do not force raw history to carry every burden.
-- For small models, contextual precision beats contextual volume.
-
-### Concrete engineering directives
-
-- Wire internet-enabled tools into agent selection only when they truly add value and the policy allows it.
-- Do not expose web tools by default for every turn; contextual discipline matters.
-- Improve repo understanding via compaction, targeted retrieval, workspace inventory, and better file-selection heuristics.
-- Favor compact summaries of prior exploration over raw transcript growth.
-- Guard against prompt bloat that makes 4B/9B models worse instead of smarter.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-09 — Bring terminal and command execution under clearer safety and autonomy controls
-
-**Problems addressed:** P-001, P-018, P-022, P-026, P-036
-
-**Completion status:** Done as of 2026-05-13. Command execution now emits a stable `command_policy_checked` event before approval/execution, persists denied/rejected/failed command status into run summaries, and renders command status/reason in the web run console instead of hiding blocked actions.
-
-**Evidence:** `packages/tool-runtime/src/registry.ts`, `packages/session-store/src/types.ts`, `packages/core/src/agent-run.ts`, `apps/web/src/app/HarnessApp.tsx`, `apps/web/src/components/AgentRunSummary.tsx`, `apps/web/src/components/run-console/ToolCallList.tsx`, and regression tests.
-
-**Primary files:**
-
-- packages/tool-runtime/src/registry.ts
-- packages/workspace-policy/src/policy.ts
-- apps/web/src/HarnessApp.tsx
-- apps/api/src/server.ts
-
-**External patterns allowed:**
-
-- Claude Code permissions and hooks model
-- Windsurf allow/deny/auto/turbo command levels
-- Codex suggest/auto edit/full auto mental model
-
-### Why this task is near the root
-
-This task sits in position 9 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-
-### Concrete engineering directives
-
-- Clarify command auto-execution posture with a stable allow/deny/approval model.
-- Preserve workspace confinement but explain it clearly and consistently.
-- Make the shell capability feel intentionally scoped rather than mysteriously crippled.
-- Tie command execution state into the same visible activity model as file tools.
-- Use approvals as part of trust, not as hidden friction.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-## TASK-10 — Close the realism gap with better traces, event contracts, and adversarial tests
-
-**Problems addressed:** P-023, P-024, P-030, P-033, P-034
-
-**Completion status:** Done as of 2026-05-13. The adversarial command-denial path now asserts exact trace payload keys, stream delivery, persisted run-summary command metadata, web/no-web tool-selection behavior, and context-pack budget limits.
-
-**Evidence:** `tests/unit/core.test.ts`, `tests/integration/workflow.test.ts`, `npm run build:packages`, `npm run build:apps`, `npm test`, and the final security scan report generated during closure.
-
-**Primary files:**
-
-- tests/unit/core.test.ts
-- tests/e2e/api.test.ts
-- packages/trace-bus/src/*
-- packages/core/src/engine.ts
-- apps/api/src/server.ts
-
-**External patterns allowed:**
-
-- Codex trust-through-clear-state
-- Claude Code health/status surface
-- Qwen Code failure-path realism
-
-### Why this task is near the root
-
-This task sits in position 10 because it directly resolves one or more of the audit’s highest-ranked failure classes. If this track is skipped, later work will mostly decorate a still-fragile harness. The core standard here is convergence: the code path, policy posture, planner state, API contract, traces, and UI narrative must agree well enough that the operator stops seeing the harness as a bundle of loosely related subsystems and starts experiencing it as one coherent worker.
-
-### Mandatory outcomes
-
-- Turn a currently ambiguous or brittle behavior into a clearly defined, inspectable runtime contract.
-- Reduce the number of states where the operator can plausibly believe the harness is lying, confused, or asleep.
-- Improve success on Gemma 4 E4B and Qwen 3.5 9B class models without assuming frontier-model luxuries.
-- Preserve or improve trust: every new optimization must remain explainable through planner state, traces, and UI.
-
-### Required implementation approach
-
-- Start from the current code path, not from a greenfield rewrite.
-- Prefer tightening contracts, events, and state transitions over introducing a new layer.
-- Where external ideas are borrowed, port the behavior pattern into existing modules instead of recreating foreign architecture names blindly.
-- Every sub-change should be reversible, testable, and explainable in trace/state terms.
-
-### Concrete engineering directives
-
-- Write adversarial tests for planning-only replies, malformed tool calls, wedged streams, state loss after rebinding, and misleading UI summaries.
-- Test the machine-readable event contract, not just prose output formatting.
-- Ensure the app can still tell the truth under many tool events and long runs.
-- Measure whether new behavior improves completion, clarity, and fallback quality on small-model paths.
-- Do not let passing tests certify empty-feeling behavior.
-
-### Acceptance criteria
-
-- The operator can explain what the harness is doing from visible runtime state without reading the code.
-- Gemma/Qwen class models complete more real tasks with fewer clarification loops and less protocol drift.
-- The change preserves architectural consistency rather than adding a duplicate subsystem.
-- Tests include real-looking local failure paths, not just friendly mocks.
-
-### Anti-patterns
-
-- Do not hide unresolved ambiguity behind confident prose.
-- Do not add raw logs when what is needed is structured, grouped narrative activity.
-- Do not borrow named features from external tools unless they solve a mapped Local-AI-Harness problem.
-- Do not optimize one path by silently degrading another.
-
-### Deliverables for this task
-
-- Code changes in the listed files.
-- Updated or new tests proving the behavior.
-- Short architecture note: what changed, what was borrowed, what was deliberately not copied.
-- Event-contract note if trace/planner/API/UI payloads changed.
-
-# 8. Issue-to-task mapping matrix
-
-| Issue | Task Track | Why it belongs there |
-|---|---|---|
-| P-001 | TASK-01 | mode/workspace/policy/source-of-truth |
-| P-002 | TASK-08 | internet/retrieval/context compaction |
-| P-003 | TASK-01 | mode/workspace/policy/source-of-truth |
-| P-004 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-005 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-006 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-007 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-008 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-009 | TASK-01 | mode/workspace/policy/source-of-truth |
-| P-010 | TASK-01 | mode/workspace/policy/source-of-truth |
-| P-011 | TASK-01 | mode/workspace/policy/source-of-truth |
-| P-012 | TASK-07 | skills, rules, durable-context hygiene |
-| P-013 | TASK-07 | skills, rules, durable-context hygiene |
-| P-014 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-015 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-016 | TASK-06 | runtime loading/timeouts/model control |
-| P-017 | TASK-06 | runtime loading/timeouts/model control |
-| P-018 | TASK-09 | command/approval/safety execution |
-| P-019 | TASK-04 | UI narrative and observability |
-| P-020 | TASK-03 | fallback and recovery path quality |
-| P-021 | TASK-04 | UI narrative and observability |
-| P-022 | TASK-04 | UI narrative and observability |
-| P-023 | TASK-10 | tests and realism |
-| P-024 | TASK-10 | tests and realism |
-| P-025 | TASK-03 | fallback and recovery path quality |
-| P-026 | TASK-01 | mode/workspace/policy/source-of-truth |
-| P-027 | TASK-05 | direct-path simplicity and speed |
-| P-028 | TASK-07 | skills, rules, durable-context hygiene |
-| P-029 | TASK-01 | mode/workspace/policy/source-of-truth |
-| P-030 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-031 | TASK-05 | direct-path simplicity and speed |
-| P-032 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-033 | TASK-04 | UI narrative and observability |
-| P-034 | TASK-04 | UI narrative and observability |
-| P-035 | TASK-02 | core agent loop/planning/selection/continuity |
-| P-036 | TASK-01 | mode/workspace/policy/source-of-truth |
-
-# 9. Base-repo inspection instructions
-
-Before making major changes, the agent should inspect the checked-out external repos under `base_repos/` with an explicit notebook of transferable ideas. The output of that inspection should not be a vague admiration essay. It should be a porting ledger with four columns: **observed behavior**, **Local-AI-Harness problem it solves**, **exact current files to touch**, and **what not to copy**.
-
-- From Osaurus, extract UI/runtime/status ideas, local-first harness framing, model/runtime presentation, tool-activity clarity, and product polish patterns.
-- From the Qwen-side reference, extract parser resilience, small-model recovery, terminal-agent discipline, context compaction, and anti-hesitation patterns.
-- Where both external repos present the same idea differently, choose the version that better fits a TypeScript/Ollama/local-CPU harness.
-- Never import platform-specific internals or naming conventions just to feel modern.
-
-# 10. Detailed external-pattern extraction checklist
-
-### Codex
-
-The agent must explicitly note how Codex handles pair-vs-delegate, approval tiers, sandbox clarity, skills/worktrees/automations framing, then convert those observations into TypeScript-compatible action items that address mapped Local-AI-Harness issues.
-
-### Claude Code
-
-The agent must explicitly note how Claude Code handles permissions, hooks, slash commands, subagents, health/status surfaces, then convert those observations into TypeScript-compatible action items that address mapped Local-AI-Harness issues.
-
-### Cursor
-
-The agent must explicitly note how Cursor handles modes, tools inventory, rules, AGENTS.md, configurable autonomy, then convert those observations into TypeScript-compatible action items that address mapped Local-AI-Harness issues.
-
-### Windsurf
-
-The agent must explicitly note how Windsurf handles AGENTS.md scoping, rules/memories/workflows/skills distinctions, terminal auto-exec levels, activity timeline, then convert those observations into TypeScript-compatible action items that address mapped Local-AI-Harness issues.
-
-### Osaurus
-
-The agent must explicitly note how Osaurus handles local-first harness posture, status UI, runtime monitor, chat polish, tool-compatible API surfaces, then convert those observations into TypeScript-compatible action items that address mapped Local-AI-Harness issues.
-
-### Qwen Code
-
-The agent must explicitly note how Qwen Code handles parser adaptations, terminal-agent ergonomics, small-model survival, provider flexibility, headless/interactive split, then convert those observations into TypeScript-compatible action items that address mapped Local-AI-Harness issues.
-
-# 11. Runtime/event contract the agent should move toward
-
-The exact event names may change during implementation, but the harness should move toward an explicit event contract that separates operational state from prose. The UI should not infer critical execution state from text alone when structured events can carry it directly.
-
-- session_mode_changed
-- workspace_binding_state_changed
-- run_phase_changed
-- run_tool_set_selected
-- tool_call_started
-- tool_call_completed
-- tool_call_failed
-- tool_preview_ready
-- native_tool_retry_requested
-- manual_fallback_activated
-- stream_idle_timeout
-- approval_requested
-- approval_resolved
-- file_change_ledger_updated
-- run_summary_ready
-- assistant_final_ready
-- runtime_status_updated
-
-# 12. UI model the agent should target
-
-- Direct mode panel: lean conversation, model/runtime badge, minimal activity unless directly relevant.
-- Agentic mode header: workspace root, policy mode, model, tool-path mode, thinking availability.
-- Run overview card: phase, elapsed time, fallback state, approvals count, file change counts.
-- Activity timeline: ordered events with tool name, brief intent, preview, success/failure, and next step.
-- Change ledger: files read, files written, files deleted, changed file stats, commands executed.
-- Assistant answer block: final narrative answer, concise, prominent, always visually above or clearly separate from the trace.
-- Optional thinking block: collapsible, clearly labeled as model-emitted thinking only.
-- Activity tab: inspectable structured trace payloads, not only timestamps and labels.
-
-# 13. Small-model survival doctrine
-
-- Prefer fewer relevant tools over many generic tools.
-- Prefer compact incremental state over long raw transcript history.
-- Prefer deterministic helpers for parsing and recovery over repeated pleading with the model.
-- Prefer inspect-first and assumption-taking over over-asking when the task is executable.
-- Prefer explicit fallback transitions over invisible degraded behavior.
-- Prefer bounded but meaningful retries over rigid early exits.
-- Prefer stable system contracts over clever prompt theatrics.
-
-# 14. Direct-mode doctrine
-
-- Direct mode is for everyday help, code understanding, quick answers, and low-overhead interaction.
-- Direct mode should not silently accumulate agentic scaffolding unless the user actually wants work done.
-- Any complexity retained in direct mode must justify itself in latency or clarity terms.
-- Direct mode is the benchmark for cleanliness; if it begins to feel like a debug console, the design is failing.
-
-# 15. Agentic-mode doctrine
-
-- Agentic mode exists to perform coding work, not merely to talk about coding work.
-- Every serious agentic run should move through a recognizable loop: scope → inspect → choose → act → verify → summarize.
-- When blocked, the run should explain the block concretely: missing binding, permission required, unsupported command shape, unavailable tool, malformed model output, or exhausted loop budget.
-- Agentic mode must show what path it is using: native tools, repaired native retry, or manual fallback.
-- After acting, the system should tell the user what changed, what it read, what it ran, what succeeded, and what still needs attention.
-
-# 16. Clone/inspect/port workflow the coding agent must follow
-
-- Step 1: confirm current Local-AI-Harness branch and working tree cleanliness.
-- Step 2: clone or update `base_repos/osaurus` and `base_repos/qwe-qwe` using the policy above.
-- Step 3: inspect only the relevant surfaces: status UI, activity timeline, model/runtime controls, parser/fallback helpers, tool event streaming, context compaction, command execution model, permission/approval model.
-- Step 4: write a porting ledger mapping every borrowed idea to a Local-AI-Harness problem code and target file.
-- Step 5: implement in current TypeScript paths, not in a new subsystem.
-- Step 6: add tests and visible status/trace outputs that prove the ported behavior exists.
-- Step 7: write a concise architecture note documenting what was borrowed and what was intentionally not copied.
-
-# 17. Expanded guidance for each of the ten tasks
-
-### Guide for TASK-01
-
-The agent should treat TASK-01 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036), review current behavior in the listed files (packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts), compare with allowed external patterns (Codex approval-mode clarity, Claude Code permissions surface, Cursor mode separation, Windsurf AGENTS.md and rules scoping), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-02
-
-The agent should treat TASK-02 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035), review current behavior in the listed files (packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts), compare with allowed external patterns (Qwen Code parser resilience and terminal-agent discipline, Codex long-horizon context compaction mindset, Claude Code subagents/permissions thinking without copying the stack), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-03
-
-The agent should treat TASK-03 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-006, P-007, P-008, P-020, P-025, P-030), review current behavior in the listed files (packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx), compare with allowed external patterns (Qwen Code robust parser adaptations, Codex explicit approval/fallback clarity, Claude Code permission-state transparency), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-04
-
-The agent should treat TASK-04 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-019, P-020, P-021, P-022, P-033, P-034), review current behavior in the listed files (apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*), compare with allowed external patterns (Osaurus product-grade chat/runtime feel, Windsurf activity timeline clarity, Codex agent-command-center mental model), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-05
-
-The agent should treat TASK-05 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-003, P-027, P-031), review current behavior in the listed files (apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx), compare with allowed external patterns (Cursor Ask/Agent distinction, Codex pair-vs-delegate separation, Osaurus fast local chat feel), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-06
-
-The agent should treat TASK-06 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-016, P-017, P-025, P-027, P-032), review current behavior in the listed files (packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx), compare with allowed external patterns (Osaurus runtime status monitor, Windsurf terminal/runtime controls, Codex environment/status visibility), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-07
-
-The agent should treat TASK-07 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-012, P-013, P-015, P-028, P-029), review current behavior in the listed files (apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts), compare with allowed external patterns (Windsurf AGENTS.md + rules engine concepts, Cursor AGENTS.md and rules layering, Codex Skills mindset without copying cloud assumptions), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-08
-
-The agent should treat TASK-08 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-002, P-014, P-015, P-028, P-032, P-035), review current behavior in the listed files (packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts), compare with allowed external patterns (Windsurf RAG/context awareness ideas, Codex repo/environment grounding, Qwen Code disciplined context exposure), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-09
-
-The agent should treat TASK-09 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-001, P-018, P-022, P-026, P-036), review current behavior in the listed files (packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts), compare with allowed external patterns (Claude Code permissions and hooks model, Windsurf allow/deny/auto/turbo command levels, Codex suggest/auto edit/full auto mental model), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-### Guide for TASK-10
-
-The agent should treat TASK-10 as a bounded but rich delivery track. The right way to approach it is to begin from its mapped problems (P-023, P-024, P-030, P-033, P-034), review current behavior in the listed files (tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts), compare with allowed external patterns (Codex trust-through-clear-state, Claude Code health/status surface, Qwen Code failure-path realism), and then convert the findings into a change set that improves runtime truth, UI truth, and test truth together. This task is not complete when the code compiles; it is complete when the operator experience for the associated failure class becomes materially clearer, more reliable, and better evidenced through traces and UI state.
-
-**Questions the agent must answer while implementing**
-
-- What is the operator’s mental model here, and how is the current harness violating it?
-- Which exact current state transitions are ambiguous or invisible?
-- Which parts of the change belong in engine logic, adapter behavior, planner state, API payloads, and UI components respectively?
-- How will a Gemma/Qwen-class model behave under this change, especially under failure conditions?
-- What new tests prove the improvement under hostile or messy inputs, not only friendly mocks?
-
-**Proof the agent must produce**
-
-- A before/after note written in plain language.
-- A machine-readable trace or event sample that shows the new behavior.
-- A UI-visible sample or screenshot plan describing how the user will perceive the change.
-- A test proving the behavior does not only work in a happy path.
-
-# 18. Architecture note template the agent should fill after implementation
-
-
-```md
-# Architecture Note
-
-## Scope
-What task tracks were touched and why.
-
-## Borrowed from Qwen-side reference
-- behavior pattern
-- exact Local-AI-Harness file(s)
-- why it fit
-- what was adapted
-
-## Borrowed from Osaurus
-- behavior pattern
-- exact Local-AI-Harness file(s)
-- why it fit
-- what was adapted
-
-## Borrowed from Codex / Claude Code / Cursor / Windsurf
-- behavior pattern
-- exact Local-AI-Harness file(s)
-- why it fit
-- what was adapted
-
-## Intentionally not copied
-- upstream behavior
-- reason it was excluded
-- local constraint that ruled it out
-
-## New or changed events
-- event
-- payload summary
-- UI consumer
-
-## Before / after behavior
-### Direct chat
-### Agentic mode
-### Tool failure handling
-### Fallback handling
-### Runtime status display
+Before editing, confirm:
+
+```bash
+git branch --show-current
+git status --short
+git log -1 --oneline
 ```
 
-# 19. Research digest the agent should keep in mind
+Do not work on:
+
+- `main`
+- `experiment/action-dsl-workflow-26b`
+- any old experiment branch
+
+unless the user explicitly asks.
+
+## 1.2 No hidden broad rewrites
+
+Do not rewrite the app in a giant pass.
+
+Each milestone must be implemented in small commits. Every commit should answer:
+
+- What changed?
+- Why did it change?
+- What behavior is now protected?
+- What validation passed?
+
+## 1.3 Keep the April 28 working behavior as the learning baseline
+
+The previously useful behavior was simple project inspection. The harness could inspect a normal project folder, identify the stack, list main files, and explain how the app worked.
+
+That behavior worked because it was:
+
+- deterministic
+- lightweight
+- fast
+- based on obvious files like `package.json`, entry files, `views/`, and `public/`
+- not a repo-wide audit
+- not a multi-agent workflow
+- not dependent on heavy model routing
+- not cluttered by advanced tool panels
+
+This recovery must preserve that lesson.
+
+---
+
+# 2. Current vulnerability report
+
+The latest recovery branch improved one important area: the core model-role configuration was mostly simplified back to one active model. However, the old workflow risks remain. The system can still become slow, confusing, or unreliable because old agentic assumptions remain in API defaults, CLI defaults, task routing, UI, tools, memory, and tests.
+
+## 2.1 Critical vulnerabilities
+
+| ID | Vulnerability | Urgency | Why it can break the system |
+|---|---|---:|---|
+| C1 | API defaults to Agent Mode | Critical | Normal chat can accidentally trigger planner, tools, repo context, approvals, and long local-model loops. |
+| C2 | CLI defaults to agentic execution | Critical | The CLI claims to be chat but sends normal input through the heavy agent path. |
+| C3 | Simple project inspection routes to `repo_wide_audit` | Critical | “What kind of project is this?” becomes a heavy multi-step audit instead of fast deterministic inspection. |
+| C4 | Rigid task templates control the agent | Critical | The agent becomes trapped in predefined workflows instead of using flexible planning. |
+| C5 | Advanced tools are exposed by default | Critical | Local models receive too many tools and may choose the wrong path. |
+| C6 | Current instructions still point toward overbuilt architecture | Critical | Future agents will preserve the wrong system unless this file replaces the old direction. |
+| C7 | Web UI still renders a heavy Run Console by default | Critical | Users see too much internal machinery and cannot quickly understand what happened. |
+| C8 | No explicit API mode contract | Critical | `agentic` booleans and implicit defaults make behavior unpredictable across web, CLI, and API. |
+| C9 | No true `inspectProject()` first-class path | Critical | The best working feature is not protected by code and tests. |
+| C10 | Tests currently allow wrong product behavior | Critical | The test suite can pass while preserving the heavy workflow that caused the problem. |
+| C11 | Event contracts still expose `direct` / `agentic` internally and inconsistently | Critical | UI/API/session code can look updated while old mode states keep driving behavior. |
+| C12 | Browser folder resolution can silently bind the wrong workspace | Critical | Folder-label matching can appear correct while backend reads/writes another candidate path. |
+
+## 2.2 High-priority workflow failures
+
+| ID | Failure | Urgency | Why it matters |
+|---|---|---:|---|
+| H1 | Planner state still contains stale profile concepts | High | Removed model-routing ideas still leak into planner/UI types. |
+| H2 | Web presets still suggest “Deep Agent” / autonomous behavior | High | Product language pushes users toward heavy workflows unsuitable for the target PC. |
+| H3 | Tool naming is inconsistent | High | `readFile` vs `read_file` style mismatch can break traces, UI display, tests, and debugging. |
+| H4 | Session turn metadata can store full run objects | High | Memory and session files can grow too large over time. |
+| H5 | Structured diff and checkpoint UI are too visible | High | Useful internals become default visual clutter. |
+| H6 | Command approval flow is safe but heavy | High | Even safe verification commands can become disruptive. |
+| H7 | Browser snapshot vs backend workspace is not clear enough | High | The agent may appear workspace-aware when it is only looking at browser-provided context. |
+| H8 | File walking/search ignore lists are incomplete and inconsistent between modules | High | The harness can scan generated, vendored, or harness-internal directories and slow down badly. |
+| H9 | Web/internet tools are available too easily | High | Local coding work can unexpectedly try network access. |
+| H10 | Local model budgets are not clearly conservative | High | 16 GB machines can stall if context/output/retry settings are too high. |
+| H11 | Secret and credential files are not treated as a first-class exclusion category | High | Broad read/search/context paths can accidentally surface sensitive files. |
+| H12 | Skill activation is still mixed into the normal session path | High | Skills can add another dimension of complexity before Chat/Agent basics are stable. |
+| H13 | API streaming and non-streaming paths can drift | High | Fixing only one endpoint can leave the other with old Agent Mode defaults. |
+| H14 | Repo-indexer candidate path lists contain stale web paths | High | The code may look for `apps/web/src/HarnessApp.tsx` while the actual path is `apps/web/src/app/HarnessApp.tsx`. |
+
+## 2.3 Medium and low-level issues
+
+| ID | Issue | Urgency |
+|---|---|---:|
+| L1 | Remove temporary user experiment names from tests, prompts, fixtures, and docs. | Medium |
+| L2 | Do not hardcode file-specific explanations like `RunConsole` or `engine.ts` inside generic UI helpers. | Medium |
+| L3 | Do not open raw diffs by default. | Medium |
+| L4 | Do not open structured diffs by default. | Medium |
+| L5 | Hide context budget telemetry behind Advanced Details. | Medium |
+| L6 | Hide checkpoint IDs behind Advanced Details. | Medium |
+| L7 | Do not print thinking blocks by default in CLI. | Medium |
+| L8 | CLI `prompt` should not silently run Agent Mode. | Medium |
+| L9 | CLI help text is too crowded. | Medium |
+| L10 | `webSearch` and `fetchUrl` should not be default coding tools. | Medium |
+| L11 | Fallback file walking ignores too few heavy directories. | Medium |
+| L12 | Grep fallback can scan too broadly. | Medium |
+| L13 | `run_command` should not be treated as a write intent. | Medium |
+| L14 | `workspace_overview` should not always be direct chat. | Medium |
+| L15 | `architecture_change` is triggered too easily by common words. | Medium |
+| L16 | `small_patch` builds context packs too early. | Medium |
+| L17 | `single_file` forces checkpoint behavior too early. | Medium |
+| L18 | Agent summaries can overstate changed files if diff metadata accumulates. | Medium |
+| L19 | The system lacks a final “safe idle” state after failed/denied actions. | Medium |
+| L20 | Runtime stall states are not prominent enough in UI/CLI. | Medium |
+| L21 | `thinking` output can leak into default CLI/web display even when it should be hidden. | Medium |
+| L22 | CORS and host binding rules are not explained as local-only defaults. | Medium |
+| L23 | Large image attachments and multimodal context can bypass lightweight expectations if not isolated. | Medium |
+| L24 | Session list output can imply turn history is loaded when listing intentionally omits it. | Medium |
+| L25 | Advanced run history and checkpoint endpoints can encourage debugging UI clutter before simple modes work. | Medium |
 
-### Codex
+---
 
-- local terminal agent with suggest/auto edit/full auto-style approval modes
-- cloud Codex provisions isolated sandboxed containers per task
-- Codex app emphasizes multi-agent workflows, worktrees, skills, automations
+# 3. Product contract
 
-### Claude Code
+Local AI Harness must become a small, reliable, local-first assistant with two clear modes and one special lightweight inspection path.
 
-- terminal-first coding tool
-- fine-grained permissions with read-only vs bash vs file-modification distinction
-- hooks for PreToolUse/PostToolUse/UserPromptSubmit/Notification
-- slash commands and subagents for specialization
+## 3.1 Chat Mode
 
-### Cursor
+Chat Mode is for normal conversation.
 
-- Agent/Ask/Manual/Custom mode split
-- Agent can use search, edit, terminal, web, MCP tools
-- rules and AGENTS.md provide prompt-level persistent instructions
+It must:
 
-### Windsurf
+- be the default mode in API, web, and CLI
+- avoid planner execution
+- avoid workspace edit tools
+- avoid repo-wide indexing
+- avoid approval workflows
+- avoid Run Console clutter
+- avoid tool schema exposure by default
+- be fast enough for local daily use
+- support normal explanation and lightweight Q&A
 
-- Cascade memories vs rules vs workflows vs skills are distinct customization layers
-- AGENTS.md is auto-scoped by directory location
-- terminal auto-execution has disabled / allowlist / auto / turbo mental model
-- context engine is RAG-based and indexes local codebase
+Chat Mode may read files only if the user explicitly chooses file context or asks for a specific file, and the UI/CLI must make that clear.
 
-### Osaurus
+## 3.2 Agent Work
 
-- local-first macOS harness with status UI, memory, skills, schedules, watchers, local/cloud flexibility
-- OpenAI-compatible API and MCP server concepts
-- product-grade runtime visibility and polished chat surface
+Agent Work is for workspace-aware action.
 
-### Qwen Code
+It may:
 
-- open-source terminal agent optimized for Qwen models
-- provider-flexible
-- described as rich built-in tools with Skills and SubAgents for a Claude Code-like experience
-- parser-level adaptations are explicitly called out in the repo as a major contribution
+- inspect files
+- create a lightweight plan
+- run safe read tools
+- propose edits
+- request approvals
+- apply minimal patches
+- run verification commands
+- summarize changed files and results
 
-# 20. Durable writing guidance for this AGENTS.md itself
+Agent Work must always show:
 
-- Prefer concrete, directory- and file-specific instructions over vague aspirations.
-- Keep global instructions in the root AGENTS.md; split out subdirectory AGENTS.md files later if directory-specific conventions become dense.
-- Do not duplicate parent instructions unnecessarily in child AGENTS files.
-- Treat this document as versioned infrastructure, not disposable chat output.
+- workspace root
+- workspace source
+- permission mode
+- mode
+- goal
+- current action
+- files inspected
+- files changed
+- checks run
+- blocked/failed/safe-idle reason
+- final result
 
-# Appendix A — Detailed issue cards
+## 3.3 Inspect Project
 
-### P-001
+Inspect Project is a special lightweight Agent Work path.
 
-**Core issue:** Danger mode docs claim broad access, but runtime remains workspace-bound; trust and scope mismatch.
+It must:
 
-**Why this matters for the operator:** P-001 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+- be deterministic first
+- avoid repo-wide audit
+- avoid edit tools
+- avoid checkpoints
+- avoid web tools
+- inspect only obvious project files/directories
+- return a clear project summary
+- run fast enough to feel like a utility, not an agent loop
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+## 3.4 Full Audit
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Full Audit is different from Inspect Project.
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Full Audit may read more broadly, but only when the user explicitly asks for broad review language such as:
 
-### P-002
+- “audit the whole repo”
+- “review the entire codebase”
+- “find all bottlenecks”
+- “scan everything”
+- “deep repo audit”
 
-**Core issue:** Internet tooling exists in runtime but is not coherently wired into agent execution.
+Do not treat ordinary project inspection as Full Audit.
 
-**Why this matters for the operator:** P-002 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+## 3.5 One active model
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+There is only one active model by default.
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Default:
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+```ts
+model: 'gemma4:e4b'
+```
 
-### P-003
+Do not reintroduce:
 
-**Core issue:** Direct mode is general-purpose but split across inconsistent stream/non-stream code paths.
+```ts
+fastModel
+codingModel
+reviewModel
+apiModel
+executionProfile
+providerProfile
+promptProfile
+automatic model routing
+```
 
-**Why this matters for the operator:** P-003 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+A future manual model preset system may exist, but automatic per-purpose model routing is forbidden until the base harness works reliably.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+## 3.6 Skills are advanced, not default behavior
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Skills are allowed only as optional user-selected behavior.
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Do not let skills:
 
-### P-004
+- change Chat Mode into Agent Work
+- add hidden tool access
+- bypass mode/tool-profile rules
+- override workspace policy
+- activate disabled skills
+- silently expand memory or context budgets
 
-**Core issue:** Planner is largely a status tracker rather than a deep working-memory/task-graph system.
+Keep disabled skills disabled unless the user explicitly changes policy and tests are updated.
 
-**Why this matters for the operator:** P-004 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+---
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+# 4. Workflow breakdowns that must be fixed
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+## 4.1 Normal chat becomes agent work
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Break path:
 
-### P-005
+1. User opens web or CLI.
+2. User types a normal question.
+3. System defaults to agentic execution.
+4. Planner starts, tools become available, context grows.
+5. Local model slows or stalls.
 
-**Core issue:** Agentic mode uses many early shortcuts that bypass the richer inspect-edit-verify loop.
+Fix:
 
-**Why this matters for the operator:** P-005 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+- Chat must be default.
+- Agent Work must be explicitly selected.
+- API must not infer Agent Work from missing fields.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+## 4.2 Project inspection becomes repo audit
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Break path:
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+1. User asks what kind of project the workspace is.
+2. Classifier maps it to `repo_wide_audit`.
+3. System builds context packs and reads too much.
+4. Simple inspection becomes slow and confusing.
 
-### P-006
+Fix:
 
-**Core issue:** Low loop caps choke iterative work and spend precious turns on recovery rather than completion.
+- Add `inspect_project`.
+- Add deterministic `inspectProject()`.
+- Use `full_audit` only when explicitly requested.
 
-**Why this matters for the operator:** P-006 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+## 4.3 Local model receives too many tools
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Break path:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+1. Agent Mode exposes advanced AST/import/diff/checkpoint/web tools.
+2. Small local model picks unnecessary tools.
+3. Tool calls fail or become malformed.
+4. Manual fallback starts.
+5. User sees noise instead of progress.
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Fix:
 
-### P-007
+- Reduce default tool set.
+- Gate advanced tools behind Advanced Agent Mode.
+- Expose tools by mode and intent, not one giant global list.
 
-**Core issue:** Manual JSON fallback is brittle for small local models and easy to derail.
+## 4.4 UI tells the wrong story
 
-**Why this matters for the operator:** P-007 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+Break path:
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+1. RunConsole shows context budget, plan, files, diffs, checkpoints, approvals, verification.
+2. User sees many panels but does not know what actually happened.
+3. Simple tasks look complicated.
+4. Failures look like progress.
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Fix:
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+- Chat Mode UI must be simple.
+- Agent Work UI must show only essential activity by default.
+- Advanced Details must hide raw traces, diffs, budget, and checkpoints.
 
-### P-008
+## 4.5 Session memory grows too heavy
 
-**Core issue:** Simulation detection exists, but recovery still relies too much on the model fixing itself.
+Break path:
 
-**Why this matters for the operator:** P-008 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+1. Agent run stores full run summaries.
+2. Full run summaries may include diffs, commands, web fetches, steps, metadata.
+3. JSONL grows.
+4. Loading and summarizing sessions becomes slow.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Fix:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+- Store compact run summaries only.
+- Keep full traces/runs separate and bounded.
+- Do not inject large memory into prompts.
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+## 4.6 Approval deadlock
 
-### P-009
+Break path:
 
-**Core issue:** Browser folder context and backend workspace binding are conceptually split and user-confusing.
+1. Agent requests write/command approval.
+2. User denies or ignores it.
+3. Agent run remains pending or unclear.
+4. UI/CLI appears stuck.
 
-**Why this matters for the operator:** P-009 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+Fix:
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+- Denial must transition run to `blocked` or `safe_idle`.
+- Timeout/no response must be visible.
+- Final message must explain what was not done and why.
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+## 4.7 Browser workspace mismatch
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Break path:
 
-### P-010
+1. User selects a folder in browser.
+2. Backend workspace root is different or unresolved.
+3. Agent appears to work on one workspace but reads/writes another.
 
-**Core issue:** Workspace resolution is heuristic and can silently fall back to snapshot-only behavior.
+Fix:
 
-**Why this matters for the operator:** P-010 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+- Always show `workspaceSource` as `backend_bound` or `browser_snapshot_only`.
+- Do not write files unless backend workspace is bound.
+- Browser snapshots are read-only unless resolved to a backend path.
+- Never silently bind if there are multiple candidates or low confidence.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+## 4.8 Web/network surprise
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Break path:
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+1. User asks a local coding question.
+2. Agent sees `webSearch`/`fetchUrl` tools.
+3. Model calls web unnecessarily.
+4. Local task becomes slow and privacy/confidence is reduced.
 
-### P-011
+Fix:
 
-**Core issue:** Changing workspace root resets important runtime/session/planner state.
+- Web tools are disabled by default.
+- Web tools require explicit web intent or setting.
+- UI must show when web access is enabled.
 
-**Why this matters for the operator:** P-011 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+## 4.9 Stale path assumptions
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Break path:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+1. Agent/test/tool assumes an older file path.
+2. Repo has moved the file.
+3. Context selection silently misses the real file.
+4. Agent patches the wrong place or fails.
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Fix:
 
-### P-012
+- Always verify paths with `git ls-files`, `find`, or `fs.access`.
+- Tests must fail when candidate path lists contain stale paths for key app files.
 
-**Core issue:** Skills loading is coupled to workspace root and can disappear silently after rebinding.
+---
 
-**Why this matters for the operator:** P-012 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+# 5. Global engineering rules
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+## 5.1 Work incrementally
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Every milestone must be completed in small commits.
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Do not create one massive rewrite.
 
-### P-013
+Each commit should answer:
 
-**Core issue:** Caveman is runtime-disabled but may still leak in catalog surfaces or build artifacts.
+- What changed?
+- Why?
+- What behavior is protected?
+- What tests passed?
 
-**Why this matters for the operator:** P-013 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+## 5.2 No fake completion
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Do not mark any milestone done unless:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+- implementation is complete
+- tests are updated
+- validation commands pass or failure is documented
+- old behavior is removed or gated
+- user-facing behavior is clear
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+## 5.3 No temporary experiment names
 
-### P-014
+Do not hardcode user experiment folder names or past test project names into runtime code, tests, prompts, fixtures, or docs.
 
-**Core issue:** Tool selection is regex-driven and therefore narrow, brittle, and phrasing-sensitive.
+Use generic names like:
 
-**Why this matters for the operator:** P-014 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+```txt
+sample-express-app
+sample-node-app
+fixture-project
+sample-vite-app
+```
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Do not use names from temporary experiments.
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+## 5.4 Prefer deterministic helpers
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+For local models, deterministic code should do obvious work:
 
-### P-015
+- inspect package manifests
+- identify common entry files
+- detect scripts
+- list top-level directories
+- read obvious files
+- summarize known framework signals
+- detect likely package manager
+- detect whether the project is frontend, backend, full-stack, CLI, or library
 
-**Core issue:** Automatic repo-context injection is off by default, weakening hard-task repository understanding.
+Do not ask the model to guess what deterministic code can compute.
 
-**Why this matters for the operator:** P-015 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+## 5.5 Keep local hardware in mind
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Target machine:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+- Linux
+- 16 GB RAM
+- Ollama local models
+- CPU/iGPU performance
+- slow long-context generation
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Therefore:
 
-### P-016
+- avoid large context by default
+- avoid huge tool lists
+- avoid long planner loops
+- avoid unnecessary repo-wide scans
+- avoid large diffs in prompts
+- avoid huge session memory
+- avoid high retry counts
+- avoid loading multiple models by default
+- avoid default network calls
+- avoid default multimodal/image-heavy payloads
 
-**Core issue:** Idle timeout seems configured but not truly enforced in the main streaming path.
+## 5.6 Type and schema migrations must be deliberate
 
-**Why this matters for the operator:** P-016 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+When changing shared types, update all consumers in the same milestone.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Shared areas include:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+- API payload types
+- web run types
+- session metadata types
+- planner types
+- engine config types
+- tool trace event types
+- CLI JSON output shapes
+- tests and mocks
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Do not leave stale fields in one package because “it still compiles.”
 
-### P-017
+## 5.7 Backward compatibility must not preserve bad defaults
 
-**Core issue:** Model lifecycle unloading can look like sleep/crash from the operator’s point of view.
+If old API callers use `agentic` booleans, support them only as compatibility mapping.
 
-**Why this matters for the operator:** P-017 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+Compatibility rules:
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+- missing mode means `chat`
+- `agentic: true` means `agent`
+- `agentic: false` means `chat`
+- `mode: "agent"` takes precedence over legacy fields
+- API response should use modern `executionMode: "chat" | "agent"`
+- legacy `executionMode: "direct" | "agentic"` may appear only in migration adapters, never as the public final contract
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Do not keep `agentic !== false` logic.
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+## 5.8 Security and privacy rules
 
-### P-018
+- No writes outside workspace root.
+- No execute outside workspace root.
+- No shell operators unless explicitly approved and safely parsed.
+- No web access unless explicitly enabled or requested.
+- No raw secrets in logs, traces, UI, session files, or final summaries.
+- No accidental reading of `.env`, key files, or credential stores unless the user explicitly asks and policy allows it.
+- No generated/vendored/harness-internal directories in broad scans by default.
+- Redact likely tokens, keys, passwords, connection strings, and authorization headers from all UI/session/trace outputs.
+- Never show full environment variables by default.
 
-**Core issue:** RunCommand is intentionally narrow, which users often experience as broken shell access.
+## 5.9 Canonical ignore list
 
-**Why this matters for the operator:** P-018 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+All broad walking, search, indexing, context-packing, and fixture scans must share a canonical ignore list.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+At minimum ignore:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+```txt
+.git
+.gamma-harness
+.next
+.nuxt
+.cache
+.turbo
+.vite
+.playwright
+.playwright-cli
+node_modules
+dist
+build
+coverage
+base_repos
+third_party
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+```
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+If a tool needs one of these paths, it must be explicitly requested by the user and must pass workspace policy.
 
-### P-019
+## 5.10 Public event contract
 
-**Core issue:** UI visibility compresses activity into counts and summaries instead of precise change ledgers.
+Public API/UI/CLI events should use stable mode names:
 
-**Why this matters for the operator:** P-019 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+```txt
+chat
+agent
+inspect_project
+full_audit
+```
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Avoid exposing internal legacy labels as public UX:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+```txt
+direct
+agentic
+repo_wide_audit
+architecture_change
+```
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Internal code may keep temporary adapters during migration, but tests must enforce the final public names.
 
-### P-020
+---
 
-**Core issue:** Renderer has an honesty fallback because the model often fails to return a real final narrative.
+# 6. Validation commands
 
-**Why this matters for the operator:** P-020 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+Use these commands as standard validation:
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+```bash
+npm run build:packages
+npm run build:apps
+npm test
+```
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+Layer-specific validation:
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+```bash
+node --import tsx tests/unit/core.test.ts
+node --import tsx tests/integration/workflow.test.ts
+node --import tsx tests/e2e/api.test.ts
+node --import tsx tests/e2e/cli.test.ts
+```
 
-### P-021
+After UI changes:
 
-**Core issue:** Reasoning blocks can visually dominate the actual useful outcome.
+```bash
+npm run build --workspace web
+```
 
-**Why this matters for the operator:** P-021 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+After API changes:
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+```bash
+npm run build --workspace @local-harness/api
+```
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+After CLI changes:
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+```bash
+npm run build --workspace @local-harness/cli
+node --import tsx tests/e2e/cli.test.ts
+```
 
-### P-022
+Manual local smoke tests:
 
-**Core issue:** Approvals documentation and UI surface have drifted apart.
+```bash
+ollama ps
+harness chat
+harness inspect
+harness agent
+```
 
-**Why this matters for the operator:** P-022 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+If a command fails, document:
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+- command run
+- failure output
+- likely cause
+- whether failure is related to the current milestone
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+---
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+# 7. File path correction note
 
-### P-023
+Verify real file paths before editing.
 
-**Core issue:** Tests mock happy paths and miss real local-model hesitation, RAM pressure, and wedged streams.
+The web app path in this branch may use:
 
-**Why this matters for the operator:** P-023 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+```txt
+apps/web/src/app/HarnessApp.tsx
+```
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+not:
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+```txt
+apps/web/src/HarnessApp.tsx
+```
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Do not guess paths from older docs. Use `git ls-files` or `find` first.
 
-### P-024
+Tests should protect the real path so future repo-indexing logic does not drift.
 
-**Core issue:** Tests encode optimistic success markers that can still feel empty to users.
+---
 
-**Why this matters for the operator:** P-024 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+# 8. Ten-milestone recovery plan
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+## Milestone 01 — Replace misleading instructions and lock recovery direction
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+### Urgency
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Critical.
 
-### P-025
+The current instruction file encourages the old overbuilt architecture. This must be fixed first because future agents follow this file.
 
-**Core issue:** Native Ollama support is strong, but capability detection and mode selection remain fragile.
+### Goal
 
-**Why this matters for the operator:** P-025 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+Make `AGENTS.md` the recovery playbook for a lightweight harness.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+### Files to inspect
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+- `AGENTS.md`
+- `package.json`
+- `packages/core/src/engine.ts`
+- `packages/task-orchestrator/src/index.ts`
+- `apps/api/src/server.ts`
+- `apps/cli/src/cli.ts`
+- `apps/web/src/app/HarnessApp.tsx`
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+### Tasks
 
-### P-026
+1. Replace the old completion ledger with this recovery file.
+2. Remove language that says smart-agent tooling and model routing are complete goals.
+3. Add a clear rule that Chat Mode is default.
+4. Add a clear rule that Agent Work is explicit.
+5. Add a clear rule that one active model is default.
+6. Add a clear rule that project inspection is lightweight, not repo-wide audit.
+7. Add a clear rule that advanced tools are gated.
+8. Remove all hardcoded temporary experiment names from docs/tests/prompts.
+9. Add validation commands to the file.
+10. Record the recovery branch name.
+11. Add the canonical ignore/security rules from this file.
+12. Add the public event contract from this file.
 
-**Core issue:** Source-of-truth for workspace changes depending on context, eroding trust.
+### Acceptance criteria
 
-**Why this matters for the operator:** P-026 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+- `AGENTS.md` no longer mentions the old architecture as the direction to preserve.
+- No “completion ledger” tells agents the overbuilt state is final.
+- The first page of `AGENTS.md` clearly states vulnerabilities and urgency.
+- A new agent can understand the recovery goal without reading prior conversations.
+- Security, ignore-list, and event-contract rules are present.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+### Validation
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+```bash
+git diff -- AGENTS.md
+npm run build:packages
+npm run build:apps
+```
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+### Completion status
 
-### P-027
+Done on 2026-05-14.
 
-**Core issue:** Local-first CPU reality is burdened by orchestration overhead and protocol weight.
+Evidence:
 
-**Why this matters for the operator:** P-027 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+- Recovery branch and lightweight harness direction are recorded in this file.
+- Temporary experiment names were removed from tests.
+- Stale web path candidates were corrected to `apps/web/src/app/HarnessApp.tsx`.
+- Repo-indexer ignore and secret-file exclusions were hardened.
+- `npm run build:packages` passed.
+- `npm run build:apps` passed.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+---
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+## Milestone 02 — Make Chat Mode and Agent Work truly separate
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+### Urgency
 
-### P-028
+Critical.
 
-**Core issue:** Lightweight indexing helps latency but under-serves deep repo understanding tasks.
+The current API and CLI can run agentic workflows by default. That is the main reason normal use feels slow and confusing.
 
-**Why this matters for the operator:** P-028 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+### Goal
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Create a real mode contract across API, CLI, web, engine, session metadata, and tests.
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+### Files to inspect
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+- `apps/api/src/server.ts`
+- `apps/cli/src/cli.ts`
+- `apps/web/src/app/HarnessApp.tsx`
+- `packages/core/src/engine.ts`
+- `packages/session-store/src/types.ts`
+- `tests/e2e/api.test.ts`
+- `tests/e2e/cli.test.ts`
+- `tests/unit/core.test.ts`
 
-### P-029
+### Required API behavior
 
-**Core issue:** Frontend config already drifts from backend runtime config fields.
+- Default request mode is Chat Mode.
+- Agent Work requires `mode: "agent"` or legacy `agentic: true`.
+- Response includes `executionMode: "chat" | "agent"`.
+- Streaming and non-streaming endpoints use the same mode parser.
+- Missing mode never means Agent Work.
+- Direct/chat streaming must not emit agent run events unless a file-read context action was explicitly requested.
 
-**Why this matters for the operator:** P-029 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+### Required CLI behavior
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+- `harness chat` opens Chat Mode.
+- `harness agent` opens Agent Work.
+- `harness prompt` defaults to Chat Mode unless `--agent` is provided.
+- Interactive startup clearly shows selected mode.
+- Normal CLI chat does not call the agent planner.
+- Thinking output is hidden unless `--show-thinking` is passed.
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+### Required web behavior
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+- Clear top-level mode switch: `Chat` and `Agent Work`.
+- Chat Mode hides Run Console and agent panels.
+- Agent Work shows activity panel.
+- Mode state is saved intentionally, not hidden in old `agentic` naming.
+- `localStorage` keys should be renamed from agentic-centric names to neutral mode names.
 
-### P-030
+### Required engine behavior
 
-**Core issue:** Architecture already normalizes planning-only/simulation failure because those failures are common.
+Provide or normalize explicit methods/options:
 
-**Why this matters for the operator:** P-030 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+```ts
+directChat(...)
+agentWork(...)
+chatStream(..., { mode: 'chat' | 'agent' })
+```
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+Do not infer agent mode from missing fields.
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+### Tasks
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+1. Replace `body.agentic !== false` with explicit mode parsing.
+2. Make default mode `chat`.
+3. Update streaming and non-streaming endpoints consistently.
+4. Update CLI command routing.
+5. Update web request payloads.
+6. Update session metadata language where needed.
+7. Keep legacy compatibility only if it does not preserve bad defaults.
+8. Add tests proving Chat Mode does not create task plans.
+9. Add tests proving Agent Work creates a lightweight plan.
+10. Update UI labels from `direct/agentic` to `Chat/Agent Work`.
+11. Add a single shared mode parser used by both `/api/chat` and `/api/chat/stream`.
+12. Add tests proving stream and non-stream behavior match.
 
-### P-031
+### Acceptance criteria
 
-**Core issue:** Direct mode is correctly broad, but that only sharpens disappointment in agentic mode.
+- Normal chat never creates `task_plan_created`.
+- Normal CLI chat never runs Agent Work.
+- Agent Work is explicitly selected.
+- Web mode is visually obvious.
+- Tests fail if Agent Mode becomes default again.
+- `direct` / `agentic` are no longer public UX names.
 
-**Why this matters for the operator:** P-031 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+### Validation
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+```bash
+npm run build:packages
+npm run build:apps
+node --import tsx tests/unit/core.test.ts
+node --import tsx tests/e2e/api.test.ts
+node --import tsx tests/e2e/cli.test.ts
+```
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+### Completion status
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Done on 2026-05-14.
 
-### P-032
+Evidence:
 
-**Core issue:** Nominal context window is large, but effective context use remains poor.
+- API mode parsing defaults to `chat` and maps legacy `agentic` only for compatibility.
+- CLI `prompt` defaults to Chat Mode; Agent Work requires `--agent` or `harness agent`.
+- Web mode state uses a neutral mode key and sends `mode: "chat" | "agent"`.
+- Public execution metadata uses `chat` and `agent`.
+- `node --import tsx tests/unit/core.test.ts` passed.
+- `node --import tsx tests/e2e/api.test.ts` passed.
+- `node --import tsx tests/e2e/cli.test.ts` passed.
 
-**Why this matters for the operator:** P-032 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+---
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+## Milestone 03 — Restore lightweight project inspection as a first-class path
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+### Urgency
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Critical.
 
-### P-033
+The earlier working behavior came from simple deterministic project inspection. That must be restored and protected.
 
-**Core issue:** UI exposes run steps and tool cards, but the information density/structure still feels wrong.
+### Goal
 
-**Why this matters for the operator:** P-033 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+Add `inspect_project` and `inspectProject()`.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+### Files to inspect
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+- `packages/core/src/engine.ts`
+- `packages/task-orchestrator/src/index.ts`
+- `packages/repo-indexer/src/indexer.ts`
+- `packages/tool-runtime/src/registry.ts`
+- `tests/unit/core.test.ts`
+- `tests/integration/workflow.test.ts`
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+### Required behavior
 
-### P-034
+When the user asks:
 
-**Core issue:** Activity tab shows trace headers without enough payload depth for diagnosis.
+```txt
+Inspect the current project and tell me what kind of app it is.
+What kind of project is this?
+Look at this workspace and explain the stack.
+Tell me how this app is structured.
+```
 
-**Why this matters for the operator:** P-034 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+The system must use lightweight inspection, not repo-wide audit.
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+### `inspectProject()` should inspect
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+- `package.json`
+- `README.md`
+- `server.js`
+- `app.js`
+- `index.js`
+- `main.js`
+- `src/index.*`
+- `src/main.*`
+- `src/App.*`
+- `views/`
+- `public/`
+- `vite.config.*`
+- `next.config.*`
+- `tsconfig.json`
+- common lockfiles
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+### Output should include
 
-### P-035
+- project name
+- likely project type
+- framework/library signals
+- backend/frontend signals
+- main entry points
+- view/static directories
+- package scripts
+- package manager
+- how to run
+- obvious missing files
+- next recommended check
 
-**Core issue:** Tool registry is stronger than the agent’s effective ability to exploit it.
+### Forbidden classifications for simple inspection
 
-**Why this matters for the operator:** P-035 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+Do not classify simple inspection as:
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+```txt
+repo_wide_audit
+architecture_change
+multi_file
+small_patch
+```
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+### Tasks
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+1. Add `TaskIntent` or equivalent: `inspect_project`.
+2. Add deterministic `inspectProject()` in core or repo-indexer.
+3. Route simple project-inspection requests to `inspect_project`.
+4. Keep `full_audit` only for explicit whole-repo audit requests.
+5. Add a generic fixture project for tests.
+6. Remove hardcoded temporary experiment names from tests.
+7. Add tests for Express/EJS-like generic fixture detection.
+8. Add tests for Vite/React-like generic fixture detection if simple.
+9. Ensure no edit tools are exposed during inspect-only mode.
+10. Ensure no checkpoint is created during inspect-only mode.
+11. Ensure no web tool is exposed during inspect-only mode.
+12. Ensure inspect output is deterministic and useful even if model call fails.
 
-### P-036
+### Acceptance criteria
 
-**Core issue:** Snapshot-only refusal is honest, but it feels bureaucratic if binding truth is unclear.
+- Simple project inspection returns through a lightweight path.
+- No repo-wide audit occurs unless explicitly requested.
+- No advanced tools are used for basic project inspection.
+- No web tools are used.
+- Tests protect this behavior.
 
-**Why this matters for the operator:** P-036 is not a cosmetic problem. It feeds the core trust deficit documented in the audit: the harness looks more capable than it feels, and when it fails it often feels indecisive, confused, or unfinished. This card exists so that future coding agents cannot optimize the wrong thing. They must be able to name the failure class precisely, identify where it lives in the current stack, and explain how their changes reduce the operator pain rather than merely shifting it elsewhere.
+### Validation
 
-**Questions to ask before changing code:** 
-1. Is the failure caused by a mismatch between backend reality and user-visible presentation? 
-2. Is the failure caused by a shallow or brittle model loop? 
-3. Is the failure caused by inadequate planner or session state? 
-4. Is the failure caused by a missing event or unclear API contract? 
-5. Is the failure caused by a UI component that technically displays information but in the wrong shape?
+```bash
+npm run build:packages
+node --import tsx tests/unit/core.test.ts
+node --import tsx tests/integration/workflow.test.ts
+```
 
-**What a good fix would look like:** A good fix for any issue card improves three layers at once: runtime truth, visible truth, and test truth. Runtime truth means the system actually behaves better. Visible truth means the operator can see what changed in an understandable way. Test truth means the improvement is encoded in automated checks that exercise realistic failure modes.
+### Completion status
 
-**What a bad fix would look like:** A bad fix papers over the symptom in prose, adds a large prompt blob without reducing ambiguity, invents a duplicate subsystem, or makes the harness harder to reason about while claiming to make it more agentic.
+Done on 2026-05-14.
 
-# Appendix B — Ten-task sequencing rationale
+Evidence:
 
-### TASK-01
+- `inspect_project` is now a first-class intent.
+- `inspectProject()` produces deterministic project summaries from obvious local files.
+- Simple project-inspection prompts avoid repo-wide audit, model calls, checkpoints, and edit tools.
+- Generic Express and Vite-style inspection tests protect the behavior.
+- `node --import tsx tests/unit/core.test.ts` passed.
+- `node --import tsx tests/integration/workflow.test.ts` passed.
 
-TASK-01 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+---
 
-Primary files for TASK-01 are packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Codex approval-mode clarity, Claude Code permissions surface, Cursor mode separation, Windsurf AGENTS.md and rules scoping) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+## Milestone 04 — Simplify the task orchestrator and planner
 
-### TASK-02
+### Urgency
 
-TASK-02 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+Critical.
 
-Primary files for TASK-02 are packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Qwen Code parser resilience and terminal-agent discipline, Codex long-horizon context compaction mindset, Claude Code subagents/permissions thinking without copying the stack) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+The current planner is too rigid. It can force the agent into fixed workflows that are inappropriate for small local tasks.
 
-### TASK-03
+### Goal
 
-TASK-03 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+Replace rigid task templates with a flexible, lightweight plan model.
 
-Primary files for TASK-03 are packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Qwen Code robust parser adaptations, Codex explicit approval/fallback clarity, Claude Code permission-state transparency) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+### Files to inspect
 
-### TASK-04
+- `packages/task-orchestrator/src/index.ts`
+- `packages/planner/src/planner.ts`
+- `packages/planner/src/types.ts`
+- `packages/core/src/engine.ts`
+- `tests/unit/core.test.ts`
 
-TASK-04 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+### New intent set
 
-Primary files for TASK-04 are apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Osaurus product-grade chat/runtime feel, Windsurf activity timeline clarity, Codex agent-command-center mental model) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+Use a small set:
 
-### TASK-05
+```ts
+type TaskIntent =
+  | 'chat'
+  | 'inspect_project'
+  | 'inspect_file'
+  | 'search_project'
+  | 'edit_file'
+  | 'run_command'
+  | 'summarize_changes'
+  | 'full_audit';
+```
 
-TASK-05 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+### New plan shape
 
-Primary files for TASK-05 are apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Cursor Ask/Agent distinction, Codex pair-vs-delegate separation, Osaurus fast local chat feel) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+```ts
+interface LightweightPlan {
+  id: string;
+  mode: 'chat' | 'agent';
+  intent: TaskIntent;
+  goal: string;
+  status: 'pending' | 'running' | 'blocked' | 'safe_idle' | 'done' | 'failed';
+  steps: LightweightPlanStep[];
+  currentStepId?: string;
+  evidence: string[];
+  nextAction?: string;
+  stopCondition: string;
+  revisedAt?: number;
+}
+```
 
-### TASK-06
+### Plan rules
 
-TASK-06 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+- Chat Mode does not create plans.
+- Agent Work creates short plans.
+- Plans can be revised.
+- Plan steps are not marked complete until real work happens.
+- Inspection can stop once enough evidence exists.
+- Full audit only runs when explicitly requested.
+- Denied approvals transition to `blocked` or `safe_idle`, not silent pending.
+- Planning must guide work; it must not trap the agent.
 
-Primary files for TASK-06 are packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Osaurus runtime status monitor, Windsurf terminal/runtime controls, Codex environment/status visibility) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+### Tasks
 
-### TASK-07
+1. Remove or gate rigid `architecture_change`, `multi_file`, and `repo_wide_audit` templates.
+2. Replace broad `TaskComplexity` with simple intent plus optional size estimate.
+3. Remove stale fields like `executionProfile` and `promptProfile`.
+4. Add clear stop conditions.
+5. Add evidence tracking.
+6. Add plan revision support.
+7. Ensure plan events are small and structured.
+8. Update UI types.
+9. Update tests.
+10. Delete tests that encode old heavy classification.
+11. Make `run_command` its own intent, not a write intent.
+12. Make `workspace_overview` inspect-related only when workspace evidence is needed.
 
-TASK-07 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+### Acceptance criteria
 
-Primary files for TASK-07 are apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Windsurf AGENTS.md + rules engine concepts, Cursor AGENTS.md and rules layering, Codex Skills mindset without copying cloud assumptions) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+- Simple tasks have simple plans.
+- `inspect_project` has a short plan or deterministic path.
+- `run_command` is not treated as write intent.
+- `architecture_change` is not triggered by ordinary words.
+- Tests fail if project inspection becomes repo-wide audit again.
 
-### TASK-08
+### Validation
 
-TASK-08 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+```bash
+npm run build:packages
+node --import tsx tests/unit/core.test.ts
+```
 
-Primary files for TASK-08 are packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Windsurf RAG/context awareness ideas, Codex repo/environment grounding, Qwen Code disciplined context exposure) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+### Completion status
 
-### TASK-09
+DONE - 2026-05-18.
 
-TASK-09 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+- `TaskComplexity` runtime contract replaced with intent plus size estimate in planner/orchestrator/API/web test surfaces.
+- Planner tracks stop condition, evidence, revision state, and `safe_idle`.
+- Classifier no longer routes ordinary architecture/file names to old heavy templates; `run_command` stays separate from edit intent.
+- Verified by `npm test` and `git diff --check`.
 
-Primary files for TASK-09 are packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Claude Code permissions and hooks model, Windsurf allow/deny/auto/turbo command levels, Codex suggest/auto edit/full auto mental model) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+---
 
-### TASK-10
+## Milestone 05 — Reduce default tools and gate advanced tools
 
-TASK-10 comes where it does because of dependency order. Later tracks benefit from it, and some later tracks are actively misleading if attempted first. For example, UI polish without event-contract improvements becomes cosmetic; retrieval improvements without tighter tool discipline can worsen small-model confusion; more tests without clarified runtime truth can merely snapshot existing ambiguity. The sequencing rule is simple: first make the harness know what it is doing, then make that state visible, then make it durable and test-realistic.
+### Urgency
 
-Primary files for TASK-10 are tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. That list is a bias, not a prison. If a change spills into nearby modules, the agent may touch them, but it should justify why. The listed external references (Codex trust-through-clear-state, Claude Code health/status surface, Qwen Code failure-path realism) are inspiration boundaries: borrow behavior patterns, not branding or foreign architecture.
+Critical.
 
-# Appendix C — Example acceptance test themes
+Too many default tools confuse local models and increase failure rates.
 
-- planning-only native response should trigger intelligent retry and then fallback, not silence
-- malformed tool arguments should repair or fail loudly with visible path state
-- workspace binding failure should yield explicit `snapshot_only` status in run summary and UI
-- stream idle should eventually surface a timeout event and stop pretending work is happening
-- direct mode should remain fast and low-overhead compared with agentic mode
-- activity timeline should reveal the right story even under many tool events
-- change ledger should list files and command activity in a stable readable order
-- mode, workspace root, policy mode, fallback mode, and active model should all be visible and consistent
+### Goal
 
-# Appendix D — Source notes
+Create small default tool sets by mode and intent.
 
-The following source list is included so future agents know which public references informed this AGENTS file.
+### Files to inspect
 
-- **Codex CLI approval modes and local terminal workflow** — OpenAI Help Center — `https://help.openai.com/en/articles/11096431-openai-codex-ci-getting-started`
-- **Codex cloud overview: sandboxed cloud containers, background work, GitHub-connected repos** — OpenAI Platform Docs — `https://platform.openai.com/docs/codex/overview`
-- **Codex app and product surface: multi-agent workflows, worktrees, skills, automations** — OpenAI — `https://openai.com/codex/`
-- **Codex app product announcement** — OpenAI — `https://openai.com/index/introducing-the-codex-app/`
-- **Claude Code overview** — Anthropic — `https://docs.anthropic.com/en/docs/claude-code/overview`
-- **Claude Code permissions** — Anthropic — `https://code.claude.com/docs/en/permissions`
-- **Claude Code hooks** — Anthropic — `https://docs.claude.com/en/docs/claude-code/hooks`
-- **Claude Code slash commands** — Anthropic — `https://docs.claude.com/en/docs/claude-code/slash-commands`
-- **Claude Code subagents** — Anthropic — `https://code.claude.com/docs/en/sub-agents`
-- **Cursor tools** — Cursor — `https://docs.cursor.com/agent/tools`
-- **Cursor modes** — Cursor — `https://docs.cursor.com/en/chat/agent`
-- **Cursor rules and AGENTS.md** — Cursor — `https://docs.cursor.com/en/context`
-- **Windsurf overview** — Windsurf — `https://docs.windsurf.com/windsurf`
-- **Windsurf terminal auto-execution levels and allow/deny lists** — Windsurf — `https://docs.windsurf.com/windsurf/terminal`
-- **Windsurf memories, rules, workflows, skills, AGENTS.md positioning** — Windsurf — `https://docs.windsurf.com/windsurf/cascade/memories`
-- **Windsurf AGENTS.md automatic directory scoping** — Windsurf — `https://docs.windsurf.com/windsurf/cascade/agents-md`
-- **Windsurf context awareness / RAG-based indexing** — Windsurf — `https://docs.windsurf.com/context-awareness/overview`
-- **Osaurus docs overview** — Osaurus — `https://docs.osaurus.ai/`
-- **Osaurus GitHub repo** — GitHub — `https://github.com/osaurus-ai/osaurus`
-- **Qwen Code GitHub repo** — GitHub — `https://github.com/QwenLM/qwen-code`
+- `packages/core/src/engine.ts`
+- `packages/tool-runtime/src/registry.ts`
+- `packages/tool-runtime/src/types.ts`
+- `packages/task-orchestrator/src/index.ts`
+- `tests/integration/workflow.test.ts`
 
-# Appendix E — Implementation playbooks by task track
+### Default Chat Mode tools
 
-### TASK-01 playbook
+None.
 
-#### Operator story
+Optional explicit file-read only if user chooses file context.
 
-For TASK-01, the **operator story** must be rewritten so that the mapped issues (P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-01 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Default Agent Work tools
 
-#### Runtime story
+Use only:
 
-For TASK-01, the **runtime story** must be rewritten so that the mapped issues (P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-01 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+```txt
+listDir
+readFile
+searchText
+writeFile
+patchFile
+runCommand
+gitStatus
+gitDiff
+```
 
-#### Planner story
+### Inspect Project tools
 
-For TASK-01, the **planner story** must be rewritten so that the mapped issues (P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-01 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Use only:
 
-#### Trace story
+```txt
+listDir
+readFile
+searchText
+```
 
-For TASK-01, the **trace story** must be rewritten so that the mapped issues (P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-01 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Advanced tools
 
-#### API story
+Gate behind Advanced Agent Mode:
 
-For TASK-01, the **api story** must be rewritten so that the mapped issues (P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-01 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+```txt
+glob
+webSearch
+fetchUrl
+findSymbol
+findFunction
+findComponent
+whatDoesThisImport
+whoImports
+affectedFiles
+selectTestsForChangedFiles
+detectProjectCommands
+buildContextPack
+replaceFunction
+insertImport
+addTypeProperty
+renameIdentifier
+replaceRange
+insertAfter
+insertBefore
+replaceBlock
+applyUnifiedPatch
+previewPatch
+getStructuredDiff
+createCheckpoint
+rollbackToCheckpoint
+```
 
-#### UI story
+### Tool naming rule
 
-For TASK-01, the **ui story** must be rewritten so that the mapped issues (P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-01 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Pick one canonical external name style and normalize all traces/UI/tests to it.
 
-#### Test story
+Recommended external/public names:
 
-For TASK-01, the **test story** must be rewritten so that the mapped issues (P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-01 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+```txt
+listDir
+readFile
+searchText
+writeFile
+patchFile
+runCommand
+gitStatus
+gitDiff
+```
 
-### TASK-02 playbook
+Runtime may internally map to snake_case, but API/UI/test contracts must be consistent.
 
-#### Operator story
+### Tasks
 
-For TASK-02, the **operator story** must be rewritten so that the mapped issues (P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-02 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+1. Introduce tool profiles: `chat`, `inspect`, `edit-basic`, `verify`, `advanced`.
+2. Make tool exposure depend on mode and intent.
+3. Remove web tools from default local coding path.
+4. Remove AST/import tools from default path.
+5. Keep write tools approval-gated.
+6. Make advanced mode explicit in UI/API/CLI.
+7. Normalize tool naming.
+8. Add tests for tool selection.
+9. Add tests that Chat Mode exposes no tools.
+10. Add tests that `inspect_project` exposes only read tools.
+11. Add tests that advanced tools are absent until Advanced Agent Mode.
+12. Add tests for canonical tool naming in traces and UI events.
 
-#### Runtime story
+### Acceptance criteria
 
-For TASK-02, the **runtime story** must be rewritten so that the mapped issues (P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-02 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- Small local model sees fewer tools.
+- Chat Mode has no tool list.
+- Inspect mode cannot edit.
+- Advanced tools never appear unless Advanced Agent Mode is selected.
+- Web tools never appear unless user asks for web or enables web intent.
 
-#### Planner story
+### Validation
 
-For TASK-02, the **planner story** must be rewritten so that the mapped issues (P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-02 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+```bash
+npm run build:packages
+node --import tsx tests/unit/core.test.ts
+node --import tsx tests/integration/workflow.test.ts
+```
 
-#### Trace story
+### Completion status
 
-For TASK-02, the **trace story** must be rewritten so that the mapped issues (P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-02 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+DONE - 2026-05-18.
 
-#### API story
+- Tool profiles now gate Chat, inspect, basic edit/verify, and advanced tools.
+- Chat Mode exposes no tools; inspect stays read-only; web/search and AST/checkpoint/diff advanced tools require explicit advanced Agent Work.
+- API rejects invalid `advancedTools` payloads.
+- Verified by unit/integration/API e2e coverage plus `npm test` and `git diff --check`.
 
-For TASK-02, the **api story** must be rewritten so that the mapped issues (P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-02 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+---
 
-#### UI story
+## Milestone 06 — Rebuild web UI around clarity
 
-For TASK-02, the **ui story** must be rewritten so that the mapped issues (P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-02 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Urgency
 
-#### Test story
+Critical.
 
-For TASK-02, the **test story** must be rewritten so that the mapped issues (P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-02 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+The current UI is too cluttered and makes the user feel lost.
 
-### TASK-03 playbook
+### Goal
 
-#### Operator story
+Create a simple two-mode web interface.
 
-For TASK-03, the **operator story** must be rewritten so that the mapped issues (P-006, P-007, P-008, P-020, P-025, P-030) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-03 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Files to inspect
 
-#### Runtime story
+- `apps/web/src/app/HarnessApp.tsx`
+- `apps/web/src/index.css`
+- `apps/web/src/components/ChatMessageRow.tsx`
+- `apps/web/src/components/AgentRunSummary.tsx`
+- `apps/web/src/components/run-console/RunConsole.tsx`
+- `apps/web/src/components/run-console/CurrentTaskCard.tsx`
+- `apps/web/src/components/run-console/ToolCallList.tsx`
+- `apps/web/src/components/run-console/TaskPlanView.tsx`
 
-For TASK-03, the **runtime story** must be rewritten so that the mapped issues (P-006, P-007, P-008, P-020, P-025, P-030) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-03 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Required layout
 
-#### Planner story
+Main screen:
 
-For TASK-03, the **planner story** must be rewritten so that the mapped issues (P-006, P-007, P-008, P-020, P-025, P-030) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-03 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- top mode switch:
+  - Chat
+  - Agent Work
+- small status:
+  - active model
+  - workspace root
+  - workspace source
+  - permission mode
+  - internet access state
+- center:
+  - conversation/results
+- Agent Work side panel:
+  - Goal
+  - Now
+  - Files inspected
+  - Files changed
+  - Checks
+  - Blocked reason
+  - Final result
 
-#### Trace story
+### Hide by default
 
-For TASK-03, the **trace story** must be rewritten so that the mapped issues (P-006, P-007, P-008, P-020, P-025, P-030) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-03 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- context budget
+- structured diff
+- raw diff
+- checkpoint IDs
+- full traces
+- tool payloads
+- why-file-selected cards
+- provider thinking
+- advanced model details
+- skill audit internals
 
-#### API story
+### Advanced Details
 
-For TASK-03, the **api story** must be rewritten so that the mapped issues (P-006, P-007, P-008, P-020, P-025, P-030) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-03 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Advanced Details may show:
 
-#### UI story
+- raw traces
+- structured diff
+- raw diff
+- context budget
+- checkpoint IDs
+- full tool input/output preview
+- runtime capabilities
+- skill audit internals
 
-For TASK-03, the **ui story** must be rewritten so that the mapped issues (P-006, P-007, P-008, P-020, P-025, P-030) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-03 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Tasks
 
-#### Test story
+1. Rename UI language from `direct/agentic` to `Chat/Agent Work`.
+2. Hide Run Console in Chat Mode.
+3. Replace Run Console default with a minimal Agent Activity panel.
+4. Move raw diff and structured diff behind Advanced Details.
+5. Move checkpoint IDs behind Advanced Details.
+6. Remove hardcoded file-specific explanation helpers.
+7. Remove “Deep Agent” / “autonomous” wording.
+8. Make empty states clear.
+9. Ensure blocked/failed/safe-idle state is visible.
+10. Add UI build validation.
+11. Rename localStorage keys away from agentic-centric names.
+12. Ensure browser snapshot mode is visibly read-only until backend binding is confirmed.
 
-For TASK-03, the **test story** must be rewritten so that the mapped issues (P-006, P-007, P-008, P-020, P-025, P-030) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-03 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Acceptance criteria
 
-### TASK-04 playbook
+- A new user can understand the UI in 10 seconds.
+- Chat Mode looks like chat.
+- Agent Work shows useful progress but not internal clutter.
+- Advanced details are optional.
+- No old model-router UI remains.
+- Workspace source is visible.
 
-#### Operator story
+### Validation
 
-For TASK-04, the **operator story** must be rewritten so that the mapped issues (P-019, P-020, P-021, P-022, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-04 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+```bash
+npm run build --workspace web
+npm run build:apps
+```
 
-#### Runtime story
+### Completion status
 
-For TASK-04, the **runtime story** must be rewritten so that the mapped issues (P-019, P-020, P-021, P-022, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-04 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+DONE - 2026-05-18.
 
-#### Planner story
+- Web UI keeps Chat and Agent Work as public mode language.
+- Top status shows model, workspace, permission mode, and internet state.
+- Agent Activity shows goal, now, files inspected, files changed, checks, blocked state, result, and workspace binding.
+- Raw diff, structured diff, checkpoint IDs, context budget, plan files, tool output, and verification output are collapsed under Advanced Details.
+- Default prompts no longer push deep/autonomous workflows.
+- Verified by `npm run build --workspace web`, `npm run build:apps`, `npm test`, and `git diff --check`.
 
-For TASK-04, the **planner story** must be rewritten so that the mapped issues (P-019, P-020, P-021, P-022, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-04 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+---
 
-#### Trace story
+## Milestone 07 — Rebuild CLI around clear mode selection
 
-For TASK-04, the **trace story** must be rewritten so that the mapped issues (P-019, P-020, P-021, P-022, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-04 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Urgency
 
-#### API story
+High.
 
-For TASK-04, the **api story** must be rewritten so that the mapped issues (P-019, P-020, P-021, P-022, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-04 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+CLI must be the simplest reliable operator interface.
 
-#### UI story
+### Goal
 
-For TASK-04, the **ui story** must be rewritten so that the mapped issues (P-019, P-020, P-021, P-022, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-04 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Make CLI commands explicit and clean.
 
-#### Test story
+### Files to inspect
 
-For TASK-04, the **test story** must be rewritten so that the mapped issues (P-019, P-020, P-021, P-022, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-04 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- `apps/cli/src/cli.ts`
+- `tests/e2e/cli.test.ts`
 
-### TASK-05 playbook
+### Required commands
 
-#### Operator story
+```bash
+harness chat
+harness agent
+harness inspect
+harness status
+harness config
+harness model
+harness workspace
+```
 
-For TASK-05, the **operator story** must be rewritten so that the mapped issues (P-003, P-027, P-031) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-05 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Chat behavior
 
-#### Runtime story
+- No planner.
+- No tools by default.
+- No thinking printed unless `--show-thinking`.
+- No run summary unless needed.
+- Fast direct response.
 
-For TASK-05, the **runtime story** must be rewritten so that the mapped issues (P-003, P-027, P-031) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-05 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Agent behavior
 
-#### Planner story
+Shows:
 
-For TASK-05, the **planner story** must be rewritten so that the mapped issues (P-003, P-027, P-031) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-05 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- goal
+- plan
+- current action
+- tool start/done
+- blocked/failed/safe-idle reason
+- final summary
 
-#### Trace story
+Does not show raw traces unless `--verbose`.
 
-For TASK-05, the **trace story** must be rewritten so that the mapped issues (P-003, P-027, P-031) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-05 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Inspect behavior
 
-#### API story
+```bash
+harness inspect
+```
 
-For TASK-05, the **api story** must be rewritten so that the mapped issues (P-003, P-027, P-031) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-05 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Runs lightweight project inspection.
 
-#### UI story
+### Tasks
 
-For TASK-05, the **ui story** must be rewritten so that the mapped issues (P-003, P-027, P-031) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-05 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+1. Make `harness chat` use Chat Mode.
+2. Make `harness prompt` default to Chat Mode.
+3. Add `--agent` flag for one-shot Agent Work.
+4. Add `harness agent` interactive flow.
+5. Add `harness inspect`.
+6. Hide thinking unless requested.
+7. Simplify help output.
+8. Add command examples.
+9. Update CLI tests.
+10. Ensure denied approvals do not freeze CLI.
+11. Ensure `/status` or `harness status` reports public `chat` / `agent` names, not legacy names.
+12. Ensure session list does not imply turn history is loaded when it is not.
 
-#### Test story
+### Acceptance criteria
 
-For TASK-05, the **test story** must be rewritten so that the mapped issues (P-003, P-027, P-031) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-05 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- CLI startup does not say `Execution: agentic` unless Agent Work is selected.
+- `harness prompt "hello"` does not create a task plan.
+- `harness inspect` produces project structure summary.
+- CLI help is readable.
+- Thinking output is hidden by default.
 
-### TASK-06 playbook
+### Validation
 
-#### Operator story
+```bash
+npm run build --workspace @local-harness/cli
+node --import tsx tests/e2e/cli.test.ts
+```
 
-For TASK-06, the **operator story** must be rewritten so that the mapped issues (P-016, P-017, P-025, P-027, P-032) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-06 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Completion status
 
-#### Runtime story
+DONE - 2026-05-18.
 
-For TASK-06, the **runtime story** must be rewritten so that the mapped issues (P-016, P-017, P-025, P-027, P-032) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-06 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- CLI help now states Chat Mode default and Agent Work only via `harness agent` or `harness prompt --agent`.
+- `harness prompt` defaults to Chat; `--agent` and `--advanced-tools` are explicit.
+- Interactive CLI startup uses public `Chat` / `Agent Work` labels and condensed help groups.
+- `harness inspect` remains lightweight project inspection.
+- Verified by `npm run build --workspace @local-harness/cli`, `node --import tsx tests/e2e/cli.test.ts`, `npm test`, and `git diff --check`.
 
-#### Planner story
+---
 
-For TASK-06, the **planner story** must be rewritten so that the mapped issues (P-016, P-017, P-025, P-027, P-032) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-06 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+## Milestone 08 — Compact session memory and run summaries
 
-#### Trace story
+### Urgency
 
-For TASK-06, the **trace story** must be rewritten so that the mapped issues (P-016, P-017, P-025, P-027, P-032) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-06 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+High.
 
-#### API story
+The harness should remember orientation, not huge histories.
 
-For TASK-06, the **api story** must be rewritten so that the mapped issues (P-016, P-017, P-025, P-027, P-032) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-06 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Goal
 
-#### UI story
+Make session memory small and useful.
 
-For TASK-06, the **ui story** must be rewritten so that the mapped issues (P-016, P-017, P-025, P-027, P-032) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-06 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Files to inspect
 
-#### Test story
+- `packages/session-store/src/types.ts`
+- `packages/session-store/src/store.ts`
+- `packages/core/src/agent-run.ts`
+- `packages/core/src/engine.ts`
 
-For TASK-06, the **test story** must be rewritten so that the mapped issues (P-016, P-017, P-025, P-027, P-032) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-06 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Compact turn summary
 
-### TASK-07 playbook
+Store this in session turn history:
 
-#### Operator story
+```ts
+interface CompactRunSummary {
+  runId: string;
+  mode: 'chat' | 'agent';
+  intent: string;
+  goal?: string;
+  outcome: 'done' | 'blocked' | 'safe_idle' | 'failed';
+  filesRead: string[];
+  filesChanged: string[];
+  commandsRun: string[];
+  approvals: number;
+  summary: string;
+  error?: string;
+  startedAt: number;
+  endedAt?: number;
+}
+```
 
-For TASK-07, the **operator story** must be rewritten so that the mapped issues (P-012, P-013, P-015, P-028, P-029) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-07 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Do not store full:
 
-#### Runtime story
+- structured diffs
+- raw diffs
+- full trace arrays
+- full tool outputs
+- full web fetch text
+- huge model responses
+- raw secrets
+- full image payloads
 
-For TASK-07, the **runtime story** must be rewritten so that the mapped issues (P-012, P-013, P-015, P-028, P-029) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-07 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Tasks
 
-#### Planner story
+1. Add compact run summary type.
+2. Keep full run files separate and bounded.
+3. Store only compact summary in session turn metadata.
+4. Add max turn history count or truncation.
+5. Add max summary lengths.
+6. Add max files remembered.
+7. Deduplicate diff/file-change metadata.
+8. Add tests for memory size.
+9. Add tests for loading old sessions.
+10. Ensure session list stays fast.
+11. Add migration adapter for old `runSummary?: AgentRun`.
+12. Add redaction before any run/session text is persisted.
 
-For TASK-07, the **planner story** must be rewritten so that the mapped issues (P-012, P-013, P-015, P-028, P-029) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-07 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Acceptance criteria
 
-#### Trace story
+- Session JSONL remains small.
+- Session listing does not load full turns.
+- Resuming a session gives useful orientation.
+- Large diffs do not enter prompt memory.
+- Old sessions load safely without preserving old heavy behavior.
 
-For TASK-07, the **trace story** must be rewritten so that the mapped issues (P-012, P-013, P-015, P-028, P-029) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-07 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Validation
 
-#### API story
+```bash
+npm run build:packages
+node --import tsx tests/integration/workflow.test.ts
+```
 
-For TASK-07, the **api story** must be rewritten so that the mapped issues (P-012, P-013, P-015, P-028, P-029) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-07 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Completion status
 
-#### UI story
+DONE - 2026-05-18.
 
-For TASK-07, the **ui story** must be rewritten so that the mapped issues (P-012, P-013, P-015, P-028, P-029) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-07 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- Session turn metadata now stores compact `CompactRunSummary` objects instead of full `AgentRun` payloads.
+- Session JSON keeps turn history out of the main file; JSONL turns are sanitized, bounded, and redacted.
+- Old heavy `runSummary?: AgentRun` records are migrated on load without preserving raw diffs, full answers, traces, or secret-like text.
+- Structured diff file metadata is deduplicated before run summaries are produced.
+- Verified by `npm run build`, `node --import tsx tests/integration/workflow.test.ts`, `npm test`, and `git diff --check`.
 
-#### Test story
+---
 
-For TASK-07, the **test story** must be rewritten so that the mapped issues (P-012, P-013, P-015, P-028, P-029) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-07 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+## Milestone 09 — Fix local model runtime budgets and stall handling
 
-### TASK-08 playbook
+### Urgency
 
-#### Operator story
+High.
 
-For TASK-08, the **operator story** must be rewritten so that the mapped issues (P-002, P-014, P-015, P-028, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-08 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+The harness must behave well on a 16 GB machine.
 
-#### Runtime story
+### Goal
 
-For TASK-08, the **runtime story** must be rewritten so that the mapped issues (P-002, P-014, P-015, P-028, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-08 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Make model runtime behavior conservative and visible.
 
-#### Planner story
+### Files to inspect
 
-For TASK-08, the **planner story** must be rewritten so that the mapped issues (P-002, P-014, P-015, P-028, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-08 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- `packages/model-adapter/src/client.ts`
+- `packages/model-adapter/src/config.ts`
+- `packages/model-adapter/src/types.ts`
+- `packages/core/src/engine.ts`
+- `apps/api/src/server.ts`
+- `apps/web/src/app/HarnessApp.tsx`
 
-#### Trace story
+### Required runtime policy
 
-For TASK-08, the **trace story** must be rewritten so that the mapped issues (P-002, P-014, P-015, P-028, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-08 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Default profile:
 
-#### API story
+```txt
+Local Balanced
+```
 
-For TASK-08, the **api story** must be rewritten so that the mapped issues (P-002, P-014, P-015, P-028, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-08 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Recommended settings:
 
-#### UI story
+```txt
+contextBudget: 12000-16000
+max output: conservative
+toolRetryMax: 1 or 2
+stream idle timeout: visible
+sessionMemoryTurns: 2 or 3
+```
 
-For TASK-08, the **ui story** must be rewritten so that the mapped issues (P-002, P-014, P-015, P-028, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-08 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Tasks
 
-#### Test story
+1. Review token budget logic for Gemma, Qwen, and DeepSeek.
+2. Remove misleading comments about raising token ceilings if code caps them.
+3. Avoid forcing huge `num_predict` values.
+4. Add clear runtime status.
+5. Add stall timeout state.
+6. Add visible “model is loading” status.
+7. Add visible “stream stalled” failure.
+8. Do not retry forever.
+9. Add tests for timeout behavior if possible.
+10. Add live manual smoke test instructions.
+11. Ensure no UI preset defaults to internet on unless explicitly desired.
+12. Ensure model lifecycle actions do not unload/reload multiple models unless explicitly requested.
 
-For TASK-08, the **test story** must be rewritten so that the mapped issues (P-002, P-014, P-015, P-028, P-032, P-035) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-08 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Acceptance criteria
 
-### TASK-09 playbook
+- Default settings are safe for 16 GB RAM.
+- A stalled model fails visibly.
+- User can see configured model and active model.
+- Runtime status does not imply multiple active agents/models.
+- Presets do not push user toward deep/autonomous defaults.
 
-#### Operator story
+### Validation
 
-For TASK-09, the **operator story** must be rewritten so that the mapped issues (P-001, P-018, P-022, P-026, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-09 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+```bash
+npm run build:packages
+node --import tsx tests/unit/core.test.ts
+```
 
-#### Runtime story
+Manual smoke:
 
-For TASK-09, the **runtime story** must be rewritten so that the mapped issues (P-001, P-018, P-022, P-026, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-09 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+```bash
+ollama ps
+harness chat
+harness inspect
+harness agent
+```
 
-#### Planner story
+### Completion status
 
-For TASK-09, the **planner story** must be rewritten so that the mapped issues (P-001, P-018, P-022, P-026, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-09 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+DONE - 2026-05-18.
 
-#### Trace story
+- Default runtime profile is Local Balanced with `contextBudget: 16000`, `toolRetryMax: 2`, and `sessionMemoryTurns: 3`.
+- Gemma, Qwen, and DeepSeek local output budgets are capped conservatively instead of forcing huge `num_predict` values.
+- Runtime status now reports configured/active model state and visible loading/stall states.
+- Model activation preloads the requested model without unloading other running models.
+- UI presets keep internet access off by default and avoid deep/autonomous defaults.
+- Smoke checked `ollama ps`, `node apps/cli/dist/cli.js status --json`, `node apps/cli/dist/cli.js inspect --json`, `/api/config`, and `/api/model/runtime`.
+- Verified by `npm run build`, `node --import tsx tests/unit/core.test.ts`, `npm test`, and `git diff --check`.
 
-For TASK-09, the **trace story** must be rewritten so that the mapped issues (P-001, P-018, P-022, P-026, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-09 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+---
 
-#### API story
+## Milestone 10 — Add regression tests that protect the lightweight harness
 
-For TASK-09, the **api story** must be rewritten so that the mapped issues (P-001, P-018, P-022, P-026, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-09 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Urgency
 
-#### UI story
+Critical.
 
-For TASK-09, the **ui story** must be rewritten so that the mapped issues (P-001, P-018, P-022, P-026, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-09 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Tests must prevent the same failure from returning.
 
-#### Test story
+### Goal
 
-For TASK-09, the **test story** must be rewritten so that the mapped issues (P-001, P-018, P-022, P-026, P-036) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-09 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+Make the test suite enforce the new product behavior.
 
-### TASK-10 playbook
+### Files to inspect
 
-#### Operator story
+- `tests/unit/core.test.ts`
+- `tests/integration/workflow.test.ts`
+- `tests/e2e/api.test.ts`
+- `tests/e2e/cli.test.ts`
+- `tests/mocks/model-responses.ts`
 
-For TASK-10, the **operator story** must be rewritten so that the mapped issues (P-023, P-024, P-030, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-10 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Required tests
 
-#### Runtime story
+1. Chat Mode does not create task plans.
+2. API defaults to Chat Mode.
+3. CLI prompt defaults to Chat Mode.
+4. Agent Work requires explicit mode.
+5. `inspect_project` does not become `repo_wide_audit`.
+6. Generic fixture project inspection works.
+7. No temporary experiment folder names exist in tests.
+8. Chat Mode exposes no tools.
+9. Inspect Project exposes only read tools.
+10. Advanced tools require Advanced Agent Mode.
+11. Web config exposes one model field.
+12. No `fastModel/codingModel/reviewModel/apiModel` fields exist.
+13. Planner does not include stale `executionProfile/promptProfile`.
+14. Session memory stores compact summaries only.
+15. Denied approval ends cleanly.
+16. Safe command denial is visible.
+17. UI build passes.
+18. CLI help contains Chat and Agent Work clearly.
+19. Project inspection avoids checkpoints.
+20. Full audit only runs when user asks for full audit.
+21. Browser snapshot cannot write unless resolved to backend workspace.
+22. Web tools are absent from default tool profiles.
+23. Generated and vendored directories are ignored during broad file walking.
+24. Mode parser maps legacy `agentic` safely without making Agent Work the default.
+25. Raw diff and structured diff are hidden by default in UI state/render tests where possible.
+26. Stream and non-stream `/api/chat` endpoints use the same mode parser.
+27. Legacy `direct` / `agentic` are not public API/UX mode names after migration.
+28. Actual web app path is verified in repo-indexer candidates.
+29. Secret-like files are excluded from broad read/search/context paths.
+30. Session persistence redacts likely secrets and does not persist full image payloads.
+31. `harness inspect` works without model success if deterministic inspection is enough.
+32. A denied approval transitions the run to `blocked` or `safe_idle`.
+33. A stalled stream emits a visible stalled/failed state.
+34. Tool trace names are normalized to one public naming convention.
+35. No default preset uses “Deep Agent” or “autonomous” language.
 
-For TASK-10, the **runtime story** must be rewritten so that the mapped issues (P-023, P-024, P-030, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-10 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Test fixture names
 
-#### Planner story
+Use generic fixture names only:
 
-For TASK-10, the **planner story** must be rewritten so that the mapped issues (P-023, P-024, P-030, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-10 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+```txt
+fixtures/sample-express-app
+fixtures/sample-vite-app
+fixtures/sample-node-cli
+```
 
-#### Trace story
+Do not use user experiment names.
 
-For TASK-10, the **trace story** must be rewritten so that the mapped issues (P-023, P-024, P-030, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-10 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Acceptance criteria
 
-#### API story
+- Tests fail if Agent Mode becomes default.
+- Tests fail if project inspection routes to repo-wide audit.
+- Tests fail if model role routing returns.
+- Tests fail if temporary experiment names return.
+- Tests fail if stale web app paths return.
+- Full `npm test` passes.
 
-For TASK-10, the **api story** must be rewritten so that the mapped issues (P-023, P-024, P-030, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-10 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Validation
 
-#### UI story
+```bash
+npm run build
+npm test
+```
 
-For TASK-10, the **ui story** must be rewritten so that the mapped issues (P-023, P-024, P-030, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-10 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+### Completion status
 
-#### Test story
+DONE - 2026-05-18.
 
-For TASK-10, the **test story** must be rewritten so that the mapped issues (P-023, P-024, P-030, P-033, P-034) become legible and improvable. The agent should explicitly describe the current failure mode, the desired future behavior, the state transitions involved, and the evidence the user will see when the change is done. This requirement exists because Local-AI-Harness has repeatedly suffered from partial solutions that improved one layer while leaving another layer ambiguous. Every change in TASK-10 should therefore be narratable through this seven-lens method: what the operator thinks is happening, what runtime actually does, what planner remembers, what traces emit, what API streams, what UI renders, and what tests verify.
+- Added/updated regression coverage for compact session memory, old-session migration, redaction, bounded run summaries, local output caps, no-unload model lifecycle, stream stall fallback, and safe runtime defaults.
+- Updated API, CLI, integration, and unit tests to enforce the lightweight harness contract.
+- Full validation passed: `npm test`.
+- Whitespace validation passed: `git diff --check`.
 
-# Appendix F — Work-package backlog for the ten task tracks
+---
 
-### Backlog for TASK-01 — Converge system truth around workspace, mode, and operator expectations
+# 9. Implementation order
 
-#### WP-01
+Follow this order unless the user explicitly changes it:
 
-Within TASK-01, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036 and the primary files packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
+1. Milestone 01 — Replace instructions.
+2. Milestone 02 — Separate Chat and Agent Work.
+3. Milestone 03 — Restore lightweight project inspection.
+4. Milestone 04 — Simplify planner/orchestrator.
+5. Milestone 05 — Reduce tool exposure.
+6. Milestone 10 — Add regression tests for the above early.
+7. Milestone 06 — Simplify web UI.
+8. Milestone 07 — Simplify CLI.
+9. Milestone 08 — Compact session memory.
+10. Milestone 09 — Runtime budgets and stall handling.
+11. Final full validation.
 
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
+Milestone 10 is listed last as a plan milestone, but its tests should be added throughout the work. Do not wait until the end to add all tests.
 
-#### WP-02
+---
 
-Within TASK-01, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036 and the primary files packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
+# 10. Forbidden regressions
 
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
+Do not reintroduce:
 
-#### WP-03
+- Agent Mode as default
+- `fastModel`
+- `codingModel`
+- `reviewModel`
+- `apiModel`
+- automatic per-purpose model routing
+- `executionProfile`
+- `providerProfile`
+- `promptProfile`
+- hidden Agent Work inside Chat Mode
+- hidden Chat Mode inside Agent Work
+- project inspection as `repo_wide_audit`
+- temporary experiment names in tests
+- advanced AST/import tools in default tool list
+- web tools in default local coding path
+- raw diff open by default
+- structured diff open by default
+- thinking blocks printed by default
+- full run summaries stored in session turn history
+- giant trace dumps in default UI
+- “Deep Agent” / “autonomous” default product language
+- false “done” labels before validation
+- browser snapshot writes without backend binding
+- silent approval hangs
+- silent model stall hangs
+- full-audit behavior from ordinary project inspection
+- stale path assumptions in repo-indexer or tests
+- raw secret persistence in sessions, traces, or UI
+- tool names drifting between API/UI/runtime/tests
+- web access enabled by default for local coding
+- skills silently expanding mode/tool capabilities
 
-Within TASK-01, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036 and the primary files packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
+---
 
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
+# 11. Definition of done
 
-#### WP-04
+The recovery is complete only when all of the following are true:
 
-Within TASK-01, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036 and the primary files packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
+- Chat Mode is default in API, CLI, and web.
+- Agent Work is explicit.
+- One active model is used by default.
+- `gemma4:e4b` remains the safe default.
+- Project inspection has a lightweight deterministic path.
+- Simple project inspection does not trigger repo-wide audit.
+- Default tool list is small.
+- Advanced tools are gated.
+- Web tools are not default.
+- Web UI is clean and understandable.
+- CLI is clean and understandable.
+- Session memory is compact.
+- Runtime stalls are visible.
+- Denied approvals end cleanly.
+- Browser snapshot vs backend workspace is clear.
+- Workspace rebind never happens silently when ambiguous.
+- Secrets are excluded/redacted by default.
+- Tool naming is consistent across API/UI/runtime/tests.
+- Tests protect all of the above.
+- `npm test` passes.
 
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
+---
 
-#### WP-05
+# 12. Final operator standard
 
-Within TASK-01, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036 and the primary files packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
+The harness should feel like this:
 
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
+- Chat is fast and clean.
+- Agent Work is deliberate and visible.
+- Inspect Project is fast and useful.
+- The model is not overwhelmed with tools.
+- The UI does not look like a debug cockpit.
+- The CLI does not surprise the user.
+- Memory helps orientation but does not bloat.
+- Failures are honest and visible.
+- Workspace truth is obvious.
+- The system does not pretend to be more autonomous than it is.
 
-#### WP-06
-
-Within TASK-01, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036 and the primary files packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-01, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036 and the primary files packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-01, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-001, P-003, P-009, P-010, P-011, P-026, P-029, P-036 and the primary files packages/core/src/engine.ts, packages/workspace-policy/src/policy.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-02 — Rebuild the small-model agent loop so Gemma/Qwen act instead of hesitating
-
-#### WP-01
-
-Within TASK-02, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-02, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-02, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-02, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-02, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-02, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-02, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-02, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-004, P-005, P-006, P-007, P-008, P-014, P-015, P-030, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/model-adapter/src/client.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-03 — Make manual fallback a first-class, inspectable operating path
-
-#### WP-01
-
-Within TASK-03, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-006, P-007, P-008, P-020, P-025, P-030 and the primary files packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-03, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-006, P-007, P-008, P-020, P-025, P-030 and the primary files packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-03, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-006, P-007, P-008, P-020, P-025, P-030 and the primary files packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-03, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-006, P-007, P-008, P-020, P-025, P-030 and the primary files packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-03, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-006, P-007, P-008, P-020, P-025, P-030 and the primary files packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-03, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-006, P-007, P-008, P-020, P-025, P-030 and the primary files packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-03, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-006, P-007, P-008, P-020, P-025, P-030 and the primary files packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-03, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-006, P-007, P-008, P-020, P-025, P-030 and the primary files packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/api/src/server.ts, apps/web/src/components/ChatMessageRow.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-04 — Redesign operational visibility so the UI tells the right story
-
-#### WP-01
-
-Within TASK-04, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-019, P-020, P-021, P-022, P-033, P-034 and the primary files apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-04, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-019, P-020, P-021, P-022, P-033, P-034 and the primary files apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-04, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-019, P-020, P-021, P-022, P-033, P-034 and the primary files apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-04, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-019, P-020, P-021, P-022, P-033, P-034 and the primary files apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-04, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-019, P-020, P-021, P-022, P-033, P-034 and the primary files apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-04, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-019, P-020, P-021, P-022, P-033, P-034 and the primary files apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-04, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-019, P-020, P-021, P-022, P-033, P-034 and the primary files apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-04, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-019, P-020, P-021, P-022, P-033, P-034 and the primary files apps/web/src/HarnessApp.tsx, apps/web/src/components/ChatMessageRow.tsx, apps/web/src/components/AgentRunSummary.tsx, apps/web/src/components/AgentRunSteps.tsx, packages/trace-bus/src/*. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-05 — Strengthen direct chat as a lean everyday mode with minimal agent overhead
-
-#### WP-01
-
-Within TASK-05, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-003, P-027, P-031 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-05, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-003, P-027, P-031 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-05, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-003, P-027, P-031 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-05, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-003, P-027, P-031 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-05, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-003, P-027, P-031 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-05, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-003, P-027, P-031 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-05, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-003, P-027, P-031 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-05, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-003, P-027, P-031 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/model-adapter/src/client.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-06 — Improve runtime/model control, loading policy, and stall handling
-
-#### WP-01
-
-Within TASK-06, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-016, P-017, P-025, P-027, P-032 and the primary files packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-06, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-016, P-017, P-025, P-027, P-032 and the primary files packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-06, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-016, P-017, P-025, P-027, P-032 and the primary files packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-06, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-016, P-017, P-025, P-027, P-032 and the primary files packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-06, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-016, P-017, P-025, P-027, P-032 and the primary files packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-06, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-016, P-017, P-025, P-027, P-032 and the primary files packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-06, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-016, P-017, P-025, P-027, P-032 and the primary files packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-06, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-016, P-017, P-025, P-027, P-032 and the primary files packages/model-adapter/src/client.ts, packages/core/src/engine.ts, apps/api/src/server.ts, apps/web/src/HarnessApp.tsx. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-07 — Fix skill, instruction, and durable-context hygiene
-
-#### WP-01
-
-Within TASK-07, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-012, P-013, P-015, P-028, P-029 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-07, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-012, P-013, P-015, P-028, P-029 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-07, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-012, P-013, P-015, P-028, P-029 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-07, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-012, P-013, P-015, P-028, P-029 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-07, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-012, P-013, P-015, P-028, P-029 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-07, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-012, P-013, P-015, P-028, P-029 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-07, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-012, P-013, P-015, P-028, P-029 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-07, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-012, P-013, P-015, P-028, P-029 and the primary files apps/api/src/server.ts, packages/core/src/engine.ts, packages/planner/src/planner.ts, packages/session-store/src/store.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-08 — Add internet, retrieval, and repo-understanding improvements without bloating small-model prompts
-
-#### WP-01
-
-Within TASK-08, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-002, P-014, P-015, P-028, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-08, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-002, P-014, P-015, P-028, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-08, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-002, P-014, P-015, P-028, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-08, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-002, P-014, P-015, P-028, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-08, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-002, P-014, P-015, P-028, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-08, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-002, P-014, P-015, P-028, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-08, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-002, P-014, P-015, P-028, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-08, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-002, P-014, P-015, P-028, P-032, P-035 and the primary files packages/core/src/engine.ts, packages/tool-runtime/src/registry.ts, packages/model-adapter/src/client.ts, packages/planner/src/planner.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-09 — Bring terminal and command execution under clearer safety and autonomy controls
-
-#### WP-01
-
-Within TASK-09, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-001, P-018, P-022, P-026, P-036 and the primary files packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-09, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-001, P-018, P-022, P-026, P-036 and the primary files packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-09, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-001, P-018, P-022, P-026, P-036 and the primary files packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-09, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-001, P-018, P-022, P-026, P-036 and the primary files packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-09, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-001, P-018, P-022, P-026, P-036 and the primary files packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-09, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-001, P-018, P-022, P-026, P-036 and the primary files packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-09, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-001, P-018, P-022, P-026, P-036 and the primary files packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-09, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-001, P-018, P-022, P-026, P-036 and the primary files packages/tool-runtime/src/registry.ts, packages/workspace-policy/src/policy.ts, apps/web/src/HarnessApp.tsx, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-### Backlog for TASK-10 — Close the realism gap with better traces, event contracts, and adversarial tests
-
-#### WP-01
-
-Within TASK-10, work package 01 is: Define the exact current failure state in code and in user-visible behavior before changing anything. This package should be interpreted against the mapped issues P-023, P-024, P-030, P-033, P-034 and the primary files tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-02
-
-Within TASK-10, work package 02 is: Identify the minimum set of files that currently own the broken contract and list which layer each belongs to. This package should be interpreted against the mapped issues P-023, P-024, P-030, P-033, P-034 and the primary files tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-03
-
-Within TASK-10, work package 03 is: Specify the new planner fields or run-summary fields needed so the behavior becomes visible and persistent. This package should be interpreted against the mapped issues P-023, P-024, P-030, P-033, P-034 and the primary files tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-04
-
-Within TASK-10, work package 04 is: Specify the new or changed trace events needed so the UI and tests can consume the behavior without inferring it from prose. This package should be interpreted against the mapped issues P-023, P-024, P-030, P-033, P-034 and the primary files tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-05
-
-Within TASK-10, work package 05 is: Implement the runtime change in the existing path rather than inventing a parallel mechanism. This package should be interpreted against the mapped issues P-023, P-024, P-030, P-033, P-034 and the primary files tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-06
-
-Within TASK-10, work package 06 is: Write one adversarial test and one realistic flow test for the new behavior. This package should be interpreted against the mapped issues P-023, P-024, P-030, P-033, P-034 and the primary files tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-07
-
-Within TASK-10, work package 07 is: Document the before/after behavior in operator language, not only in implementation language. This package should be interpreted against the mapped issues P-023, P-024, P-030, P-033, P-034 and the primary files tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-#### WP-08
-
-Within TASK-10, work package 08 is: Review whether the change improves or worsens small-model prompt pressure and token load. This package should be interpreted against the mapped issues P-023, P-024, P-030, P-033, P-034 and the primary files tests/unit/core.test.ts, tests/e2e/api.test.ts, packages/trace-bus/src/*, packages/core/src/engine.ts, apps/api/src/server.ts. The agent should not treat this as a checklist item to be ticked mechanically. It should produce a concrete artifact: a note, a diff, a planner field, an event schema, a UI element, or a test. The point of this repeated structure is to force completeness. Local-AI-Harness has enough architecture already; what it lacks is disciplined closure across runtime, presentation, and verification.
-
-When completing this package, the agent should answer four questions in writing: 
-(1) what exact ambiguity is being removed, 
-(2) how the new behavior will be visible to the user, 
-(3) how the behavior will survive a messy small-model reply, and 
-(4) what test or trace proves the result. If any of these answers is vague, the package is not finished.
-
-# Appendix G — Detailed porting ledger patterns from external systems
-
-### Codex
-
-#### Approval-mode clarity
-
-When borrowing **Approval-mode clarity** from Codex, the agent should interpret the pattern as follows: Map Local-AI-Harness modes and command/file autonomy into a visible, low-confusion ladder so the operator knows the difference between read-only help, auto-edit with command approval, and more autonomous execution. Do not copy Codex cloud infrastructure; copy the clarity of the contract. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Pair vs delegate distinction
-
-When borrowing **Pair vs delegate distinction** from Codex, the agent should interpret the pattern as follows: Keep direct chat lean and agentic work purposeful. When the user just wants help, avoid heavy agent protocol. When the user wants work done, expose an execution-oriented path with explicit status. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Context compaction for long-horizon work
-
-When borrowing **Context compaction for long-horizon work** from Codex, the agent should interpret the pattern as follows: Favor compact persistent state and targeted retrieval over raw history growth. The point is not to imitate OpenAI internals but to preserve long-horizon coherence under local-model limits. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Skills as organized reusable capability
-
-When borrowing **Skills as organized reusable capability** from Codex, the agent should interpret the pattern as follows: Treat skills as curated reusable capability rather than random prompt snippets; surface missing/disabled/active state clearly. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Worktree and environment mentality
-
-When borrowing **Worktree and environment mentality** from Codex, the agent should interpret the pattern as follows: Even if this harness cannot match Codex cloud worktrees, it should adopt the mindset that execution context must be explicit, inspectable, and isolated enough to trust. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Automations mental model
-
-When borrowing **Automations mental model** from Codex, the agent should interpret the pattern as follows: Background or scheduled behavior should only be added where runtime truth and user visibility remain strong; never quietly automate ambiguous states. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-### Claude Code
-
-#### Fine-grained permissions
-
-When borrowing **Fine-grained permissions** from Claude Code, the agent should interpret the pattern as follows: Separate read, write, and command autonomy clearly, and allow the user to see permission state and approval provenance. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Pre/post tool hooks mindset
-
-When borrowing **Pre/post tool hooks mindset** from Claude Code, the agent should interpret the pattern as follows: Use explicit pre-tool and post-tool policy points inside the current architecture to normalize tool behavior and status emission. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Slash commands and specialization
-
-When borrowing **Slash commands and specialization** from Claude Code, the agent should interpret the pattern as follows: Treat repeatable workflows as explicit capabilities or documented commands rather than hidden magic. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Subagent discipline
-
-When borrowing **Subagent discipline** from Claude Code, the agent should interpret the pattern as follows: If specialization is added, it must remain inspectable, deny-able, and bounded; do not explode the system into invisible autonomous helpers. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Health/status surfaces
-
-When borrowing **Health/status surfaces** from Claude Code, the agent should interpret the pattern as follows: Expose installation/runtime/model/connectivity state visibly so users can diagnose the system without reading source. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Compaction and memory controls
-
-When borrowing **Compaction and memory controls** from Claude Code, the agent should interpret the pattern as follows: Allow explicit compaction/summarization behaviors for long sessions rather than pretending history is free. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-### Cursor
-
-#### Mode separation
-
-When borrowing **Mode separation** from Cursor, the agent should interpret the pattern as follows: Use a clear everyday-help path and a clear autonomous-work path; let the UI reinforce that distinction. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Configurable tool sets
-
-When borrowing **Configurable tool sets** from Cursor, the agent should interpret the pattern as follows: Reduce confusion by choosing a tight relevant tool set per mode and per turn. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Rules and AGENTS.md
-
-When borrowing **Rules and AGENTS.md** from Cursor, the agent should interpret the pattern as follows: Treat persistent instructions as prompt-level infrastructure rather than as conversation residue. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Manual/Ask/Agent mentality
-
-When borrowing **Manual/Ask/Agent mentality** from Cursor, the agent should interpret the pattern as follows: Not every request should have the same autonomy surface; different request classes justify different tool exposure. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Web and MCP awareness
-
-When borrowing **Web and MCP awareness** from Cursor, the agent should interpret the pattern as follows: External capability should be explicit and policy-governed rather than silently available or silently absent. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Auto-run/auto-fix caution
-
-When borrowing **Auto-run/auto-fix caution** from Cursor, the agent should interpret the pattern as follows: Automation is useful only if failure and rollback remain legible. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-### Windsurf
-
-#### AGENTS.md directory scoping
-
-When borrowing **AGENTS.md directory scoping** from Windsurf, the agent should interpret the pattern as follows: Root instructions should be always-on; subdirectory instructions should be scoped by location. This is especially relevant if Local-AI-Harness later adds nested AGENTS files. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Rules vs memories vs workflows vs skills
-
-When borrowing **Rules vs memories vs workflows vs skills** from Windsurf, the agent should interpret the pattern as follows: Keep durable shared knowledge separate from auto-generated memory and separate again from complex reusable workflows. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Terminal allow/deny/auto/turbo ladder
-
-When borrowing **Terminal allow/deny/auto/turbo ladder** from Windsurf, the agent should interpret the pattern as follows: A clearer command execution posture can help users reason about shell autonomy without guessing. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Activity timeline
-
-When borrowing **Activity timeline** from Windsurf, the agent should interpret the pattern as follows: Show phase, current tool, preview, and summary in a product-grade sequence rather than raw logs. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Context-aware retrieval
-
-When borrowing **Context-aware retrieval** from Windsurf, the agent should interpret the pattern as follows: Use repository context intelligently, but do not over-pin or over-bloat prompts for small models. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Current-state runtime indicators
-
-When borrowing **Current-state runtime indicators** from Windsurf, the agent should interpret the pattern as follows: Configured model, active model, workspace root, current policy, and execution path should be visible without digging. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-### Osaurus
-
-#### Local-first harness framing
-
-When borrowing **Local-first harness framing** from Osaurus, the agent should interpret the pattern as follows: Reinforce that the harness, not a single model, is the compounding layer. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Runtime status and monitor feel
-
-When borrowing **Runtime status and monitor feel** from Osaurus, the agent should interpret the pattern as follows: Bring product-grade runtime visibility and status polish into the existing web UI. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Chat polish
-
-When borrowing **Chat polish** from Osaurus, the agent should interpret the pattern as follows: Stream output smoothly, keep markdown readable, and avoid letting diagnostics swallow the chat experience. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Tool-compatible API posture
-
-When borrowing **Tool-compatible API posture** from Osaurus, the agent should interpret the pattern as follows: Preserve compatible local model and tool interfaces where useful, but do not chase Apple-specific runtime internals. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Memory/skills/watchers mental model
-
-When borrowing **Memory/skills/watchers mental model** from Osaurus, the agent should interpret the pattern as follows: Use organized capability layers as a design reference, not as a mandate to clone every feature. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Product coherence
-
-When borrowing **Product coherence** from Osaurus, the agent should interpret the pattern as follows: Make the harness feel intentional, not accidental. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-### Qwen Code
-
-#### Parser resilience
-
-When borrowing **Parser resilience** from Qwen Code, the agent should interpret the pattern as follows: Adopt stronger repair around malformed tool payloads, code fences, JSON drift, and small-model formatting noise. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Terminal-agent ergonomics
-
-When borrowing **Terminal-agent ergonomics** from Qwen Code, the agent should interpret the pattern as follows: Treat command-line execution as a first-class coding workflow, not an afterthought. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Small-model survival tactics
-
-When borrowing **Small-model survival tactics** from Qwen Code, the agent should interpret the pattern as follows: Prioritize anti-hesitation behavior, compact state, and disciplined tool exposure. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Provider flexibility
-
-When borrowing **Provider flexibility** from Qwen Code, the agent should interpret the pattern as follows: Keep model/provider logic adapter-driven, not woven into random code paths. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Interactive vs headless split
-
-When borrowing **Interactive vs headless split** from Qwen Code, the agent should interpret the pattern as follows: Maintain a lean interactive path and a scriptable/automatable path where sensible. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-#### Claude-Code-like but Qwen-adapted lesson
-
-When borrowing **Claude-Code-like but Qwen-adapted lesson** from Qwen Code, the agent should interpret the pattern as follows: The lesson is not branding; the lesson is that parser-level and small-model-specific adaptation matter. The port is successful only if it closes a mapped Local-AI-Harness problem and leaves the resulting behavior more legible to the operator. A pattern is not considered ported merely because similar words appear in the UI or code. It is ported when the current harness actually behaves better under real local-model conditions.
-
-# Appendix H — Full problem-guidance matrix
-
-### P-001
-
-#### Operator lens
-
-From the operator lens, P-001 should be understood as follows: Danger mode docs claim broad access, but runtime remains workspace-bound; trust and scope mismatch. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-001 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-002
-
-#### Operator lens
-
-From the operator lens, P-002 should be understood as follows: Internet tooling exists in runtime but is not coherently wired into agent execution. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-002 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-003
-
-#### Operator lens
-
-From the operator lens, P-003 should be understood as follows: Direct mode is general-purpose but split across inconsistent stream/non-stream code paths. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-003 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-004
-
-#### Operator lens
-
-From the operator lens, P-004 should be understood as follows: Planner is largely a status tracker rather than a deep working-memory/task-graph system. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-004 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-005
-
-#### Operator lens
-
-From the operator lens, P-005 should be understood as follows: Agentic mode uses many early shortcuts that bypass the richer inspect-edit-verify loop. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-005 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-006
-
-#### Operator lens
-
-From the operator lens, P-006 should be understood as follows: Low loop caps choke iterative work and spend precious turns on recovery rather than completion. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-006 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-007
-
-#### Operator lens
-
-From the operator lens, P-007 should be understood as follows: Manual JSON fallback is brittle for small local models and easy to derail. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-007 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-008
-
-#### Operator lens
-
-From the operator lens, P-008 should be understood as follows: Simulation detection exists, but recovery still relies too much on the model fixing itself. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-008 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-009
-
-#### Operator lens
-
-From the operator lens, P-009 should be understood as follows: Browser folder context and backend workspace binding are conceptually split and user-confusing. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-009 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-010
-
-#### Operator lens
-
-From the operator lens, P-010 should be understood as follows: Workspace resolution is heuristic and can silently fall back to snapshot-only behavior. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-010 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-011
-
-#### Operator lens
-
-From the operator lens, P-011 should be understood as follows: Changing workspace root resets important runtime/session/planner state. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-011 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-012
-
-#### Operator lens
-
-From the operator lens, P-012 should be understood as follows: Skills loading is coupled to workspace root and can disappear silently after rebinding. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-012 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-013
-
-#### Operator lens
-
-From the operator lens, P-013 should be understood as follows: Caveman is runtime-disabled but may still leak in catalog surfaces or build artifacts. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-013 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-014
-
-#### Operator lens
-
-From the operator lens, P-014 should be understood as follows: Tool selection is regex-driven and therefore narrow, brittle, and phrasing-sensitive. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-014 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-015
-
-#### Operator lens
-
-From the operator lens, P-015 should be understood as follows: Automatic repo-context injection is off by default, weakening hard-task repository understanding. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-015 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-016
-
-#### Operator lens
-
-From the operator lens, P-016 should be understood as follows: Idle timeout seems configured but not truly enforced in the main streaming path. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-016 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-017
-
-#### Operator lens
-
-From the operator lens, P-017 should be understood as follows: Model lifecycle unloading can look like sleep/crash from the operator’s point of view. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-017 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-018
-
-#### Operator lens
-
-From the operator lens, P-018 should be understood as follows: RunCommand is intentionally narrow, which users often experience as broken shell access. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-018 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-019
-
-#### Operator lens
-
-From the operator lens, P-019 should be understood as follows: UI visibility compresses activity into counts and summaries instead of precise change ledgers. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-019 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-020
-
-#### Operator lens
-
-From the operator lens, P-020 should be understood as follows: Renderer has an honesty fallback because the model often fails to return a real final narrative. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-020 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-021
-
-#### Operator lens
-
-From the operator lens, P-021 should be understood as follows: Reasoning blocks can visually dominate the actual useful outcome. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-021 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-022
-
-#### Operator lens
-
-From the operator lens, P-022 should be understood as follows: Approvals documentation and UI surface have drifted apart. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-022 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-023
-
-#### Operator lens
-
-From the operator lens, P-023 should be understood as follows: Tests mock happy paths and miss real local-model hesitation, RAM pressure, and wedged streams. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-023 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-024
-
-#### Operator lens
-
-From the operator lens, P-024 should be understood as follows: Tests encode optimistic success markers that can still feel empty to users. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-024 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-025
-
-#### Operator lens
-
-From the operator lens, P-025 should be understood as follows: Native Ollama support is strong, but capability detection and mode selection remain fragile. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-025 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-026
-
-#### Operator lens
-
-From the operator lens, P-026 should be understood as follows: Source-of-truth for workspace changes depending on context, eroding trust. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-026 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-027
-
-#### Operator lens
-
-From the operator lens, P-027 should be understood as follows: Local-first CPU reality is burdened by orchestration overhead and protocol weight. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-027 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-028
-
-#### Operator lens
-
-From the operator lens, P-028 should be understood as follows: Lightweight indexing helps latency but under-serves deep repo understanding tasks. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-028 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-029
-
-#### Operator lens
-
-From the operator lens, P-029 should be understood as follows: Frontend config already drifts from backend runtime config fields. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-029 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-030
-
-#### Operator lens
-
-From the operator lens, P-030 should be understood as follows: Architecture already normalizes planning-only/simulation failure because those failures are common. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-030 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-031
-
-#### Operator lens
-
-From the operator lens, P-031 should be understood as follows: Direct mode is correctly broad, but that only sharpens disappointment in agentic mode. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-031 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-032
-
-#### Operator lens
-
-From the operator lens, P-032 should be understood as follows: Nominal context window is large, but effective context use remains poor. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-032 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-033
-
-#### Operator lens
-
-From the operator lens, P-033 should be understood as follows: UI exposes run steps and tool cards, but the information density/structure still feels wrong. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-033 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-034
-
-#### Operator lens
-
-From the operator lens, P-034 should be understood as follows: Activity tab shows trace headers without enough payload depth for diagnosis. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-034 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-035
-
-#### Operator lens
-
-From the operator lens, P-035 should be understood as follows: Tool registry is stronger than the agent’s effective ability to exploit it. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-035 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-### P-036
-
-#### Operator lens
-
-From the operator lens, P-036 should be understood as follows: Snapshot-only refusal is honest, but it feels bureaucratic if binding truth is unclear. The operator does not care which module technically caused the issue; they care whether the assistant felt dependable. Therefore any change targeting P-036 must improve the user’s ability to predict, interpret, and trust the harness. A fix that only changes code without changing the user’s ability to understand the behavior is insufficient.
-
-#### Engine lens
-
-From the engine lens, the agent should identify the controlling state machine, retries, loop budgets, parser behavior, and policy checks that create or amplify this issue. The implementation goal is not merely to add more text to prompts, but to improve the contract between model behavior and deterministic runtime behavior. When in doubt, add stronger structure around the model instead of asking the model to be magically more perfect.
-
-#### UI lens
-
-From the UI lens, the question is: what should the user see when this issue is happening, and what should they see after it is fixed? Every important runtime state should have a visual correlate or a trace correlate that is accessible from the current app. The UI must not be forced to reverse-engineer execution truth from free-form prose alone.
-
-#### Porting lens
-
-From the porting lens, the agent should ask which external reference offers the best transferable idea for this issue. Some issues are better informed by Codex-style clarity, some by Claude Code permissions discipline, some by Cursor/Windsurf mode and rule design, some by Osaurus polish, and many by Qwen-side parser resilience. Choose the pattern that matches the issue class, not the tool with the coolest branding.
-
-#### Verification lens
-
-From the verification lens, the agent must specify exactly how the improvement will be proven. That proof can be a new test, a trace sample, a run-summary field, a UI element, or a measured reduction in clarification loops—but it must be concrete. A claim like 'this should make the model smarter' is not verification.
-
-# Appendix I — Examples of good and bad AGENTS.md instructions
-
-- **Good:** When changing planner state, add a machine-readable field and ensure the same field appears in API output and the UI activity model.
-- **Bad:** Improve the planner so it is more robust and intelligent.
-- **Good:** If the requested coding task is executable with current workspace binding and current policy, inspect first, act second, and ask follow-up only when a specific blocker remains.
-- **Bad:** Try not to ask too many questions.
-- **Good:** If native tool mode emits planning-only text or malformed tool payloads, retry once with a targeted correction; then explicitly activate manual fallback and surface the path in run summary and UI.
-- **Bad:** Handle tool-call failures better.
-- **Good:** Direct mode must stay on the shortest reliable path and should not inherit agentic trace overhead unless the feature directly improves direct-chat usability.
-- **Bad:** Make direct mode cleaner.
-
-# Appendix J — Checklist for deciding whether a change belongs in AGENTS.md, rules, memory, or code
-
-- If it is a durable instruction about how agents should behave in this repo, put it in AGENTS.md or a scoped child AGENTS.md.
-- If it is reusable project guidance with activation logic, a rules mechanism may be more appropriate.
-- If it is transient learned context from one run, it belongs in planner/session summaries, not as permanent global instruction.
-- If it is a runtime truth needed by the UI or tests, it belongs in code and event contracts, not only in documentation.
-- If it is a one-off observation about an upstream repo, put it in a porting ledger or architecture note rather than polluting permanent instructions.
-
-# Appendix K — Failure vignettes and desired future behavior
-
-### P-001
-
-#### Current likely vignette
-
-A plausible current vignette for P-001 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences danger mode docs claim broad access, but runtime remains workspace-bound; trust and scope mismatch. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-002
-
-#### Current likely vignette
-
-A plausible current vignette for P-002 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences internet tooling exists in runtime but is not coherently wired into agent execution. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-003
-
-#### Current likely vignette
-
-A plausible current vignette for P-003 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences direct mode is general-purpose but split across inconsistent stream/non-stream code paths. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-004
-
-#### Current likely vignette
-
-A plausible current vignette for P-004 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences planner is largely a status tracker rather than a deep working-memory/task-graph system. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-005
-
-#### Current likely vignette
-
-A plausible current vignette for P-005 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences agentic mode uses many early shortcuts that bypass the richer inspect-edit-verify loop. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-006
-
-#### Current likely vignette
-
-A plausible current vignette for P-006 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences low loop caps choke iterative work and spend precious turns on recovery rather than completion. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-007
-
-#### Current likely vignette
-
-A plausible current vignette for P-007 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences manual json fallback is brittle for small local models and easy to derail. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-008
-
-#### Current likely vignette
-
-A plausible current vignette for P-008 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences simulation detection exists, but recovery still relies too much on the model fixing itself. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-009
-
-#### Current likely vignette
-
-A plausible current vignette for P-009 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences browser folder context and backend workspace binding are conceptually split and user-confusing. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-010
-
-#### Current likely vignette
-
-A plausible current vignette for P-010 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences workspace resolution is heuristic and can silently fall back to snapshot-only behavior. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-011
-
-#### Current likely vignette
-
-A plausible current vignette for P-011 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences changing workspace root resets important runtime/session/planner state. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-012
-
-#### Current likely vignette
-
-A plausible current vignette for P-012 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences skills loading is coupled to workspace root and can disappear silently after rebinding. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-013
-
-#### Current likely vignette
-
-A plausible current vignette for P-013 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences caveman is runtime-disabled but may still leak in catalog surfaces or build artifacts. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-014
-
-#### Current likely vignette
-
-A plausible current vignette for P-014 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences tool selection is regex-driven and therefore narrow, brittle, and phrasing-sensitive. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-015
-
-#### Current likely vignette
-
-A plausible current vignette for P-015 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences automatic repo-context injection is off by default, weakening hard-task repository understanding. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-016
-
-#### Current likely vignette
-
-A plausible current vignette for P-016 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences idle timeout seems configured but not truly enforced in the main streaming path. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-017
-
-#### Current likely vignette
-
-A plausible current vignette for P-017 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences model lifecycle unloading can look like sleep/crash from the operator’s point of view. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-018
-
-#### Current likely vignette
-
-A plausible current vignette for P-018 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences runcommand is intentionally narrow, which users often experience as broken shell access. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-019
-
-#### Current likely vignette
-
-A plausible current vignette for P-019 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences ui visibility compresses activity into counts and summaries instead of precise change ledgers. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-020
-
-#### Current likely vignette
-
-A plausible current vignette for P-020 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences renderer has an honesty fallback because the model often fails to return a real final narrative. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-021
-
-#### Current likely vignette
-
-A plausible current vignette for P-021 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences reasoning blocks can visually dominate the actual useful outcome. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-022
-
-#### Current likely vignette
-
-A plausible current vignette for P-022 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences approvals documentation and ui surface have drifted apart. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-023
-
-#### Current likely vignette
-
-A plausible current vignette for P-023 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences tests mock happy paths and miss real local-model hesitation, ram pressure, and wedged streams. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-024
-
-#### Current likely vignette
-
-A plausible current vignette for P-024 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences tests encode optimistic success markers that can still feel empty to users. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-025
-
-#### Current likely vignette
-
-A plausible current vignette for P-025 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences native ollama support is strong, but capability detection and mode selection remain fragile. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-026
-
-#### Current likely vignette
-
-A plausible current vignette for P-026 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences source-of-truth for workspace changes depending on context, eroding trust. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-027
-
-#### Current likely vignette
-
-A plausible current vignette for P-027 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences local-first cpu reality is burdened by orchestration overhead and protocol weight. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-028
-
-#### Current likely vignette
-
-A plausible current vignette for P-028 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences lightweight indexing helps latency but under-serves deep repo understanding tasks. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-029
-
-#### Current likely vignette
-
-A plausible current vignette for P-029 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences frontend config already drifts from backend runtime config fields. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-030
-
-#### Current likely vignette
-
-A plausible current vignette for P-030 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences architecture already normalizes planning-only/simulation failure because those failures are common. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-031
-
-#### Current likely vignette
-
-A plausible current vignette for P-031 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences direct mode is correctly broad, but that only sharpens disappointment in agentic mode. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-032
-
-#### Current likely vignette
-
-A plausible current vignette for P-032 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences nominal context window is large, but effective context use remains poor. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-033
-
-#### Current likely vignette
-
-A plausible current vignette for P-033 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences ui exposes run steps and tool cards, but the information density/structure still feels wrong. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-034
-
-#### Current likely vignette
-
-A plausible current vignette for P-034 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences activity tab shows trace headers without enough payload depth for diagnosis. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-035
-
-#### Current likely vignette
-
-A plausible current vignette for P-035 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences tool registry is stronger than the agent’s effective ability to exploit it. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-### P-036
-
-#### Current likely vignette
-
-A plausible current vignette for P-036 is that a user asks the harness to do something that should feel routine, but the system responds with uncertainty, fragmented visibility, or a mismatch between what the interface implies and what runtime truth allows. In plain language, the user experiences snapshot-only refusal is honest, but it feels bureaucratic if binding truth is unclear. The important lesson for future agents is that these vignettes are not edge fiction; they are proxies for how trust erodes in real use. A fix should therefore be shaped around the vignette, not merely around the code abstraction.
-
-#### Desired future vignette
-
-In the desired future vignette, the same request produces a clearer contract. The user can tell what mode is active, what context is bound, what the system is trying next, what tool path is in use, what changed, and what blocked progress if any. Even when the harness cannot complete the task, it should fail in a way that still feels trustworthy, bounded, and technically grounded.
-
-#### Implementation reminder
-
-Do not treat the future vignette as a UI-only goal. The runtime, planner, API, traces, and tests must line up so the visible improvement is backed by real behavior. If the vignette is only cosmetically improved while the engine remains ambiguous, the issue is not fixed.
-
-# Appendix L — Task-track review rubrics
-
-### TASK-01
-
-Use this rubric to review work delivered under TASK-01. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-01: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-01: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-01: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-01: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-01: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-01: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-01: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-01: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-02
-
-Use this rubric to review work delivered under TASK-02. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-02: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-02: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-02: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-02: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-02: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-02: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-02: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-02: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-03
-
-Use this rubric to review work delivered under TASK-03. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-03: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-03: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-03: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-03: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-03: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-03: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-03: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-03: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-04
-
-Use this rubric to review work delivered under TASK-04. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-04: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-04: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-04: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-04: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-04: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-04: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-04: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-04: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-05
-
-Use this rubric to review work delivered under TASK-05. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-05: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-05: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-05: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-05: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-05: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-05: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-05: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-05: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-06
-
-Use this rubric to review work delivered under TASK-06. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-06: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-06: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-06: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-06: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-06: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-06: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-06: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-06: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-07
-
-Use this rubric to review work delivered under TASK-07. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-07: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-07: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-07: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-07: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-07: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-07: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-07: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-07: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-08
-
-Use this rubric to review work delivered under TASK-08. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-08: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-08: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-08: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-08: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-08: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-08: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-08: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-08: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-09
-
-Use this rubric to review work delivered under TASK-09. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-09: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-09: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-09: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-09: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-09: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-09: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-09: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-09: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-### TASK-10
-
-Use this rubric to review work delivered under TASK-10. A change should not be accepted merely because it compiles or because one demo looks better. It should be evaluated against the criteria below, with explicit notes describing what changed, what evidence exists, and what still remains weak.
-
-#### Runtime truth is clearer and more deterministic.
-
-Review question for TASK-10: how does this work demonstrate that **runtime truth is clearer and more deterministic.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Planner state is richer or more useful where needed.
-
-Review question for TASK-10: how does this work demonstrate that **planner state is richer or more useful where needed.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Trace/event payloads got more explicit instead of more noisy.
-
-Review question for TASK-10: how does this work demonstrate that **trace/event payloads got more explicit instead of more noisy.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### UI clarity improved without burying the final answer.
-
-Review question for TASK-10: how does this work demonstrate that **ui clarity improved without burying the final answer.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Small-model prompt load did not bloat unnecessarily.
-
-Review question for TASK-10: how does this work demonstrate that **small-model prompt load did not bloat unnecessarily.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Fallback behavior became more inspectable and less mysterious.
-
-Review question for TASK-10: how does this work demonstrate that **fallback behavior became more inspectable and less mysterious.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### Tests gained at least one realistic hostile-path case.
-
-Review question for TASK-10: how does this work demonstrate that **tests gained at least one realistic hostile-path case.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-#### The change did not create a duplicate orchestration core.
-
-Review question for TASK-10: how does this work demonstrate that **the change did not create a duplicate orchestration core.**? The reviewer should demand concrete evidence: a diff, a trace payload, a UI artifact, a run-summary field, a test, or a measured behavioral difference. If the answer is hand-wavy, the criterion is not satisfied. This insistence on evidence is necessary because Local-AI-Harness has suffered from elegant-sounding but weakly grounded changes before.
-
-# Appendix M — Suggested nested AGENTS.md strategy for the future
-
-- **root/AGENTS.md** — global product truth, architecture constraints, external reference policy, task-track program
-- **packages/core/AGENTS.md** — engine loop, planner interplay, fallback logic, event schema discipline
-- **packages/model-adapter/AGENTS.md** — Ollama/native capability handling, model lifecycle, retries, timeouts
-- **packages/tool-runtime/AGENTS.md** — tool safety, command execution rules, preview/result semantics
-- **apps/api/AGENTS.md** — streaming contracts, session/workspace binding truth, approval API behavior
-- **apps/web/AGENTS.md** — activity timeline, answer-vs-trace separation, runtime badges, change ledger
-- **tests/AGENTS.md** — realism-first local-model tests, hostile-path coverage, event contract assertions
-
-The root file should stay authoritative on global product truth. Nested files should only appear when a directory accumulates enough local complexity that a scoped instruction file will materially help future agents. Do not create nested AGENTS.md files just because it feels sophisticated; create them when local conventions or failure modes are genuinely different and worth scoping by directory.
-
-# Appendix N — Implementation notes on the unresolved repo-name discrepancy
-
-The user-provided integration prompt names `osaurus-ai/osaurus` and `deepfounder-ai/qwe-qwe`. Public research in this session strongly supports the existence of Osaurus under the `osaurus-ai/osaurus` identity and an official documentation site. Public research did not confirm a `deepfounder-ai/qwe-qwe` repository. The nearest high-confidence open-source terminal-agent reference matching the desired small-model patterns is `QwenLM/qwen-code`. Future agents must preserve this distinction: attempt the exact requested clone first, but if it does not resolve, record the substitution and continue with the verified fallback rather than pretending the requested repo was available.
-
-This note is intentionally persistent because hidden substitutions are a trust failure. A high-quality coding agent should be honest when upstream identifiers are unavailable, especially when the whole purpose of the work is to improve operator trust in Local-AI-Harness itself.
-
-# Appendix O — Long-form reminders for future maintainers
-
-- The audit already proved that the harness has architecture. Stop acting as if one more subsystem is the cure.
-- Most failures are not missing-feature failures; they are convergence failures.
-- Visibility is not the same as raw logging. Activity should explain work, not drown it.
-- A model with a large context window can still feel myopic if orchestration is weak.
-- When the user says the model is 'sleeping', check runtime lifecycle and streaming watchdogs before blaming the model.
-- When the user says the tool system is bad, inspect routing, fallback, and UI storytelling before rewriting the registry.
-- When the user says the harness asks too many questions, inspect internal decomposition, tool discipline, and anti-hedge behavior.
-- When the user cannot tell what changed, the fault is both in the UI ledger and in the event contract beneath it.
-- Good local-agent design is not about maximal autonomy. It is about bounded autonomy plus truthfulness.
-- Any feature that makes the system harder to explain to the operator must justify itself with major gains.
-
-# Appendix P — Final operating mantra
-
-The harness must stop feeling like a protocol stack that occasionally behaves like a worker and start feeling like a worker whose protocol stack is visible, trustworthy, and disciplined. That is the design bar. Every future change should be judged against it.
-
-In short: one workspace truth, one mode truth, one runtime truth, one visible story, one testable contract. If a change weakens any of those, it does not belong here—even if it sounds intelligent.
-
-# Appendix Q — Review prompts for human supervisors
-
-### TASK-01
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-02
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-03
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-04
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-05
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-06
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-07
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-08
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-09
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
-
-### TASK-10
-
-- Can I tell, from the UI alone, what the harness is doing right now?
-- Can I tell which workspace root is real and whether the run is snapshot-only or backend-bound?
-- Can I tell whether the harness is using native tools, a repaired native retry, or manual fallback?
-- If the model hesitates, do I see a bounded recovery path rather than an endless stall?
-- If files changed, can I tell which files and roughly what happened without reading the raw diff first?
-- Would this behavior still make sense on Gemma 4 E4B or Qwen 3.5 9B under local CPU constraints?
-- Is the change easier to explain than the behavior it replaced?
+If a change makes the harness more impressive but less usable on Hunde’s laptop, reject the change.

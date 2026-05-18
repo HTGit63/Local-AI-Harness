@@ -1,6 +1,6 @@
 export type PolicyMode = 'read-only' | 'workspace-write' | 'danger';
 
-export type AgentRunExecutionMode = 'direct' | 'agentic';
+export type AgentRunExecutionMode = 'chat' | 'agent';
 export type AgentFallbackPath =
   | 'native_tools'
   | 'native_retry'
@@ -160,6 +160,30 @@ export interface AgentRun {
   error?: string;
 }
 
+export type CompactRunOutcome = 'done' | 'blocked' | 'safe_idle' | 'failed';
+
+export interface CompactRunSummary {
+  runId: string;
+  mode: AgentRunExecutionMode;
+  intent: string;
+  goal?: string;
+  outcome: CompactRunOutcome;
+  filesRead: string[];
+  filesChanged: string[];
+  commandsRun: string[];
+  approvals: number;
+  toolProtocol?: 'native' | 'manual';
+  fallbackPath?: AgentFallbackPath;
+  usedManualFallback?: boolean;
+  fallbackReason?: string;
+  summary: string;
+  error?: string;
+  startedAt: number;
+  endedAt?: number;
+  firstTokenMs?: number;
+  totalDurationMs?: number;
+}
+
 export interface SessionTurnMetadata {
   timestamp: number;
   executionMode: AgentRunExecutionMode;
@@ -171,7 +195,7 @@ export interface SessionTurnMetadata {
   summary?: string;
   firstTokenMs?: number;
   totalDurationMs?: number;
-  runSummary?: AgentRun;
+  runSummary?: CompactRunSummary;
 }
 
 export type SkillAuditStatus = 'available' | 'filtered' | 'missing';

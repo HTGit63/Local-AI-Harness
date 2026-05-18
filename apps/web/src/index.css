@@ -983,7 +983,7 @@ a {
   cursor: not-allowed;
 }
 
-/* Toggle switch for Agentic/Thinking */
+/* Toggle switch for Agent Work/Thinking */
 .toggle-switch {
   display: inline-flex;
   align-items: center;
@@ -1813,6 +1813,39 @@ a {
   color: var(--text-tertiary);
   font-family: var(--font-mono);
   font-size: 10px;
+}
+
+.topbar-mode-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 30px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #101010;
+}
+
+.topbar-mode-option {
+  min-height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.topbar-mode-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.topbar-mode-option-active {
+  background: var(--surface-active);
+  color: var(--text);
 }
 
 .tool-call-row strong {

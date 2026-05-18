@@ -1,11 +1,15 @@
-export type TaskComplexity =
-  | 'direct_answer'
-  | 'single_file'
-  | 'small_patch'
-  | 'multi_file'
-  | 'architecture_change'
-  | 'repo_wide_audit'
-  | 'unsafe_or_too_broad';
+export type TaskIntent =
+  | 'chat'
+  | 'inspect_project'
+  | 'inspect_file'
+  | 'search_project'
+  | 'edit_file'
+  | 'run_command'
+  | 'summarize_changes'
+  | 'full_audit';
+
+export type TaskSizeEstimate = 'none' | 'small' | 'medium' | 'large';
+export type TaskPlanStatus = 'pending' | 'running' | 'blocked' | 'safe_idle' | 'done' | 'failed';
 
 export type TaskStepType =
   | 'intake'
@@ -22,7 +26,8 @@ export type TaskStepStatus =
   | 'done'
   | 'failed'
   | 'skipped'
-  | 'blocked';
+  | 'blocked'
+  | 'safe_idle';
 
 export interface TaskBudget {
   maxModelCalls: number;
@@ -49,15 +54,23 @@ export interface TaskStep {
 
 export interface TaskPlan {
   id: string;
+  mode: 'chat' | 'agent';
+  intent: TaskIntent;
+  goal: string;
+  status: TaskPlanStatus;
   userRequest: string;
   title: string;
   summary: string;
-  complexity: TaskComplexity;
-  intent: string;
   workspaceRoot: string;
+  sizeEstimate: TaskSizeEstimate;
   steps: TaskStep[];
+  currentStepId?: string;
+  evidence: string[];
+  nextAction?: string;
+  stopCondition: string;
   createdAt: number;
   updatedAt: number;
+  revisedAt?: number;
   completedAt?: number;
   failedAt?: number;
 }

@@ -239,7 +239,10 @@ export function createMockFetch(options: MockFetchOptions = {}) {
         } as any;
       }
 
-      runningModels = [{ name: model, model, context_length: 4096 }];
+      runningModels = [
+        ...runningModels.filter((entry) => entry.model !== model),
+        { name: model, model, context_length: 4096 },
+      ];
       return {
         ok: true,
         json: async () => ({ model, done: true, done_reason: 'load', response: '' }),

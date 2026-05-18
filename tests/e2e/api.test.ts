@@ -26,7 +26,7 @@ interface ApprovalItem {
 interface SessionState {
   id: string;
   turnHistory?: Array<{
-    executionMode: 'direct' | 'agentic';
+    executionMode: 'chat' | 'agent';
     runSummary?: {
       summary?: string;
       workspaceSource?: 'backend' | 'browser_snapshot';
@@ -403,11 +403,11 @@ main().catch((error) => {
 async function testApiWorkflow() {
   const workspaceParent = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-api-e2e-'));
   const workspaceRoot = path.join(workspaceParent, 'Gamma 4 Harness');
-  const pickedWorkspace = path.join(workspaceParent, 'art-gallery');
+  const pickedWorkspace = path.join(workspaceParent, 'sample-express-app');
   const mockModel = await startMockModelServer();
   await fs.mkdir(workspaceRoot, { recursive: true });
   await fs.mkdir(path.join(pickedWorkspace, 'src'), { recursive: true });
-  await fs.writeFile(path.join(pickedWorkspace, 'package.json'), JSON.stringify({ name: 'art-gallery' }), 'utf8');
+  await fs.writeFile(path.join(pickedWorkspace, 'package.json'), JSON.stringify({ name: 'sample-express-app' }), 'utf8');
   await fs.writeFile(path.join(pickedWorkspace, 'src', 'index.ts'), 'export const gallery = true;\n', 'utf8');
   const server = await startApiServer(workspaceRoot, mockModel.baseUrl);
 
@@ -420,6 +420,7 @@ async function testApiWorkflow() {
       baseUrl: string;
       contextBudget: number;
       toolRetryMax: number;
+      internetAccessEnabled: boolean;
       sessionMemoryEnabled: boolean;
       sessionMemoryTurns: number;
       selfCheckEnabled: boolean;
@@ -428,8 +429,10 @@ async function testApiWorkflow() {
     }>(`${API_BASE}/api/config`);
     assert.strictEqual(initialConfig.workspaceRoot, workspaceRoot);
     assert.strictEqual(initialConfig.baseUrl, mockModel.baseUrl);
-    assert.strictEqual(initialConfig.contextBudget, 24000);
+    assert.strictEqual(initialConfig.profile, 'balanced');
+    assert.strictEqual(initialConfig.contextBudget, 16000);
     assert.strictEqual(initialConfig.toolRetryMax, 2);
+    assert.strictEqual(initialConfig.internetAccessEnabled, false);
     assert.strictEqual(initialConfig.sessionMemoryEnabled, true);
     assert.strictEqual(initialConfig.sessionMemoryTurns, 3);
     assert.strictEqual(initialConfig.selfCheckEnabled, true);
@@ -455,20 +458,20 @@ async function testApiWorkflow() {
         mode: 'workspace-write',
         model: 'gemma4:e4b',
         baseUrl: mockModel.baseUrl,
-        contextBudget: 32000,
-        toolRetryMax: 4,
+        contextBudget: 12000,
+        toolRetryMax: 1,
         sessionMemoryEnabled: true,
-        sessionMemoryTurns: 5,
+        sessionMemoryTurns: 2,
         selfCheckEnabled: false,
         localModelBudgetProfile: 'lean',
       }),
     });
     assert.strictEqual(updatedConfig.profile, 'fast');
     assert.strictEqual(updatedConfig.mode, 'workspace-write');
-    assert.strictEqual(updatedConfig.contextBudget, 32000);
-    assert.strictEqual(updatedConfig.toolRetryMax, 4);
+    assert.strictEqual(updatedConfig.contextBudget, 12000);
+    assert.strictEqual(updatedConfig.toolRetryMax, 1);
     assert.strictEqual(updatedConfig.sessionMemoryEnabled, true);
-    assert.strictEqual(updatedConfig.sessionMemoryTurns, 5);
+    assert.strictEqual(updatedConfig.sessionMemoryTurns, 2);
     assert.strictEqual(updatedConfig.selfCheckEnabled, false);
     assert.strictEqual(updatedConfig.localModelBudgetProfile, 'lean');
 
@@ -535,7 +538,7 @@ async function testApiWorkflow() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        folderLabel: 'art-gallery',
+        folderLabel: 'sample-express-app',
         relativeFiles: ['package.json', 'src/index.ts'],
       }),
     });
@@ -546,47 +549,81 @@ async function testApiWorkflow() {
     const configAfterResolve = await fetchJson<{ workspaceRoot: string }>(`${API_BASE}/api/config`);
     assert.strictEqual(configAfterResolve.workspaceRoot, pickedWorkspace);
 
-    const chatRequestsBeforeAgentic = mockModel.getChatRequests().length;
-    const agenticEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
+    const chatRequestsBeforeDefaultChat = mockModel.getChatRequests().length;
+    const defaultChatEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages: [{ role: 'user', content: 'Reply with exactly: API agentic' }],
+        messages: [{ role: 'user', content: 'Reply with exactly: API chat' }],
       }),
     });
-    const agenticDone = agenticEvents.find((event) => event.type === 'done');
-    assert.ok(String(agenticDone?.response || '').includes('Direct stream works.'));
-    assert.ok(String(agenticDone?.response || '').includes('What I did:'));
-    assert.ok(agenticEvents.some((event) => event.type === 'task_plan_created'));
-    assert.ok(agenticEvents.some((event) => event.type === 'task_step_started'));
-    assert.ok(agenticEvents.some((event) => event.type === 'task_step_completed'));
-    assert.ok(agenticEvents.some((event) => event.type === 'task_checkpoint_saved'));
-    const agenticRunSummary = agenticEvents.find((event) => event.type === 'run_summary');
-    assert.ok(agenticRunSummary);
-    assert.strictEqual(agenticRunSummary?.summary?.workspaceSource, 'backend');
-    assert.strictEqual(agenticRunSummary?.summary?.workspaceBound, true);
-    assert.ok(mockModel.getChatRequests().length > chatRequestsBeforeAgentic);
+    const defaultChatDone = defaultChatEvents.find((event) => event.type === 'done');
+    assert.ok(String(defaultChatDone?.response || '').includes('Direct stream works.'));
+    assert.strictEqual(defaultChatDone?.executionMode, 'chat');
+    assert.ok(!defaultChatEvents.some((event) => event.type === 'task_plan_created'));
+    assert.strictEqual(mockModel.getChatRequests().length, chatRequestsBeforeDefaultChat + 1);
 
-    const planState = await fetchJson<{ taskPlan?: { complexity?: string; steps?: unknown[] } }>(`${API_BASE}/api/plan`);
+    const invalidAdvancedTools = await fetch(`${API_BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'agent',
+        advancedTools: 'yes',
+        messages: [{ role: 'user', content: 'Invalid advanced tools type' }],
+      }),
+    });
+    assert.strictEqual(invalidAdvancedTools.status, 400);
+
+    const chatRequestsBeforeAgent = mockModel.getChatRequests().length;
+    const agentEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'agent',
+        messages: [{ role: 'user', content: 'Reply with exactly: API agent' }],
+      }),
+    });
+    const agentDone = agentEvents.find((event) => event.type === 'done');
+    assert.ok(String(agentDone?.response || '').includes('Direct stream works.'));
+    assert.ok(String(agentDone?.response || '').includes('What I did:'));
+    assert.strictEqual(agentDone?.executionMode, 'agent');
+    assert.ok(agentEvents.some((event) => event.type === 'task_plan_created'));
+    assert.ok(agentEvents.some((event) => event.type === 'task_step_started'));
+    assert.ok(agentEvents.some((event) => event.type === 'task_step_completed'));
+    assert.ok(agentEvents.some((event) => event.type === 'task_checkpoint_saved'));
+    const agentRunSummary = agentEvents.find((event) => event.type === 'run_summary');
+    assert.ok(agentRunSummary);
+    assert.strictEqual(agentRunSummary?.summary?.workspaceSource, 'backend');
+    assert.strictEqual(agentRunSummary?.summary?.workspaceBound, true);
+    assert.ok(mockModel.getChatRequests().length > chatRequestsBeforeAgent);
+
+    const planState = await fetchJson<{ taskPlan?: { intent?: string; sizeEstimate?: string; complexity?: string; steps?: unknown[] } }>(`${API_BASE}/api/plan`);
     assert.ok(planState.taskPlan);
+    assert.ok(planState.taskPlan?.intent);
+    assert.ok(planState.taskPlan?.sizeEstimate);
+    assert.strictEqual(planState.taskPlan?.complexity, undefined);
     assert.ok(Array.isArray(planState.taskPlan?.steps));
 
-    const runs = await fetchJson<Array<{ runId: string; taskPlan: { id: string; complexity: string } }>>(`${API_BASE}/api/runs`);
+    const runs = await fetchJson<Array<{ runId: string; taskPlan: { id: string; intent: string; sizeEstimate: string; complexity?: string } }>>(`${API_BASE}/api/runs`);
     assert.ok(runs.length >= 1);
+    assert.ok(runs[0].taskPlan.intent);
+    assert.ok(runs[0].taskPlan.sizeEstimate);
+    assert.strictEqual(runs[0].taskPlan.complexity, undefined);
     const firstRun = await fetchJson<{ runId: string; taskPlan: { id: string } }>(`${API_BASE}/api/runs/${runs[0].runId}`);
     assert.strictEqual(firstRun.runId, runs[0].runId);
     const checkpoint = await fetchJson<{ runId: string; taskPlan: { id: string }; completedSteps: string[] }>(`${API_BASE}/api/runs/${runs[0].runId}/checkpoint`);
     assert.strictEqual(checkpoint.runId, runs[0].runId);
     assert.ok(Array.isArray(checkpoint.completedSteps));
 
-    const sessionAfterAgentic = await fetchJson<SessionState>(`${API_BASE}/api/session`);
-    const latestAgenticTurn = [...(sessionAfterAgentic.turnHistory || [])]
+    const sessionAfterAgent = await fetchJson<SessionState>(`${API_BASE}/api/session`);
+    const latestAgentTurn = [...(sessionAfterAgent.turnHistory || [])]
       .reverse()
-      .find((turn) => turn.executionMode === 'agentic');
-    assert.ok(latestAgenticTurn?.runSummary?.summary);
-    assert.strictEqual(latestAgenticTurn?.runSummary?.workspaceSource, 'backend');
-    assert.strictEqual(latestAgenticTurn?.runSummary?.toolProtocol, 'native');
-    assert.strictEqual(latestAgenticTurn?.runSummary?.fallbackPath, 'native_tools');
+      .find((turn) => turn.executionMode === 'agent');
+    assert.ok(latestAgentTurn?.runSummary?.summary);
+    assert.strictEqual(latestAgentTurn?.runSummary?.toolProtocol, 'native');
+    assert.strictEqual(latestAgentTurn?.runSummary?.fallbackPath, 'native_tools');
+    assert.strictEqual((latestAgentTurn?.runSummary as any)?.workspaceSource, undefined);
+    assert.strictEqual((latestAgentTurn?.runSummary as any)?.steps, undefined);
 
     const chatRequestsBeforeSnapshot = mockModel.getChatRequests().length;
     const snapshotEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
@@ -594,9 +631,10 @@ async function testApiWorkflow() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         messages: [
-          { role: 'system', content: '[Browser Folder Context]\nFolder label: art-gallery\nTree:\n- src/\n  - index.ts' },
+          { role: 'system', content: '[Browser Folder Context]\nFolder label: sample-express-app\nTree:\n- src/\n  - index.ts' },
           { role: 'user', content: 'Create notes.txt and run npm test' },
         ],
+        mode: 'agent',
       }),
     });
     const snapshotDone = snapshotEvents.find((event) => event.type === 'done');
@@ -611,8 +649,8 @@ async function testApiWorkflow() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages: [{ role: 'user', content: 'Say hello from direct mode' }],
-        agentic: false,
+        messages: [{ role: 'user', content: 'Say hello from Chat Mode' }],
+        mode: 'chat',
       }),
     });
     const streamedText = streamEvents
@@ -626,8 +664,8 @@ async function testApiWorkflow() {
 
     const sessionAfterDirect = await fetchJson<SessionState>(`${API_BASE}/api/session`);
     assert.strictEqual(
-      sessionAfterDirect.turnHistory?.filter((turn) => turn.executionMode === 'direct').length,
-      1,
+      sessionAfterDirect.turnHistory?.filter((turn) => turn.executionMode === 'chat').length,
+      2,
     );
   } finally {
     await stopApiServer(server);
@@ -649,6 +687,7 @@ async function testApiApprovalStreamResumesComplexTask() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        mode: 'agent',
         messages: [{
           role: 'user',
           content: 'Read src/index.ts, create notes.txt, wait for approval, then summarize result.',

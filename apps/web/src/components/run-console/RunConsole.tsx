@@ -35,11 +35,7 @@ function explainPlanFile(file: string, plan?: TaskPlan): string {
   const step = plan?.steps.find((entry) => entry.files?.includes(file));
   if (step?.detail) return step.detail;
   if (step?.title) return step.title;
-  if (file.includes('RunConsole')) return 'RunConsole renders agent work, tool transparency, and code changes.';
-  if (file.includes('types/run')) return 'Shared run types define UI diff, checkpoint, and timeline contracts.';
-  if (file.includes('engine.ts')) return 'Core engine routes model calls and executes deterministic tools.';
-  if (file.includes('registry.ts')) return 'Tool registry owns file, diff, command, and repo tool behavior.';
-  return 'Selected from current task plan or repo relevance ranking.';
+  return 'Selected by current task plan evidence.';
 }
 
 interface DiffFileStat {
@@ -130,7 +126,7 @@ export function RunConsole({
     <aside className="run-console" data-testid="run-console">
       <div className="run-console-header">
         <div>
-          <span>Agent work</span>
+          <span>Agent activity</span>
           <strong>{streamStatus || phase || plan?.title || 'idle'}</strong>
         </div>
         <div className="run-console-header-stats">
@@ -151,53 +147,62 @@ export function RunConsole({
           fallbackReason={fallbackReason}
         />
         {contextData && (
-          <section className="run-console-section">
-            <div className="run-console-section-head">
-              <span>Context budget</span>
-              <span>{String(contextData.contextBudgetUsed ?? 0)} / {String(contextData.contextBudgetLimit ?? 0)}</span>
-            </div>
-            <div className="run-console-metrics">
-              <div><span>Files</span><strong>{String(contextData.filesIncluded ?? 0)}</strong></div>
-              <div><span>Snippets</span><strong>{String(contextData.snippetsIncluded ?? 0)}</strong></div>
-              <div><span>Memory turns</span><strong>{String(contextData.memoryTurns ?? 0)}</strong></div>
-            </div>
-          </section>
+          <details className="run-console-advanced-details">
+            <summary>Advanced Details · Context budget</summary>
+            <section className="run-console-section">
+              <div className="run-console-section-head">
+                <span>Context budget</span>
+                <span>{String(contextData.contextBudgetUsed ?? 0)} / {String(contextData.contextBudgetLimit ?? 0)}</span>
+              </div>
+              <div className="run-console-metrics">
+                <div><span>Files</span><strong>{String(contextData.filesIncluded ?? 0)}</strong></div>
+                <div><span>Snippets</span><strong>{String(contextData.snippetsIncluded ?? 0)}</strong></div>
+                <div><span>Memory turns</span><strong>{String(contextData.memoryTurns ?? 0)}</strong></div>
+              </div>
+            </section>
+          </details>
         )}
         <TaskPlanView plan={plan} currentStepId={currentStepId} />
         <ToolCallList traces={traces} currentTool={currentTool} />
 
         {checkpointIds.length > 0 && (
-          <section className="run-console-section">
-            <div className="run-console-section-head">
-              <span>Safety checkpoint</span>
-              <span>Rollback available</span>
-            </div>
-            <div className="checkpoint-list">
-              {checkpointIds.slice(-3).map((checkpointId) => (
-                <code key={checkpointId}>{checkpointId}</code>
-              ))}
-            </div>
-          </section>
+          <details className="run-console-advanced-details">
+            <summary>Advanced Details · Checkpoints</summary>
+            <section className="run-console-section">
+              <div className="run-console-section-head">
+                <span>Safety checkpoint</span>
+                <span>Rollback available</span>
+              </div>
+              <div className="checkpoint-list">
+                {checkpointIds.slice(-3).map((checkpointId) => (
+                  <code key={checkpointId}>{checkpointId}</code>
+                ))}
+              </div>
+            </section>
+          </details>
         )}
 
-        <section className="run-console-section">
-          <div className="run-console-section-head">
-            <span>Files in plan</span>
-            <span>{planFiles.length}</span>
-          </div>
-          {planFiles.length === 0 ? (
-            <div className="empty-note">No files selected yet</div>
-          ) : (
-            <div className="run-file-list">
-              {planFiles.slice(0, 12).map((file) => (
-                <div key={file} className="run-file-card">
-                  <code>{file}</code>
-                  <span>Why selected: {explainPlanFile(file, plan)}</span>
-                </div>
-              ))}
+        <details className="run-console-advanced-details">
+          <summary>Advanced Details · Plan files</summary>
+          <section className="run-console-section">
+            <div className="run-console-section-head">
+              <span>Files in plan</span>
+              <span>{planFiles.length}</span>
             </div>
-          )}
-        </section>
+            {planFiles.length === 0 ? (
+              <div className="empty-note">No files selected yet</div>
+            ) : (
+              <div className="run-file-list">
+                {planFiles.slice(0, 12).map((file) => (
+                  <div key={file} className="run-file-card">
+                    <code>{file}</code>
+                    <span>Selection evidence: {explainPlanFile(file, plan)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        </details>
 
         {approvals.length > 0 && (
           <section className="run-console-section">
@@ -227,40 +232,43 @@ export function RunConsole({
                 ))}
               </div>
               {hasStructuredDiff ? (
-                <div className="inline-diff-viewer">
-                  {structuredFiles.slice(0, 8).map((file) => (
-                    <details key={file.path} className="inline-diff-file" open>
-                      <summary>
-                        <code>{file.path}</code>
-                        <span><span className="diff-added">+{file.addedLines}</span> <span className="diff-removed">-{file.removedLines}</span></span>
-                      </summary>
-                      <div className="inline-diff-hunks">
-                        {file.hunks.slice(0, 8).map((hunk, hunkIndex) => (
-                          <div key={`${file.path}-${hunk.oldStart}-${hunk.newStart}-${hunkIndex}`} className="inline-diff-hunk">
-                            {hunk.lines.slice(0, 260).map((line, lineIndex) => (
-                              <div key={`${lineIndex}-${line.type}-${line.content.slice(0, 24)}`} className={`inline-diff-line ${structuredLineClass(line)}`}>
-                                <span className="inline-diff-line-no">{lineNumber('old', line.oldLine)}</span>
-                                <span className="inline-diff-line-no">{lineNumber('new', line.newLine)}</span>
-                                <code>{line.type === 'added' ? '+' : line.type === 'removed' ? '-' : line.type === 'hunk' ? '@' : ' '}{line.content || ' '}</code>
-                              </div>
-                            ))}
-                            {hunk.lines.length > 260 && (
-                              <div className="inline-diff-line diff-line-hunk">
-                                <span className="inline-diff-line-no" />
-                                <span className="inline-diff-line-no" />
-                                <code>... hunk truncated in UI preview ...</code>
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </details>
-                  ))}
-                </div>
+                <details className="run-console-advanced-details">
+                  <summary>Advanced Details · Structured diff</summary>
+                  <div className="inline-diff-viewer">
+                    {structuredFiles.slice(0, 8).map((file) => (
+                      <details key={file.path} className="inline-diff-file">
+                        <summary>
+                          <code>{file.path}</code>
+                          <span><span className="diff-added">+{file.addedLines}</span> <span className="diff-removed">-{file.removedLines}</span></span>
+                        </summary>
+                        <div className="inline-diff-hunks">
+                          {file.hunks.slice(0, 8).map((hunk, hunkIndex) => (
+                            <div key={`${file.path}-${hunk.oldStart}-${hunk.newStart}-${hunkIndex}`} className="inline-diff-hunk">
+                              {hunk.lines.slice(0, 260).map((line, lineIndex) => (
+                                <div key={`${lineIndex}-${line.type}-${line.content.slice(0, 24)}`} className={`inline-diff-line ${structuredLineClass(line)}`}>
+                                  <span className="inline-diff-line-no">{lineNumber('old', line.oldLine)}</span>
+                                  <span className="inline-diff-line-no">{lineNumber('new', line.newLine)}</span>
+                                  <code>{line.type === 'added' ? '+' : line.type === 'removed' ? '-' : line.type === 'hunk' ? '@' : ' '}{line.content || ' '}</code>
+                                </div>
+                              ))}
+                              {hunk.lines.length > 260 && (
+                                <div className="inline-diff-line diff-line-hunk">
+                                  <span className="inline-diff-line-no" />
+                                  <span className="inline-diff-line-no" />
+                                  <code>... hunk truncated in UI preview ...</code>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    ))}
+                  </div>
+                </details>
               ) : null}
               {!hasStructuredDiff && gitDiff.trim() ? (
-                <details className="diff-raw-details" open>
-                  <summary>Raw diff</summary>
+                <details className="run-console-advanced-details diff-raw-details">
+                  <summary>Advanced Details · Raw diff</summary>
                   <pre className="run-diff-preview diff-code">
                     {diffPreviewLines.map((line, index) => (
                       <span key={`${index}-${line.slice(0, 20)}`} className={getDiffLineClass(line)}>

@@ -3,7 +3,7 @@ import { ApprovalQueue } from '../components/approvals/ApprovalQueue';
 import { ChatMessageRow } from '../components/ChatMessageRow';
 import { RunConsole } from '../components/run-console/RunConsole';
 import { useStreamingBuffer } from '../hooks/useStreamingBuffer';
-import type { RunApprovalItem, StructuredDiff, StructuredDiffFile, TaskComplexity, TaskPlan } from '../types/run';
+import type { RunApprovalItem, StructuredDiff, StructuredDiffFile, TaskIntent, TaskPlan, TaskPlanStatus, TaskSizeEstimate } from '../types/run';
 
 /* ─────────── API helpers ─────────── */
 function getApiBase(): string {
@@ -20,7 +20,8 @@ const MAX_BROWSER_CONTEXT_CHARS = 48_000;
 const MAX_BROWSER_TREE_LINES = 220;
 const MAX_IMAGE_ATTACHMENTS = 2;
 const MAX_IMAGE_BYTES = 1024 * 1024;
-const AGENTIC_STORAGE_KEY = 'gamma-harness.agentic-mode';
+const MODE_STORAGE_KEY = 'gamma-harness.execution-mode';
+const LEGACY_AGENTIC_STORAGE_KEY = 'gamma-harness.agentic-mode';
 const LIVE_REFRESH_MS = 6000;
 const ACTIVE_RUN_REFRESH_MS = 1500;
 const FULL_REFRESH_MS = 45000;
@@ -30,7 +31,7 @@ type ChatRole = 'user' | 'assistant';
 type ConversationMode = 'general' | 'architecture' | 'data-analysis' | 'code-review' | 'implementation';
 type BackendStatus = 'ok' | 'degraded' | 'offline';
 type SettingsTab = 'connection' | 'workspace' | 'sessions' | 'activity' | 'agent';
-type ExecutionMode = 'direct' | 'agentic';
+type ExecutionMode = 'chat' | 'agent';
 type FallbackPath = 'native_tools' | 'native_retry' | 'manual_fallback' | 'manual_repair' | 'final_noop_warning';
 
 interface ChatToolEvent {
@@ -81,6 +82,7 @@ interface ConfigState {
   sessionMemoryEnabled: boolean;
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
+  advancedAgentToolsEnabled: boolean;
   localModelBudgetProfile?: 'lean' | 'balanced' | 'deep';
   localModelBudget?: {
     contextBudget: number;
@@ -107,7 +109,7 @@ interface SessionState {
   toolsAllowlist: string[];
   turnHistory?: Array<{
     timestamp: number;
-    executionMode: 'direct' | 'agentic';
+    executionMode: ExecutionMode;
     promptMode?: string;
     messageCount: number;
     thinkingEnabled?: boolean;
@@ -149,6 +151,7 @@ interface PlanState {
   sessionMemoryEnabled?: boolean;
   sessionMemoryTurns?: number;
   selfCheckEnabled?: boolean;
+  advancedAgentToolsEnabled?: boolean;
   fallbackPath?: FallbackPath;
   fallbackReason?: string;
   fallbackCount?: number;
@@ -158,7 +161,9 @@ interface PlanState {
   currentTool?: string;
   taskPlan?: TaskPlan;
   currentStepId?: string;
-  complexity?: TaskComplexity;
+  taskIntent?: TaskIntent;
+  taskStatus?: TaskPlanStatus;
+  sizeEstimate?: TaskSizeEstimate;
   stepProgress?: {
     total: number;
     completed: number;
@@ -286,6 +291,8 @@ interface ModelLifecyclePolicy {
 interface ModelRuntimeState {
   configuredModel: string;
   activeModel: string | null;
+  runtimeStatus?: 'ready' | 'idle' | 'configured_not_loaded' | 'unavailable';
+  statusMessage?: string;
   runningModels: RunningModel[];
   installedModels: string[];
   availableModels: AvailableModel[];
@@ -477,23 +484,24 @@ const SETTINGS_TABS: Array<{ id: SettingsTab; label: string }> = [
 ];
 
 const AGENT_PRESETS: Array<{
-  id: 'lean' | 'balanced' | 'autonomous';
+  id: 'lean' | 'balanced' | 'deep_review';
   title: string;
   note: string;
-  values: Pick<ConfigState, 'contextBudget' | 'toolRetryMax' | 'sessionMemoryEnabled' | 'sessionMemoryTurns' | 'selfCheckEnabled' | 'internetAccessEnabled' | 'streamIdleTimeoutMs'>;
+  values: Pick<ConfigState, 'contextBudget' | 'toolRetryMax' | 'sessionMemoryEnabled' | 'sessionMemoryTurns' | 'selfCheckEnabled' | 'internetAccessEnabled' | 'streamIdleTimeoutMs' | 'advancedAgentToolsEnabled'>;
 }> = [
   {
     id: 'lean',
     title: 'Lean Local',
     note: 'Fast local loop. Tight context. Minimal retries.',
     values: {
-      contextBudget: 16000,
+      contextBudget: 12000,
       toolRetryMax: 1,
       sessionMemoryEnabled: true,
       sessionMemoryTurns: 2,
       selfCheckEnabled: true,
       internetAccessEnabled: false,
       streamIdleTimeoutMs: 30000,
+      advancedAgentToolsEnabled: false,
     },
   },
   {
@@ -501,27 +509,29 @@ const AGENT_PRESETS: Array<{
     title: 'Balanced Harness',
     note: 'Good default. Memory on. Verifies edits.',
     values: {
-      contextBudget: 24000,
+      contextBudget: 16000,
       toolRetryMax: 2,
       sessionMemoryEnabled: true,
       sessionMemoryTurns: 3,
       selfCheckEnabled: true,
-      internetAccessEnabled: true,
+      internetAccessEnabled: false,
       streamIdleTimeoutMs: 45000,
+      advancedAgentToolsEnabled: false,
     },
   },
   {
-    id: 'autonomous',
-    title: 'Deep Agent',
-    note: 'Bigger context and more retries for long task runs.',
+    id: 'deep_review',
+    title: 'Manual Deep Review',
+    note: 'Max local budget for explicit reviews. Internet stays opt-in.',
     values: {
-      contextBudget: 32000,
-      toolRetryMax: 4,
+      contextBudget: 16000,
+      toolRetryMax: 2,
       sessionMemoryEnabled: true,
-      sessionMemoryTurns: 5,
+      sessionMemoryTurns: 3,
       selfCheckEnabled: true,
-      internetAccessEnabled: true,
+      internetAccessEnabled: false,
       streamIdleTimeoutMs: 60000,
+      advancedAgentToolsEnabled: true,
     },
   },
 ];
@@ -1171,7 +1181,7 @@ function buildSystemPrompt(mode: ConversationMode, opts: {
     ? `Active skills: ${skillsList}.`
     : '';
   return [
-    'You are a local-first agentic coding assistant.',
+    'You are a local-first coding assistant.',
     modeInstr[mode],
     skills,
     ctx,
@@ -1241,9 +1251,12 @@ function HarnessApp() {
   const [isSending, setIsSending] = useState(false);
   const [chatMode, setChatMode] = useState<ConversationMode>('general');
   const [isAgentic, setIsAgentic] = useState(() => {
-    if (typeof window === 'undefined') return true;
-    const stored = window.localStorage.getItem(AGENTIC_STORAGE_KEY);
-    return stored === null ? true : stored === 'true';
+    if (typeof window === 'undefined') return false;
+    const stored = window.localStorage.getItem(MODE_STORAGE_KEY);
+    if (stored === 'agent') return true;
+    if (stored === 'chat') return false;
+    const legacy = window.localStorage.getItem(LEGACY_AGENTIC_STORAGE_KEY);
+    return legacy === 'true';
   });
   const [thinkingEnabled, setThinkingEnabled] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -1268,14 +1281,15 @@ function HarnessApp() {
   const [profileDraft, setProfileDraft] = useState('balanced');
   const [modeDraft, setModeDraft] = useState('workspace-write');
   const [workspaceRootDraft, setWorkspaceRootDraft] = useState('');
-  const [internetAccessDraft, setInternetAccessDraft] = useState(true);
+  const [internetAccessDraft, setInternetAccessDraft] = useState(false);
   const [streamIdleTimeoutDraft, setStreamIdleTimeoutDraft] = useState('45');
-  const [contextBudgetDraft, setContextBudgetDraft] = useState('24000');
+  const [contextBudgetDraft, setContextBudgetDraft] = useState('16000');
   const [localModelBudgetProfileDraft, setLocalModelBudgetProfileDraft] = useState<'lean' | 'balanced' | 'deep'>('balanced');
   const [toolRetryMaxDraft, setToolRetryMaxDraft] = useState('2');
   const [sessionMemoryEnabledDraft, setSessionMemoryEnabledDraft] = useState(true);
   const [sessionMemoryTurnsDraft, setSessionMemoryTurnsDraft] = useState('3');
   const [selfCheckEnabledDraft, setSelfCheckEnabledDraft] = useState(true);
+  const [advancedAgentToolsDraft, setAdvancedAgentToolsDraft] = useState(false);
   const [settingsStatus, setSettingsStatus] = useState('');
 
   // Refs
@@ -1312,6 +1326,9 @@ function HarnessApp() {
   }, [browserFilter, sidebarSelection]);
 
   const activeModelLabel = modelRuntime?.activeModel || config?.model || 'No model';
+  const modelRuntimeStatusLabel = modelRuntime?.runtimeStatus
+    ? modelRuntime.runtimeStatus.replace(/_/g, ' ')
+    : backendStatus;
   const recentTurns = useMemo(
     () => (session?.turnHistory ? [...session.turnHistory].slice(-4).reverse() : []),
     [session?.turnHistory],
@@ -1328,10 +1345,12 @@ function HarnessApp() {
       preset.values.sessionMemoryTurns === Number(sessionMemoryTurnsDraft || 0) &&
       preset.values.selfCheckEnabled === selfCheckEnabledDraft &&
       preset.values.internetAccessEnabled === internetAccessDraft &&
+      preset.values.advancedAgentToolsEnabled === advancedAgentToolsDraft &&
       preset.values.streamIdleTimeoutMs === Number(streamIdleTimeoutDraft || 0) * 1000,
     )?.id || null,
     [
       contextBudgetDraft,
+      advancedAgentToolsDraft,
       internetAccessDraft,
       selfCheckEnabledDraft,
       sessionMemoryEnabledDraft,
@@ -1353,7 +1372,9 @@ function HarnessApp() {
           ? 'error'
           : step.status === 'pending'
             ? 'skipped'
-            : step.status,
+            : step.status === 'safe_idle'
+              ? 'skipped'
+              : step.status,
       }));
     },
     [plan?.runSteps, plan?.taskPlan?.steps],
@@ -1436,6 +1457,7 @@ function HarnessApp() {
             sessionMemoryEnabled: cfg.sessionMemoryEnabled,
             sessionMemoryTurns: cfg.sessionMemoryTurns,
             selfCheckEnabled: cfg.selfCheckEnabled,
+            advancedAgentToolsEnabled: cfg.advancedAgentToolsEnabled,
             localModelBudgetProfile: cfg.localModelBudgetProfile,
           });
 
@@ -1453,6 +1475,7 @@ function HarnessApp() {
             setSessionMemoryEnabledDraft(cfg.sessionMemoryEnabled);
             setSessionMemoryTurnsDraft(String(cfg.sessionMemoryTurns));
             setSelfCheckEnabledDraft(cfg.selfCheckEnabled);
+            setAdvancedAgentToolsDraft(cfg.advancedAgentToolsEnabled);
             setLocalModelBudgetProfileDraft(cfg.localModelBudgetProfile || 'balanced');
           }
         }
@@ -1544,7 +1567,8 @@ function HarnessApp() {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(AGENTIC_STORAGE_KEY, String(isAgentic));
+      window.localStorage.setItem(MODE_STORAGE_KEY, isAgentic ? 'agent' : 'chat');
+      window.localStorage.removeItem(LEGACY_AGENTIC_STORAGE_KEY);
     } catch {
       // ignore storage errors
     }
@@ -1632,7 +1656,7 @@ function HarnessApp() {
     await bindWorkspaceSelection(selection, nativeWorkspaceRoot);
   }
 
-  function applyAgentPreset(presetId: 'lean' | 'balanced' | 'autonomous') {
+  function applyAgentPreset(presetId: 'lean' | 'balanced' | 'deep_review') {
     const preset = AGENT_PRESETS.find((entry) => entry.id === presetId);
     if (!preset) return;
     setContextBudgetDraft(String(preset.values.contextBudget));
@@ -1641,6 +1665,7 @@ function HarnessApp() {
     setSessionMemoryTurnsDraft(String(preset.values.sessionMemoryTurns));
     setSelfCheckEnabledDraft(preset.values.selfCheckEnabled);
     setInternetAccessDraft(preset.values.internetAccessEnabled);
+    setAdvancedAgentToolsDraft(preset.values.advancedAgentToolsEnabled);
     setStreamIdleTimeoutDraft(String(Math.round(preset.values.streamIdleTimeoutMs / 1000)));
     setSettingsStatus(`${preset.title} preset loaded. Save to apply.`);
   }
@@ -1662,7 +1687,7 @@ function HarnessApp() {
         role: 'user',
         content,
         mode: chatMode,
-        executionMode: isAgentic ? 'agentic' : 'direct',
+        executionMode: isAgentic ? 'agent' : 'chat',
         createdAt: now,
         activity: [],
         toolEvents: [],
@@ -1674,7 +1699,7 @@ function HarnessApp() {
         role: 'assistant',
         content: '',
         mode: chatMode,
-        executionMode: isAgentic ? 'agentic' : 'direct',
+        executionMode: isAgentic ? 'agent' : 'chat',
         createdAt: now + 1,
         activity: [],
         toolEvents: [],
@@ -1707,7 +1732,8 @@ function HarnessApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: requestMessages,
-          agentic: isAgentic,
+          mode: isAgentic ? 'agent' : 'chat',
+          advancedTools: isAgentic && Boolean(config?.advancedAgentToolsEnabled),
           thinking: thinkingEnabled,
           images: attachedImages.map(image => image.base64),
         }),
@@ -1892,7 +1918,9 @@ function HarnessApp() {
               currentTool,
               taskPlan,
               currentStepId,
-              complexity: taskPlan?.complexity || base.complexity,
+              taskIntent: taskPlan?.intent || base.taskIntent,
+              taskStatus: taskPlan?.status || base.taskStatus,
+              sizeEstimate: taskPlan?.sizeEstimate || base.sizeEstimate,
               stepProgress: calculateStepProgress(taskPlan),
               lastStatus,
               isComplete: Boolean(taskPlan?.completedAt) || base.isComplete,
@@ -1957,16 +1985,16 @@ function HarnessApp() {
     const toolRetryMax = Number(toolRetryMaxDraft);
     const sessionMemoryTurns = Number(sessionMemoryTurnsDraft);
     const streamIdleTimeoutSeconds = Number(streamIdleTimeoutDraft);
-    if (!Number.isFinite(contextBudget) || contextBudget < 4000) {
-      setSettingsStatus('Context budget must be at least 4000.');
+    if (!Number.isFinite(contextBudget) || contextBudget < 4000 || contextBudget > 16000) {
+      setSettingsStatus('Context budget must be 4000 to 16000.');
       return;
     }
-    if (!Number.isFinite(toolRetryMax) || toolRetryMax < 0) {
-      setSettingsStatus('Tool retry max must be 0 or greater.');
+    if (!Number.isFinite(toolRetryMax) || toolRetryMax < 0 || toolRetryMax > 2) {
+      setSettingsStatus('Tool retry max must be 0 to 2.');
       return;
     }
-    if (!Number.isFinite(sessionMemoryTurns) || sessionMemoryTurns < 1) {
-      setSettingsStatus('Session memory turns must be at least 1.');
+    if (!Number.isFinite(sessionMemoryTurns) || sessionMemoryTurns < 1 || sessionMemoryTurns > 3) {
+      setSettingsStatus('Session memory turns must be 1 to 3.');
       return;
     }
     if (!Number.isFinite(streamIdleTimeoutSeconds) || streamIdleTimeoutSeconds < 0) {
@@ -1994,6 +2022,7 @@ function HarnessApp() {
           sessionMemoryEnabled: sessionMemoryEnabledDraft,
           sessionMemoryTurns,
           selfCheckEnabled: selfCheckEnabledDraft,
+          advancedAgentToolsEnabled: advancedAgentToolsDraft,
           localModelBudgetProfile: localModelBudgetProfileDraft,
 
           activateModel: shouldActivate,
@@ -2168,7 +2197,37 @@ function HarnessApp() {
             <strong>{shortenText(activeModelLabel, 28)}</strong>
           </div>
           <div className="topbar-badge">
-            <span>{isAgentic ? 'Agent' : 'Direct'}</span>
+            <span>Workspace</span>
+            <strong>{config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 18) : 'None'}</strong>
+          </div>
+          <div className="topbar-badge">
+            <span>Policy</span>
+            <strong>{config?.mode || 'unknown'}</strong>
+          </div>
+          <div className="topbar-badge">
+            <span>Net</span>
+            <strong>{config?.internetAccessEnabled ? 'On' : 'Off'}</strong>
+          </div>
+          <div className="topbar-badge">
+            <span>{isAgentic ? 'Agent Work' : 'Chat'}</span>
+          </div>
+          <div className="topbar-mode-switch" aria-label="Execution mode">
+            <button
+              className={!isAgentic ? 'topbar-mode-option topbar-mode-option-active' : 'topbar-mode-option'}
+              type="button"
+              onClick={() => setIsAgentic(false)}
+              aria-pressed={!isAgentic}
+            >
+              Chat
+            </button>
+            <button
+              className={isAgentic ? 'topbar-mode-option topbar-mode-option-active' : 'topbar-mode-option'}
+              type="button"
+              onClick={() => setIsAgentic(true)}
+              aria-pressed={isAgentic}
+            >
+              Agent Work
+            </button>
           </div>
           {session && (
             <div className="topbar-badge">
@@ -2323,10 +2382,9 @@ function HarnessApp() {
             <div className="command-center-hero">
               <div className="command-center-copy">
                 <span className="command-center-kicker">Harness posture</span>
-                <h1>{isAgentic ? 'Agent loop armed for real work' : 'Direct pair mode for low-friction help'}</h1>
+                <h1>{isAgentic ? 'Agent Work armed for workspace action' : 'Chat Mode for low-friction help'}</h1>
                 <p>
-                  Borrowed carefully from Osaurus and qwe-qwe: visible runtime state, compact memory, retry budget, and verification posture
-                  should stay visible while you work, not buried in logs.
+                  Chat stays lean by default. Agent Work shows workspace, action, checks, blockers, and final result without opening logs.
                 </p>
               </div>
               <div className="command-center-meta">
@@ -2346,11 +2404,12 @@ function HarnessApp() {
             <div className="command-center-grid">
               <div className="command-center-card command-center-card-primary">
                 <span className="command-center-card-label">Agent</span>
-                <strong>{isAgentic ? 'Agent loop' : 'Direct chat'}</strong>
-                <p>{isAgentic ? 'Inspect → act → verify → summarize.' : 'Lean answers without heavy orchestration.'}</p>
+                <strong>{isAgentic ? 'Agent Work' : 'Chat Mode'}</strong>
+                <p>{isAgentic ? 'Inspect, act, verify, summarize.' : 'Lean answers without tool orchestration.'}</p>
                 <div className="command-center-chip-row">
                   <span className="command-center-chip">{thinkingEnabled ? 'Thinking on' : 'Thinking off'}</span>
                   <span className="command-center-chip">{config?.selfCheckEnabled ? 'Self-check on' : 'Self-check off'}</span>
+                  <span className="command-center-chip">{config?.advancedAgentToolsEnabled ? 'Advanced tools on' : 'Basic tools only'}</span>
                 </div>
               </div>
               <div className="command-center-card">
@@ -2400,38 +2459,36 @@ function HarnessApp() {
                 </div>
                 <div className="activity-summary-grid">
                   <div className="activity-summary-item">
-                    <span>Phase</span>
-                    <strong>{plan?.currentPhase || streamStatus || 'ready'}</strong>
+                    <span>Goal</span>
+                    <strong>{plan?.taskPlan?.goal || plan?.taskSummary || 'Awaiting task'}</strong>
                   </div>
                   <div className="activity-summary-item">
-                    <span>Next</span>
-                    <strong>{plan?.intendedNextAction || 'Awaiting input'}</strong>
+                    <span>Now</span>
+                    <strong>{plan?.intendedNextAction || streamStatus || plan?.currentPhase || 'Ready'}</strong>
                   </div>
                   <div className="activity-summary-item">
-                    <span>Current Tool</span>
-                    <strong>{plan?.currentTool || 'None'}</strong>
+                    <span>Files Inspected</span>
+                    <strong>{currentRunSummary?.filesRead?.length ?? 0}</strong>
                   </div>
                   <div className="activity-summary-item">
-                    <span>Tool Protocol</span>
-                    <strong>{plan?.toolProtocol || 'native'}</strong>
+                    <span>Files Changed</span>
+                    <strong>{currentRunSummary?.filesWritten?.length ?? plan?.runSummary?.changedFiles ?? 0}</strong>
                   </div>
                   <div className="activity-summary-item">
-                    <span>Fallback Path</span>
-                    <strong>{plan?.fallbackPath ? formatFallbackPath(plan.fallbackPath) : 'native tools'}</strong>
+                    <span>Checks</span>
+                    <strong>{currentRunSummary?.commands?.length ?? 0}</strong>
                   </div>
-                  {plan?.fallbackReason ? (
-                    <div className="activity-summary-item">
-                      <span>Fallback Reason</span>
-                      <strong>{plan.fallbackReason}</strong>
-                    </div>
-                  ) : null}
+                  <div className="activity-summary-item">
+                    <span>Blocked</span>
+                    <strong>{approvals.length > 0 ? `${approvals.length} approval pending` : plan?.fallbackReason || 'None'}</strong>
+                  </div>
+                  <div className="activity-summary-item">
+                    <span>Result</span>
+                    <strong>{plan?.runSummary?.summary || currentRunSummary?.summary || 'Pending'}</strong>
+                  </div>
                   <div className="activity-summary-item">
                     <span>Workspace</span>
                     <strong>{plan?.workspaceBound === false ? 'Snapshot only' : 'Backend bound'}</strong>
-                  </div>
-                  <div className="activity-summary-item">
-                    <span>Approvals</span>
-                    <strong>{approvals.length > 0 ? `${approvals.length} pending` : 'Clear'}</strong>
                   </div>
                 </div>
               </div>
@@ -2481,50 +2538,7 @@ function HarnessApp() {
                 )}
               </div>
             </section>
-          ) : (
-            <section className="activity-deck">
-              <div className="activity-card activity-card-primary">
-                <div className="command-center-section-head">
-                  <span>Direct Activity</span>
-                  <span>{liveActivityBadge}</span>
-                </div>
-                <div className="activity-summary-grid">
-                  <div className="activity-summary-item">
-                    <span>Phase</span>
-                    <strong>{streamStatus || 'direct'}</strong>
-                  </div>
-                  <div className="activity-summary-item">
-                    <span>Next</span>
-                    <strong>{isSending ? 'Generating direct answer' : 'Ready for direct reply'}</strong>
-                  </div>
-                  <div className="activity-summary-item">
-                    <span>Model</span>
-                    <strong>{shortenText(activeModelLabel, 24)}</strong>
-                  </div>
-                  <div className="activity-summary-item">
-                    <span>Workspace</span>
-                    <strong>{browserSelection && !workspaceSelection ? 'Snapshot only' : config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 24) : 'Not bound'}</strong>
-                  </div>
-                  <div className="activity-summary-item">
-                    <span>Thinking</span>
-                    <strong>{thinkingEnabled ? 'On' : 'Off'}</strong>
-                  </div>
-                  <div className="activity-summary-item">
-                    <span>Memory</span>
-                    <strong>{config?.sessionMemoryEnabled ? `${config.sessionMemoryTurns} turns` : 'Off'}</strong>
-                  </div>
-                  <div className="activity-summary-item">
-                    <span>Policy</span>
-                    <strong>{getPermissionModeSummary(config?.mode)}</strong>
-                  </div>
-                  <div className="activity-summary-item">
-                    <span>Status</span>
-                    <strong>{streamStatus || 'Ready'}</strong>
-                  </div>
-                </div>
-              </div>
-            </section>
-          )}
+          ) : null}
 
           <div className="chat-messages" ref={chatScrollRef}>
             {messages.length === 0 ? (
@@ -2533,14 +2547,14 @@ function HarnessApp() {
                 <h2>Let's build</h2>
                 <p>{config?.workspaceRoot ? getPathBasename(config.workspaceRoot) : 'Pick a workspace or start a thread.'}</p>
                 <div className="chat-welcome-hints">
-                  <button className="hint-chip" onClick={() => { setDraft('Review the codebase and summarize the architecture'); }} type="button">
-                    Review architecture
-                  </button>
-                  <button className="hint-chip" onClick={() => { setDraft('Find and fix potential bugs'); }} type="button">
-                    Find bugs
-                  </button>
-                  <button className="hint-chip" onClick={() => { setDraft('Explain the project structure'); }} type="button">
+                  <button className="hint-chip" onClick={() => { setDraft('What kind of project is this?'); }} type="button">
                     Explain project
+                  </button>
+                  <button className="hint-chip" onClick={() => { setDraft('Inspect package.json and show scripts'); }} type="button">
+                    Show scripts
+                  </button>
+                  <button className="hint-chip" onClick={() => { setDraft('Which workspace folder is open?'); }} type="button">
+                    Workspace status
                   </button>
                 </div>
               </div>
@@ -2647,11 +2661,11 @@ function HarnessApp() {
                   <button
                     className={`composer-toggle ${isAgentic ? 'composer-toggle-active' : ''}`}
                     onClick={() => setIsAgentic(v => !v)}
-                    title={isAgentic ? 'Agentic mode enabled' : 'Direct chat mode enabled'}
+                    title={isAgentic ? 'Agent Work enabled' : 'Chat Mode enabled'}
                     aria-pressed={isAgentic}
                     type="button"
                   >
-                    {isAgentic ? 'Agentic' : 'Direct'}
+                    {isAgentic ? 'Agent Work' : 'Chat'}
                   </button>
                   <button
                     className={`composer-toggle composer-toggle-thinking ${thinkingEnabled ? 'composer-toggle-active' : ''}`}
@@ -2800,7 +2814,11 @@ function HarnessApp() {
                     <div className="settings-info">
                       <div className="settings-info-row">
                         <span>Status</span>
-                        <span>{backendStatus}</span>
+                        <span>{modelRuntimeStatusLabel}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Model State</span>
+                        <span>{modelRuntime?.statusMessage || backendStatus}</span>
                       </div>
                       <div className="settings-info-row">
                         <span>Configured</span>
@@ -2841,6 +2859,10 @@ function HarnessApp() {
                       <div className="settings-info-row">
                         <span>Internet</span>
                         <span>{config?.internetAccessEnabled ? 'Enabled' : 'Disabled'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Advanced Tools</span>
+                        <span>{config?.advancedAgentToolsEnabled ? 'Enabled' : 'Disabled'}</span>
                       </div>
                       <div className="settings-info-row">
                         <span>Stream Stall Limit</span>
@@ -3005,7 +3027,7 @@ function HarnessApp() {
                           value={contextBudgetDraft}
                           onChange={e => setContextBudgetDraft(e.target.value)}
                           inputMode="numeric"
-                          placeholder="24000"
+                          placeholder="16000"
                         />
                       </div>
                       <div className="settings-field">
@@ -3077,6 +3099,14 @@ function HarnessApp() {
                           onChange={e => setInternetAccessDraft(e.target.checked)}
                         />
                         <span>Allow internet tools during agent runs</span>
+                      </label>
+                      <label className="agent-toggle-row">
+                        <input
+                          type="checkbox"
+                          checked={advancedAgentToolsDraft}
+                          onChange={e => setAdvancedAgentToolsDraft(e.target.checked)}
+                        />
+                        <span>Enable Advanced Agent tools</span>
                       </label>
                     </div>
                     <button className="settings-btn" onClick={() => void saveConfig()} type="button">
@@ -3155,7 +3185,9 @@ function HarnessApp() {
                         <div className="settings-info-row"><span>Task</span><span>{plan.taskSummary}</span></div>
                         <div className="settings-info-row"><span>Phase</span><span>{plan.currentPhase}</span></div>
                         <div className="settings-info-row"><span>Next</span><span>{plan.intendedNextAction}</span></div>
-                        <div className="settings-info-row"><span>Complexity</span><span>{plan.complexity || plan.taskPlan?.complexity || 'Unknown'}</span></div>
+                        <div className="settings-info-row"><span>Intent</span><span>{plan.taskIntent || plan.taskPlan?.intent || 'Unknown'}</span></div>
+                        <div className="settings-info-row"><span>Plan Status</span><span>{plan.taskStatus || plan.taskPlan?.status || 'Unknown'}</span></div>
+                        <div className="settings-info-row"><span>Size</span><span>{plan.sizeEstimate || plan.taskPlan?.sizeEstimate || 'Unknown'}</span></div>
                         <div className="settings-info-row"><span>Task Steps</span><span>{plan.stepProgress ? `${plan.stepProgress.completed}/${plan.stepProgress.total}` : plan.taskPlan ? `${plan.taskPlan.steps.filter(step => step.status === 'done').length}/${plan.taskPlan.steps.length}` : 'None'}</span></div>
                         <div className="settings-info-row"><span>Status</span><span>{plan.lastStatus || 'None'}</span></div>
                         <div className="settings-info-row"><span>Workspace</span><span>{plan.workspaceRoot || config?.workspaceRoot || 'Unknown'}</span></div>
@@ -3167,6 +3199,7 @@ function HarnessApp() {
                           <div className="settings-info-row"><span>Fallback Reason</span><span>{plan.fallbackReason}</span></div>
                         ) : null}
                         <div className="settings-info-row"><span>Internet</span><span>{plan.internetAccessEnabled ?? config?.internetAccessEnabled ? 'Enabled' : 'Disabled'}</span></div>
+                        <div className="settings-info-row"><span>Advanced Tools</span><span>{plan.advancedAgentToolsEnabled ?? config?.advancedAgentToolsEnabled ? 'Enabled' : 'Disabled'}</span></div>
                         <div className="settings-info-row"><span>Context Budget</span><span>{plan.contextBudget ?? config?.contextBudget ?? 'Unknown'}</span></div>
                         <div className="settings-info-row"><span>Retry Budget</span><span>{plan.toolRetryMax ?? config?.toolRetryMax ?? 0}</span></div>
                         <div className="settings-info-row"><span>Session Memory</span><span>{plan.sessionMemoryEnabled ?? config?.sessionMemoryEnabled ? `${plan.sessionMemoryTurns ?? config?.sessionMemoryTurns ?? 0} turns` : 'Off'}</span></div>

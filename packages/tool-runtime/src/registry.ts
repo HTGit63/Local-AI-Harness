@@ -282,7 +282,7 @@ async function fetchTextWithTimeout(url: string): Promise<{ text: string; conten
       redirect: 'follow',
       signal: controller.signal as AbortSignal,
       headers: {
-        'User-Agent': 'GammaHarness/1.0 (+local agentic coding harness)',
+        'User-Agent': 'GammaHarness/1.0 (+local coding harness)',
         'Accept': 'text/html, text/plain, application/json;q=0.9, text/markdown;q=0.8, */*;q=0.2',
       },
     });

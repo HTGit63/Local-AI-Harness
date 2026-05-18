@@ -7,13 +7,13 @@ import { ApprovalQueueManager, ApprovalRequestPayload } from '@local-harness/app
 import { ModelAdapter, ModelRuntimeState } from '@local-harness/model-adapter';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
-import { RepoIndexer, ProjectContext, TaskContext } from '@local-harness/repo-indexer';
+import { RepoIndexer, ProjectContext, ProjectInspection, TaskContext } from '@local-harness/repo-indexer';
 import { AgentFallbackPath, AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
-import { LOCAL_MODEL_BUDGET_PROFILES, LocalModelBudgetProfile, TaskOrchestrator, TaskPlan, TaskStep } from '@local-harness/task-orchestrator';
+import { LOCAL_MODEL_BUDGET_PROFILES, LocalModelBudgetProfile, TaskIntent as PlanTaskIntent, TaskOrchestrator, TaskPlan, TaskSizeEstimate, TaskStep, TOOL_PROFILES, ToolProfileName } from '@local-harness/task-orchestrator';
 import { ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
-import { AgentRunBuilder, buildFinalAnswer, summarizeRun } from './agent-run';
+import { AgentRunBuilder, buildFinalAnswer, compactRunSummary, summarizeRun } from './agent-run';
 import { classifyIntent, IntentDecision, TaskIntent } from './intent-classifier';
 // PromptAnalyzer removed — passes messages straight through for lower latency
 
@@ -59,9 +59,10 @@ const execFileAsync = promisify(execFile);
 const DISABLED_SKILL_SLUGS = new Set(['caveman']);
 
 type SupportedTool = (typeof SUPPORTED_TOOLS)[number];
-type TurnExecutionMode = 'direct' | 'agentic';
+type TurnExecutionMode = 'chat' | 'agent';
 type ReasoningEffort = 'high' | 'medium' | 'low' | 'none';
 type LocalModelBudgetProfileName = keyof typeof LOCAL_MODEL_BUDGET_PROFILES;
+type AgentWorkOptions = { signal?: AbortSignal; think?: boolean; advancedTools?: boolean };
 type StreamIdleTimeoutError = Error & {
   code: 'stream_idle_timeout';
   receivedContent: boolean;
@@ -73,6 +74,11 @@ type ImmediateChatAnswer = { content: string; action: string; source: string };
 type ToolProtocolMode = 'native' | 'manual_preferred' | 'manual_fallback';
 type SessionSkillAuditState = NonNullable<SessionMetadata['skillAudit']>;
 type SkillAuditRecord = SessionSkillAuditState['records'][number];
+
+function supportedToolsFromProfile(profile: ToolProfileName): SupportedTool[] {
+  const supported = new Set<string>(SUPPORTED_TOOLS);
+  return TOOL_PROFILES[profile].filter((toolName): toolName is SupportedTool => supported.has(toolName));
+}
 
 interface SkillSelectionResult {
   requested: string[];
@@ -207,6 +213,7 @@ export interface EngineConfig {
   sessionMemoryEnabled: boolean;
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
+  advancedAgentToolsEnabled: boolean;
   localModelBudgetProfile: LocalModelBudgetProfileName;
 }
 
@@ -224,6 +231,7 @@ export interface PublicEngineConfig {
   sessionMemoryEnabled: boolean;
   sessionMemoryTurns: number;
   selfCheckEnabled: boolean;
+  advancedAgentToolsEnabled: boolean;
   localModelBudgetProfile: LocalModelBudgetProfileName;
   localModelBudget: LocalModelBudgetProfile;
 }
@@ -236,17 +244,18 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1',
   apiKey: process.env.OPENAI_API_KEY || 'ollama',
   model: 'gemma4:e4b',
-  profile: 'fast',
+  profile: 'balanced',
   workspaceRoot: process.cwd(),
   mode: 'workspace-write',
   sessionDataDir: '.gamma-harness/sessions',
-  internetAccessEnabled: process.env.HARNESS_INTERNET_ACCESS !== '0',
+  internetAccessEnabled: process.env.HARNESS_INTERNET_ACCESS === '1' || process.env.HARNESS_INTERNET_ACCESS === 'true',
   streamIdleTimeoutMs: Number(process.env.HARNESS_STREAM_IDLE_TIMEOUT_MS || 45000),
-  contextBudget: Number(process.env.HARNESS_CONTEXT_BUDGET || 24000),
+  contextBudget: Number(process.env.HARNESS_CONTEXT_BUDGET || 16000),
   toolRetryMax: Number(process.env.HARNESS_TOOL_RETRY_MAX || 2),
   sessionMemoryEnabled: process.env.HARNESS_SESSION_MEMORY !== '0',
   sessionMemoryTurns: Number(process.env.HARNESS_SESSION_MEMORY_TURNS || 3),
   selfCheckEnabled: process.env.HARNESS_SELF_CHECK !== '0',
+  advancedAgentToolsEnabled: process.env.HARNESS_ADVANCED_AGENT_TOOLS === '1',
   localModelBudgetProfile: (process.env.HARNESS_LOCAL_MODEL_BUDGET_PROFILE as LocalModelBudgetProfileName) || 'balanced',
 };
 
@@ -753,7 +762,10 @@ function buildStepScopedPrompt(taskPlan: TaskPlan, currentStep: TaskStep | null,
   return [
     '[Current Task Plan]',
     `Plan: ${taskPlan.title}`,
-    `Complexity: ${taskPlan.complexity}`,
+    `Intent: ${taskPlan.intent}`,
+    `Status: ${taskPlan.status}`,
+    `Size: ${taskPlan.sizeEstimate}`,
+    `Stop: ${taskPlan.stopCondition}`,
     `Progress: ${taskPlan.steps.map((stepEntry) => `[${stepEntry.status}] ${stepEntry.title}`).join(' | ')}`,
     currentStep ? [
       '[Current Step]',
@@ -804,11 +816,12 @@ export class CoreEngine extends EventEmitter {
     if (!Number.isFinite(this.config.streamIdleTimeoutMs) || this.config.streamIdleTimeoutMs < 0) {
       this.config.streamIdleTimeoutMs = DEFAULT_ENGINE_CONFIG.streamIdleTimeoutMs;
     }
-    this.config.contextBudget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000);
-    this.config.toolRetryMax = normalizeIntegerSetting(this.config.toolRetryMax, DEFAULT_ENGINE_CONFIG.toolRetryMax, 0, 8);
-    this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
+    this.config.contextBudget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000, 16000);
+    this.config.toolRetryMax = normalizeIntegerSetting(this.config.toolRetryMax, DEFAULT_ENGINE_CONFIG.toolRetryMax, 0, 2);
+    this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 3);
     this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
     this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
+    this.config.advancedAgentToolsEnabled = this.config.advancedAgentToolsEnabled === true;
     this.modelAdapter = new ModelAdapter(this.config);
     this.workspacePolicy = new WorkspacePolicy({
       workspaceRoot: this.config.workspaceRoot,
@@ -894,6 +907,7 @@ export class CoreEngine extends EventEmitter {
       sessionMemoryEnabled: this.config.sessionMemoryEnabled,
       sessionMemoryTurns: this.config.sessionMemoryTurns,
       selfCheckEnabled: this.config.selfCheckEnabled,
+      advancedAgentToolsEnabled: this.config.advancedAgentToolsEnabled,
       localModelBudgetProfile: this.config.localModelBudgetProfile,
       localModelBudget: LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile],
     };
@@ -1043,6 +1057,7 @@ export class CoreEngine extends EventEmitter {
       sessionMemoryEnabled: this.config.sessionMemoryEnabled,
       sessionMemoryTurns: this.config.sessionMemoryTurns,
       selfCheckEnabled: this.config.selfCheckEnabled,
+      advancedAgentToolsEnabled: this.config.advancedAgentToolsEnabled,
       skillAudit: this.currentSession?.skillAudit,
     };
   }
@@ -1166,9 +1181,9 @@ export class CoreEngine extends EventEmitter {
       ...config,
       workspaceRoot: config.workspaceRoot ? path.resolve(config.workspaceRoot) : this.config.workspaceRoot,
     };
-    this.config.contextBudget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000);
-    this.config.toolRetryMax = normalizeIntegerSetting(this.config.toolRetryMax, DEFAULT_ENGINE_CONFIG.toolRetryMax, 0, 8);
-    this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 12);
+    this.config.contextBudget = normalizeIntegerSetting(this.config.contextBudget, DEFAULT_ENGINE_CONFIG.contextBudget, 4000, 16000);
+    this.config.toolRetryMax = normalizeIntegerSetting(this.config.toolRetryMax, DEFAULT_ENGINE_CONFIG.toolRetryMax, 0, 2);
+    this.config.sessionMemoryTurns = normalizeIntegerSetting(this.config.sessionMemoryTurns, DEFAULT_ENGINE_CONFIG.sessionMemoryTurns, 1, 3);
     this.config.sessionMemoryEnabled = this.config.sessionMemoryEnabled !== false;
     this.config.selfCheckEnabled = this.config.selfCheckEnabled !== false;
 
@@ -1542,89 +1557,25 @@ export class CoreEngine extends EventEmitter {
     };
   }
 
-  private isProjectHealthInspectionQuestion(latestUserMessage: string): boolean {
+  private isProjectInspectionQuestion(latestUserMessage: string): boolean {
     const normalized = latestUserMessage.toLowerCase();
     const projectTarget = /\b(app|application|codebase|project|repo|repository|site|website|workspace)\b/.test(normalized);
     const asksProjectType = /\b(what kind|what type|kind of project|type of project|what is this project|what kind of app)\b/.test(normalized);
+    const asksStructure = /\b(explain|inspect|look at|summarize|tell me)\b/.test(normalized) && /\b(stack|structure|structured|entry points?|how .* organized)\b/.test(normalized);
     const asksBugReview = /\b(any bugs?|bugs?|broken|issues?|problems?|working at (its )?best)\b/.test(normalized);
-    return projectTarget && (asksProjectType || asksBugReview);
+    return projectTarget && (asksProjectType || asksStructure || asksBugReview);
   }
 
   private async tryAnswerFromLocalProjectInspection(latestUserMessage: string): Promise<ImmediateChatAnswer | null> {
-    if (!this.isProjectHealthInspectionQuestion(latestUserMessage)) {
+    if (!this.isProjectInspectionQuestion(latestUserMessage)) {
       return null;
     }
-
-    const readText = async (relativePath: string): Promise<string | null> => {
-      try {
-        return await fs.readFile(path.join(this.config.workspaceRoot, relativePath), 'utf8');
-      } catch {
-        return null;
-      }
-    };
-
-    const packageRaw = await readText('package.json');
-    let manifest: { name?: unknown; scripts?: Record<string, unknown>; dependencies?: Record<string, unknown>; devDependencies?: Record<string, unknown> } = {};
-    if (packageRaw) {
-      try {
-        manifest = JSON.parse(packageRaw) as typeof manifest;
-      } catch {
-        manifest = {};
-      }
-    }
-    const deps = new Set([
-      ...Object.keys(manifest.dependencies ?? {}),
-      ...Object.keys(manifest.devDependencies ?? {}),
-    ]);
-    const scripts = manifest.scripts ?? {};
-    const entryCandidates = ['server.js', 'app.js', 'index.js', 'main.js', 'src/index.js', 'src/main.js'];
-    const entryReads = await Promise.all(entryCandidates.map(async (entry) => [entry, await readText(entry)] as const));
-    const entry = entryReads.find(([, content]) => Boolean(content));
-    const viewFiles = await fs.readdir(path.join(this.config.workspaceRoot, 'views')).catch(() => [] as string[]);
-    const publicFiles = await fs.readdir(path.join(this.config.workspaceRoot, 'public')).catch(() => [] as string[]);
-
-    const typeSignals: string[] = [];
-    if (deps.has('express')) typeSignals.push('Express server');
-    if (deps.has('ejs')) typeSignals.push('EJS server-rendered views');
-    if (deps.has('bootstrap')) typeSignals.push('Bootstrap styling');
-    if (deps.has('axios')) typeSignals.push('Axios HTTP fetches');
-    if (!typeSignals.length && packageRaw) typeSignals.push('Node.js package');
-
-    const findings: string[] = [];
-    const testScript = typeof scripts.test === 'string' ? scripts.test : '';
-    if (!testScript || /no test specified/i.test(testScript)) {
-      findings.push('No real test script is configured.');
-    }
-    if (!entry) {
-      findings.push('No common server/client entry file found at root.');
-    }
-    if (entry?.[1] && deps.has('axios') && /https?:\/\//.test(entry[1]) && !/process\.env/.test(entry[1])) {
-      findings.push('External API URL appears hard-coded instead of env-configured.');
-    }
-    if (entry?.[1] && /app\.listen\((?:3000|["']3000["'])/.test(entry[1]) && !/process\.env\.PORT/.test(entry[1])) {
-      findings.push('Server port appears hard-coded instead of using process.env.PORT.');
-    }
-    if (!findings.length) {
-      findings.push('No obvious static bug found from manifest and entry-file inspection.');
-    }
-
-    const projectName = typeof manifest.name === 'string' && manifest.name.trim() ? manifest.name.trim() : 'this workspace';
-    const inspected = [
-      packageRaw ? 'package.json' : null,
-      entry ? entry[0] : null,
-      viewFiles.length ? `views (${viewFiles.slice(0, 4).join(', ')})` : null,
-      publicFiles.length ? 'public assets' : null,
-    ].filter((value): value is string => Boolean(value));
-    const answer = [
-      `${projectName} looks like this kind of web app: ${typeSignals.join(' + ')}.`,
-      `Inspected: ${inspected.join(', ') || 'workspace metadata only'}.`,
-      `Potential issues: ${findings.join(' ')}`,
-      'Runtime bugs still need app start/test verification.',
-    ].join('\n');
+    const inspection = await this.inspectProject();
+    const answer = this.formatProjectInspection(inspection);
 
     return {
       content: answer,
-      action: 'Summarizing project type and static bug risks',
+      action: 'Running lightweight project inspection',
       source: 'local_project_inspection',
     };
   }
@@ -1713,101 +1664,105 @@ export class CoreEngine extends EventEmitter {
     return null;
   }
 
-  private selectToolNames(latestUserMessage: string, promptMode: RunMode): SupportedTool[] {
-    if (!this.isWorkspaceQuestion(latestUserMessage, promptMode)) {
-      if (this.shouldIncludeInternetTools(latestUserMessage)) {
-        const selected = new Set<SupportedTool>(['webSearch']);
-        if (extractFirstUrl(latestUserMessage)) {
-          selected.add('fetchUrl');
-        }
-        return SUPPORTED_TOOLS.filter((toolName) => selected.has(toolName));
+  private selectToolNames(
+    latestUserMessage: string,
+    promptMode: RunMode,
+    intentDecision: IntentDecision,
+    advancedToolsEnabled: boolean,
+  ): SupportedTool[] {
+    const selectedInternetTools = (): SupportedTool[] => {
+      if (!advancedToolsEnabled || !this.shouldIncludeInternetTools(latestUserMessage)) {
+        return [];
       }
-      return [];
-    }
+      const selected = new Set<SupportedTool>();
+      selected.add('webSearch');
+      if (extractFirstUrl(latestUserMessage)) {
+        selected.add('fetchUrl');
+      }
+      return SUPPORTED_TOOLS.filter((toolName) => selected.has(toolName));
+    };
 
     if (this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
       return [];
     }
 
+    if (!this.isWorkspaceQuestion(latestUserMessage, promptMode)) {
+      return selectedInternetTools();
+    }
+
+    if (intentDecision.intent === 'inspect_project') {
+      return supportedToolsFromProfile('inspect');
+    }
+
     const normalized = latestUserMessage.toLowerCase();
-    const selected = new Set<SupportedTool>(['readFile', 'listDir']);
+    const selected = new Set<SupportedTool>(supportedToolsFromProfile('inspect'));
 
-    if (/\b(find|glob|list files|which file|where is|files named|pattern|search)\b/.test(normalized)) {
-      selected.add('glob');
+    if (this.shouldIncludeWriteTools(latestUserMessage, promptMode) || intentDecision.intent === 'edit_code') {
+      for (const tool of supportedToolsFromProfile('edit-basic')) {
+        selected.add(tool);
+      }
     }
 
-    if (/\b(find|grep|search|symbol|string|text|where is|references)\b/.test(normalized)) {
-      selected.add('searchText');
-    }
-
-    if (/\b(symbol|function|component|definition|where is|jump to)\b/.test(normalized)) {
-      selected.add('findSymbol');
-      selected.add('findFunction');
-      selected.add('findComponent');
-    }
-
-    if (/\b(imports?|dependency|dependencies|affected files?|who imports|what does.*import)\b/.test(normalized)) {
-      selected.add('whatDoesThisImport');
-      selected.add('whoImports');
-      selected.add('affectedFiles');
-    }
-
-    if (/\b(test selection|select tests|targeted tests|changed files)\b/.test(normalized)) {
-      selected.add('selectTestsForChangedFiles');
-    }
-
-    if (/\b(package manager|project commands|build command|test command|dev command|detect commands)\b/.test(normalized)) {
-      selected.add('detectProjectCommands');
-    }
-
-    if (/\b(context pack|file card|relevance|relevant snippets|context budget)\b/.test(normalized)) {
-      selected.add('buildContextPack');
-    }
-
-    if (this.shouldIncludeWriteTools(latestUserMessage, promptMode)) {
-      selected.add('writeFile');
-      selected.add('patchFile');
-      selected.add('replaceFunction');
-      selected.add('insertImport');
-      selected.add('addTypeProperty');
-      selected.add('renameIdentifier');
-      selected.add('replaceRange');
-      selected.add('insertAfter');
-      selected.add('insertBefore');
-      selected.add('replaceBlock');
-      selected.add('applyUnifiedPatch');
-      selected.add('previewPatch');
-      selected.add('makeDir');
-      selected.add('deleteFile');
-      selected.add('searchText');
-      selected.add('findSymbol');
-      selected.add('findFunction');
-      selected.add('whatDoesThisImport');
-      selected.add('affectedFiles');
-      selected.add('createCheckpoint');
-      selected.add('getStructuredDiff');
-      selected.add('selectTestsForChangedFiles');
-    }
-
-    if (this.shouldIncludeGitTools(latestUserMessage, promptMode)) {
+    if (this.shouldIncludeGitTools(latestUserMessage, promptMode) || intentDecision.intent === 'review_diff') {
       selected.add('gitStatus');
       selected.add('gitDiff');
-      selected.add('getStructuredDiff');
     }
 
-    if (/\b(checkpoint|rollback|roll back|restore checkpoint)\b/.test(normalized)) {
-      selected.add('createCheckpoint');
-      selected.add('rollbackToCheckpoint');
-    }
-
-    if (this.shouldIncludeCommandTool(latestUserMessage)) {
+    if (this.shouldIncludeCommandTool(latestUserMessage) || intentDecision.intent === 'run_command') {
       selected.add('runCommand');
     }
 
-    if (this.shouldIncludeInternetTools(latestUserMessage)) {
-      selected.add('webSearch');
-      if (extractFirstUrl(latestUserMessage)) {
-        selected.add('fetchUrl');
+    if (advancedToolsEnabled) {
+      const advanced = new Set(supportedToolsFromProfile('advanced'));
+
+      if (/\b(find|glob|list files|which file|where is|files named|pattern|search)\b/.test(normalized) && advanced.has('glob')) {
+        selected.add('glob');
+      }
+      if (/\b(symbol|function|component|definition|where is|jump to)\b/.test(normalized)) {
+        for (const tool of ['findSymbol', 'findFunction', 'findComponent'] as const) {
+          if (advanced.has(tool)) selected.add(tool);
+        }
+      }
+      if (/\b(imports?|dependency|dependencies|affected files?|who imports|what does.*import)\b/.test(normalized)) {
+        for (const tool of ['whatDoesThisImport', 'whoImports', 'affectedFiles'] as const) {
+          if (advanced.has(tool)) selected.add(tool);
+        }
+      }
+      if (/\b(test selection|select tests|targeted tests|changed files)\b/.test(normalized) && advanced.has('selectTestsForChangedFiles')) {
+        selected.add('selectTestsForChangedFiles');
+      }
+      if (/\b(package manager|project commands|build command|test command|dev command|detect commands)\b/.test(normalized) && advanced.has('detectProjectCommands')) {
+        selected.add('detectProjectCommands');
+      }
+      if (/\b(context pack|file card|relevance|relevant snippets|context budget)\b/.test(normalized) && advanced.has('buildContextPack')) {
+        selected.add('buildContextPack');
+      }
+      if (this.shouldIncludeWriteTools(latestUserMessage, promptMode)) {
+        for (const tool of [
+          'replaceFunction',
+          'insertImport',
+          'addTypeProperty',
+          'renameIdentifier',
+          'replaceRange',
+          'insertAfter',
+          'insertBefore',
+          'replaceBlock',
+          'applyUnifiedPatch',
+          'previewPatch',
+          'getStructuredDiff',
+          'createCheckpoint',
+          'selectTestsForChangedFiles',
+        ] as const) {
+          if (advanced.has(tool)) selected.add(tool);
+        }
+      }
+      if (/\b(checkpoint|rollback|roll back|restore checkpoint)\b/.test(normalized)) {
+        if (advanced.has('createCheckpoint')) selected.add('createCheckpoint');
+        if (advanced.has('rollbackToCheckpoint')) selected.add('rollbackToCheckpoint');
+      }
+      if (this.shouldIncludeInternetTools(latestUserMessage)) {
+        if (advanced.has('webSearch')) selected.add('webSearch');
+        if (extractFirstUrl(latestUserMessage) && advanced.has('fetchUrl')) selected.add('fetchUrl');
       }
     }
 
@@ -1819,6 +1774,7 @@ export class CoreEngine extends EventEmitter {
 
     switch (intent) {
       case 'workspace_overview':
+      case 'inspect_project':
         selected.push('repo-cartographer');
         break;
       case 'read_file':
@@ -1862,6 +1818,11 @@ export class CoreEngine extends EventEmitter {
         ];
       case 'find_file':
         if (!intentDecision.targetPath) return [];
+        if (!toolNames.includes('glob')) {
+          return toolNames.includes('listDir')
+            ? [{ type: 'tool', title: 'List workspace root', toolName: 'listDir', args: { dirPath: '.' } }]
+            : [];
+        }
         return [
           {
             type: 'tool',
@@ -1925,7 +1886,7 @@ export class CoreEngine extends EventEmitter {
     taskContext: TaskContext | null,
     toolNames: SupportedTool[],
   ): BootstrapPlanStep[] {
-    if (taskPlan.complexity !== 'repo_wide_audit' || !taskContext) {
+    if (taskPlan.intent !== 'full_audit' || !taskContext) {
       return [];
     }
 
@@ -2769,9 +2730,26 @@ export class CoreEngine extends EventEmitter {
       summary: run.summary,
       firstTokenMs: run.metrics?.firstTokenMs,
       totalDurationMs: run.metrics?.totalMs,
-      runSummary: run,
+      runSummary: compactRunSummary(run),
     };
     turnHistory[turnHistory.length - 1] = lastTurn;
+    this.currentSession = {
+      ...this.currentSession,
+      turnHistory,
+    };
+  }
+
+  private updateLatestChatTurnSummary(summary: string, intent = 'chat') {
+    if (!this.currentSession?.turnHistory?.length) {
+      return;
+    }
+
+    const turnHistory = [...this.currentSession.turnHistory];
+    turnHistory[turnHistory.length - 1] = {
+      ...turnHistory[turnHistory.length - 1],
+      intent,
+      summary: summary.slice(0, 900),
+    };
     this.currentSession = {
       ...this.currentSession,
       turnHistory,
@@ -2865,7 +2843,7 @@ export class CoreEngine extends EventEmitter {
     maxChars: number,
     executionMode: TurnExecutionMode,
   ): EngineChatMessage[] {
-    const preserveTail = executionMode === 'direct' ? DIRECT_HISTORY_COMPACTION_TAIL : AGENT_HISTORY_COMPACTION_TAIL;
+    const preserveTail = executionMode === 'chat' ? DIRECT_HISTORY_COMPACTION_TAIL : AGENT_HISTORY_COMPACTION_TAIL;
     return this.compactMessageList(
       messages,
       maxChars,
@@ -3534,11 +3512,44 @@ export class CoreEngine extends EventEmitter {
     return this.repoIndexer.generatePromptInjection(context);
   }
 
+  async inspectProject(): Promise<ProjectInspection> {
+    return this.repoIndexer.inspectProject();
+  }
+
+  private formatProjectInspection(inspection: ProjectInspection): string {
+    const scripts = Object.entries(inspection.packageScripts)
+      .slice(0, 8)
+      .map(([name, command]) => `${name}: ${command}`);
+    return [
+      `Project: ${inspection.projectName}`,
+      `Type: ${inspection.likelyProjectType}`,
+      `Signals: ${inspection.frameworkSignals.length ? inspection.frameworkSignals.join(', ') : 'none detected'}`,
+      `Frontend: ${inspection.frontendSignals.length ? inspection.frontendSignals.join(', ') : 'none detected'}`,
+      `Backend: ${inspection.backendSignals.length ? inspection.backendSignals.join(', ') : 'none detected'}`,
+      `Entry points: ${inspection.mainEntryPoints.length ? inspection.mainEntryPoints.join(', ') : 'none found'}`,
+      `Views/static: ${[...inspection.viewDirectories, ...inspection.staticDirectories].join(', ') || 'none found'}`,
+      `Package manager: ${inspection.packageManager}`,
+      `Scripts: ${scripts.length ? scripts.join('; ') : 'none found'}`,
+      `How to run: ${inspection.howToRun.length ? inspection.howToRun.join('; ') : 'no run script detected'}`,
+      `Missing/weak spots: ${inspection.obviousMissingFiles.length ? inspection.obviousMissingFiles.join('; ') : 'none obvious from lightweight inspection'}`,
+      `Inspected: ${inspection.inspectedFiles.length ? inspection.inspectedFiles.join(', ') : 'metadata only'}`,
+      `Next check: ${inspection.nextRecommendedCheck}`,
+    ].join('\n');
+  }
+
   async chat(messages: ChatMessage[], options?: { signal?: AbortSignal; think?: boolean }): Promise<string> {
     return this.runChat(messages, undefined, options);
   }
 
   async chatStream(messages: ChatMessage[], handlers: ChatStreamHandlers, options?: { signal?: AbortSignal; think?: boolean }): Promise<string> {
+    return this.runChat(messages, handlers, options);
+  }
+
+  async agentWork(messages: ChatMessage[], options?: AgentWorkOptions): Promise<string> {
+    return this.runChat(messages, undefined, options);
+  }
+
+  async agentWorkStream(messages: ChatMessage[], handlers: ChatStreamHandlers, options?: AgentWorkOptions): Promise<string> {
     return this.runChat(messages, handlers, options);
   }
 
@@ -3558,15 +3569,15 @@ export class CoreEngine extends EventEmitter {
     const currentMessages = this.compactConversationMessages(
       messages as EngineChatMessage[],
       Math.max(6_000, Math.floor(this.config.contextBudget * 0.65)),
-      'direct',
+      'chat',
     );
-    await this.recordTurnExecution('direct', {
+    await this.recordTurnExecution('chat', {
       promptMode: 'general',
       messageCount: messages.length,
       thinkingEnabled: options?.think === true,
     });
-    this.planner.setTaskSummary('Intent: direct chat');
-    this.planner.setPhase('direct');
+    this.planner.setTaskSummary('Intent: chat');
+    this.planner.setPhase('chat');
     this.planner.setRuntimeContext({
       ...this.buildPlannerRuntimeContext(),
       workspaceSource: 'backend',
@@ -3575,8 +3586,18 @@ export class CoreEngine extends EventEmitter {
     });
     this.planner.setCurrentTool(undefined);
     this.planner.setIntendedAction('Generating assistant response');
-    this.emitChatStatus(handlers, 'mode', 'Direct chat mode', 0);
-    this.emitChatStatus(handlers, 'model', 'Generating assistant response', 0);
+    this.emitChatStatus(handlers, 'mode', 'Chat Mode', 0);
+
+    const latestUserMessage = this.getLatestUserMessage(messages);
+    const projectInspectionAnswer = await this.tryAnswerFromLocalProjectInspection(latestUserMessage);
+    if (projectInspectionAnswer !== null) {
+      this.completeImmediateResponse(handlers, projectInspectionAnswer);
+      this.updateLatestChatTurnSummary(projectInspectionAnswer.content, projectInspectionAnswer.source);
+      await this.persistCurrentSession();
+      return projectInspectionAnswer.content;
+    }
+
+    this.emitChatStatus(handlers, 'model_loading', 'Model loading or generating response', 0);
     let response = '';
     let continuationCount = 0;
     const directOutputBudget = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile]?.outputBudgetDirect
@@ -3630,7 +3651,7 @@ export class CoreEngine extends EventEmitter {
       this.traceBus.emitEvent({
         type: 'response_continuation_requested',
         data: {
-          executionMode: 'direct',
+          executionMode: 'chat',
           attempt: continuationCount,
           finishReason,
         },
@@ -3638,7 +3659,7 @@ export class CoreEngine extends EventEmitter {
       this.planner.setPhase('continuation');
       this.planner.setIntendedAction('Continuing truncated response');
       this.emitChatStatus(handlers, 'continuation', 'Continuing truncated response', continuationCount);
-      currentMessages.push({ role: 'system', content: this.buildContinuationPrompt('direct') });
+      currentMessages.push({ role: 'system', content: this.buildContinuationPrompt('chat') });
       this.replaceMessageBuffer(
         currentMessages,
         this.compactLoopMessages(currentMessages, Math.max(this.config.contextBudget, 12_000)),
@@ -3648,6 +3669,8 @@ export class CoreEngine extends EventEmitter {
     this.planner.setPhase('ready');
     this.planner.setIntendedAction('Awaiting user input');
     this.emitChatStatus(handlers, 'ready', 'Awaiting user input', continuationCount);
+    this.updateLatestChatTurnSummary(response || 'No assistant response generated.');
+    await this.persistCurrentSession();
     return response;
   }
 
@@ -3918,7 +3941,7 @@ export class CoreEngine extends EventEmitter {
   private async runChat(
     messages: ChatMessage[],
     streamHandlers?: ChatStreamHandlers,
-    options?: { signal?: AbortSignal; think?: boolean },
+    options?: AgentWorkOptions,
   ): Promise<string> {
     if (!this.currentSession) {
       this.startSession();
@@ -3932,7 +3955,7 @@ export class CoreEngine extends EventEmitter {
     const requestMessages = this.compactConversationMessages(
       messages as EngineChatMessage[],
       Math.max(5_000, Math.floor(this.config.contextBudget * 0.55)),
-      'agentic',
+      'agent',
     );
     const intentStartedAt = Date.now();
     const intentDecision = classifyIntent({
@@ -3942,12 +3965,13 @@ export class CoreEngine extends EventEmitter {
     });
     const classificationMs = Date.now() - intentStartedAt;
     const initialRouteModel = this.config.model;
-    const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode) : [];
+    const advancedToolsEnabled = options?.advancedTools === true || this.config.advancedAgentToolsEnabled;
+    const selectedToolNames = workspaceBound ? this.selectToolNames(latestUserMessage, promptMode, intentDecision, advancedToolsEnabled) : [];
     const capabilityRouteModel = this.config.model;
     const modelCapabilities = await this.modelAdapter.getModelCapabilities(capabilityRouteModel);
     const toolProtocol = await this.selectToolProtocol(selectedToolNames, modelCapabilities, capabilityRouteModel);
 
-    await this.recordTurnExecution('agentic', {
+    await this.recordTurnExecution('agent', {
       promptMode,
       messageCount: messages.length,
       thinkingEnabled: options?.think === true,
@@ -3956,7 +3980,7 @@ export class CoreEngine extends EventEmitter {
       id: createRunId(),
       sessionId: this.currentSession!.id,
       startedAt: Date.now(),
-      executionMode: 'agentic',
+      executionMode: 'agent',
       workspaceRoot: this.config.workspaceRoot,
       workspaceSource,
       model: initialRouteModel,
@@ -4010,7 +4034,7 @@ export class CoreEngine extends EventEmitter {
     this.emitChatStatus(
       streamHandlers,
       'mode',
-      workspaceBound ? 'Agentic coding mode' : 'Snapshot-only analysis mode',
+      workspaceBound ? 'Agent Work mode' : 'Snapshot-only analysis mode',
       0,
     );
     this.emitRunStarted(streamHandlers, {
@@ -4021,7 +4045,7 @@ export class CoreEngine extends EventEmitter {
       workspaceBound,
       browserContextActive: browserFolderContextActive,
       workspaceSource,
-      executionMode: 'agentic',
+      executionMode: 'agent',
     });
 
     const classifyStep = runBuilder.startNamedStep('classify', 'Classify request', intentDecision.reasons.join(' '));
@@ -4038,6 +4062,40 @@ export class CoreEngine extends EventEmitter {
         detail: classified.detail,
       });
       this.emitRunStep(streamHandlers, runId, classified);
+    }
+
+    if (intentDecision.intent === 'inspect_project') {
+      this.emitChatStatus(streamHandlers, 'inspection', 'Running lightweight project inspection', 0);
+      const inspection = await this.inspectProject();
+      const answer = this.formatProjectInspection(inspection);
+      this.completeImmediateResponse(streamHandlers, {
+        content: answer,
+        action: 'Running lightweight project inspection',
+        source: 'local_project_inspection',
+      });
+      runBuilder.recordToolMetadata({
+        fileReads: inspection.inspectedFiles.filter((entry) => !entry.endsWith('/')),
+        directoriesRead: inspection.inspectedFiles.filter((entry) => entry.endsWith('/')),
+      });
+      const summary = summarizeRun(runBuilder.snapshot());
+      runBuilder.finalize({
+        finalAnswer: answer,
+        summary,
+      });
+      const completedRun = runBuilder.snapshot();
+      this.updateLatestTurnRunSummary(intentDecision.intent, completedRun);
+      this.planner.setRunSummary({
+        id: completedRun.id,
+        summary: completedRun.summary,
+        changedFiles: 0,
+        addedLines: 0,
+        removedLines: 0,
+      });
+      this.emitRunMetric(streamHandlers, runId, completedRun);
+      this.emitRunSummary(streamHandlers, runId, completedRun);
+      await this.persistCurrentSession();
+      this.autoCheckpointRuns.delete(runId);
+      return buildFinalAnswer(answer, completedRun);
     }
 
     let loopCount = 0;
@@ -4100,6 +4158,7 @@ export class CoreEngine extends EventEmitter {
 	      userRequest: latestUserMessage,
 	      intent: intentDecision.intent,
 	      workspaceRoot: this.config.workspaceRoot,
+	      mode: 'agent',
 	      knownFiles: [],
 	    });
 	    let currentTaskStep: TaskStep | null = null;
@@ -4204,7 +4263,8 @@ export class CoreEngine extends EventEmitter {
       ? await this.repoIndexer.buildTaskContext({
           userRequest: latestUserMessage,
           intent: intentDecision.intent,
-          complexity: taskPlan.complexity,
+          taskIntent: taskPlan.intent,
+          sizeEstimate: taskPlan.sizeEstimate,
         }).catch(() => null)
       : null;
     await persistCheckpoint();
@@ -4278,7 +4338,7 @@ export class CoreEngine extends EventEmitter {
         return await finalizeRun(localRepoOverviewAnswer.content);
       }
 
-      const useStepScopedContext = ['multi_file', 'architecture_change', 'repo_wide_audit'].includes(taskPlan.complexity);
+      const useStepScopedContext = taskPlan.intent === 'edit_file' || taskPlan.intent === 'full_audit' || taskPlan.sizeEstimate !== 'small';
       const includeWorkspaceContext = workspaceBound && this.isWorkspaceQuestion(latestUserMessage, promptMode);
       const includeRepoContext = workspaceBound && !useStepScopedContext && this.shouldIncludeRepoContext(latestUserMessage, promptMode);
       const rootManifestAnswer = workspaceBound && !['workspace_overview', 'review_diff', 'find_file', 'read_file', 'search_text'].includes(intentDecision.intent)
@@ -4354,9 +4414,11 @@ export class CoreEngine extends EventEmitter {
       this.traceBus.emitEvent({
         type: 'chat_execution_plan',
         data: {
-          executionMode: 'agentic',
+          executionMode: 'agent',
           promptMode,
           toolNames: selectedToolNames,
+          toolProfile: advancedToolsEnabled ? 'advanced' : 'basic',
+          advancedToolsEnabled,
           nativeTools: Boolean(nativeToolDefinitions),
           manualToolProtocol,
           toolProtocolMode: toolProtocol.mode,
@@ -4410,8 +4472,12 @@ export class CoreEngine extends EventEmitter {
           `Workspace source: ${workspaceSource}`,
           `Workspace bound: ${workspaceBound ? 'yes' : 'no'}`,
           `Available tools: ${selectedToolNames.length > 0 ? selectedToolNames.join(', ') : 'none'}`,
+          `Tool profile: ${advancedToolsEnabled ? 'advanced' : 'basic'}`,
           `Tool protocol: ${manualToolProtocol ? 'manual' : 'native'}`,
-          `Task complexity: ${taskPlan.complexity}`,
+          `Task intent: ${taskPlan.intent}`,
+          `Task size: ${taskPlan.sizeEstimate}`,
+          `Task status: ${taskPlan.status}`,
+          `Stop condition: ${taskPlan.stopCondition}`,
           `Local budget profile: ${this.config.localModelBudgetProfile}`,
           `Context budget: ${LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile].contextBudget} tokens target`,
           `Output budget for this step: ${maxTokens}`,
@@ -4419,8 +4485,8 @@ export class CoreEngine extends EventEmitter {
           `Session memory: ${this.config.sessionMemoryEnabled ? `${this.config.sessionMemoryTurns} recent turns` : 'off'}`,
           `Self-check: ${this.config.selfCheckEnabled ? 'required after edits or commands' : 'off'}`,
           'If workspace tools are available and the request is about repo behavior, inspect workspace facts before asking the user for more detail.',
-          'Agentic loop: use deterministic tools first, read minimal files, create checkpoint before edits, patch minimal code, get structured diff, run selected tests only, then summarize exact files and verification.',
-          'Do not read the whole repo unless the current task is repo_wide_audit. Do not rewrite full files unnecessarily. Do not run full build before targeted checks unless needed. Do not continue after budget exceeded.',
+          'Agent Work loop: use deterministic tools first, read minimal files, create checkpoint before edits, patch minimal code, get structured diff, run selected tests only, then summarize exact files and verification.',
+          'Do not read the whole repo unless the current task intent is full_audit. Do not rewrite full files unnecessarily. Do not run full build before targeted checks unless needed. Do not continue after budget exceeded.',
           'For complex tasks, do not solve the whole project in one response. Work only the current task step.',
           'Never simulate tool execution or file changes.',
           'Finish with concise answer, What I did, and Files changed.',
@@ -4474,7 +4540,7 @@ export class CoreEngine extends EventEmitter {
         : intentDecision.intent === 'run_command'
           ? 4
           : 3;
-      const MAX_LOOPS = Math.min(budgetProfile.maxModelCallsPerRun, taskPlan.complexity === 'architecture_change' ? Math.max(maxLoopTarget, 6) : maxLoopTarget);
+      const MAX_LOOPS = Math.min(budgetProfile.maxModelCallsPerRun, taskPlan.sizeEstimate === 'large' ? Math.max(maxLoopTarget, 6) : maxLoopTarget);
       let manualProtocolCorrectionCount = 0;
       let planningOnlyNativeRetryCount = 0;
       let simulatedToolReplyCount = 0;
@@ -4960,7 +5026,7 @@ export class CoreEngine extends EventEmitter {
             type: 'response_continuation_requested',
             data: {
               runId,
-              executionMode: 'agentic',
+              executionMode: 'agent',
               attempt: responseContinuationCount,
               finishReason,
             },
@@ -4971,7 +5037,7 @@ export class CoreEngine extends EventEmitter {
           this.emitChatStatus(streamHandlers, 'continuation', 'Continuing truncated response', loopCount);
           currentMessages.push({
             role: 'system',
-            content: this.buildContinuationPrompt('agentic'),
+            content: this.buildContinuationPrompt('agent'),
           });
           continue;
         }
@@ -5330,8 +5396,8 @@ export class CoreEngine extends EventEmitter {
       this.planner.failRun(limitWarning);
       return await finalizeRun(limitWarning, limitWarning);
     } catch (error: any) {
-      await failCurrentTaskStep(error?.message || 'Agentic run failed.');
-      this.planner.failRun(error?.message || 'Agentic run failed.');
+      await failCurrentTaskStep(error?.message || 'Agent Work run failed.');
+      this.planner.failRun(error?.message || 'Agent Work run failed.');
       throw error;
     } finally {
       this.traceBus.off('trace', traceListener);

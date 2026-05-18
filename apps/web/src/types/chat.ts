@@ -1,5 +1,5 @@
 export type ChatRole = 'user' | 'assistant';
-export type ExecutionMode = 'direct' | 'agentic';
+export type ExecutionMode = 'chat' | 'agent';
 
 export interface ChatStreamStatusEvent {
   type: 'status';
