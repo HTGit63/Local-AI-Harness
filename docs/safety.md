@@ -1,37 +1,47 @@
 # Safety Model
 
-## Core Principle
+## Core Rule
 
-The harness never silently writes broad changes. Every mutative action passes through a policy check and, when required, an explicit human approval gate.
+The harness must show every file change, command, approval, verification result, and runtime error. It must not simulate tool results or claim checks passed unless they ran.
 
-## Workspace Modes
+## Permission Modes
 
-| Mode | Reads | Writes | Deletes | Shell |
-|---|---|---|---|---|
-| `read-only` | ✅ | ❌ | ❌ | ❌ |
-| `workspace-write` | ✅ | ✅ (in workspace) | ⚠️ Approval | ⚠️ Approval |
-| `danger` | ✅ | ✅ (anywhere) | ✅ | ✅ |
+| Mode | Reads | Edits | Deletes | Shell | Model Required |
+|---|---|---|---|---|---|
+| `chat` | Selected context only | No | No | No | Yes |
+| `inspect` | Deterministic read/search/git | No | No | Safe read-only only | No |
+| `plan` | AI may inspect evidence | No | No | No destructive commands | Yes |
+| `trusted-edit` | Yes | Scoped in workspace | Approval | Safe verification allowlist | Optional |
+| `full-agent` | Yes | With visible plan/diff | Approval | Approval unless safe verification | Yes |
+| `danger-sandbox` | Yes | Workspace only | No repeated prompt | No repeated prompt | Optional |
 
-`danger` mode is **disabled by default** and requires explicit opt-in.
+Legacy aliases `read-only`, `workspace-write`, and `danger` are still accepted internally for compatibility.
 
-## Denied Actions
+## Hard Denials
 
-- Writes outside workspace root in `workspace-write` mode → **hard denied**
-- File deletions → **require approval**
-- Multi-file writes → **require approval**
-- New file creation → **warning shown**
-- Shell command execution → **require approval**
+These are denied even in danger-style modes unless the product is explicitly reconfigured:
 
-## Visibility Over Secrecy
+- Paths outside the workspace root.
+- Protected files such as `.env`, `.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_ed25519`, `secrets.*`, and `credentials.*`.
+- Hidden writes or edits that skip diff visibility.
 
-The system shows:
-- Current plan phase, not raw chain-of-thought
-- Tool name and input summary
-- Tool output summary
-- File diffs before acceptance
-- Concise rationale blocks
+## Approval Rules
 
-The system never shows:
-- Giant verbose thought dumps
-- Fake "thinking" without operational content
-- Hidden file edits
+- Inspect and Plan cannot edit.
+- Trusted Edit can make small in-workspace edits to non-protected files with fewer prompts.
+- Delete, broad move/copy, installs, deploys, pushes, migrations, network operations, and protected-path access still require approval or are denied.
+- Full Agent must show plan, files changed, diff, and verification status.
+
+## Verification
+
+Safe verification commands may run without repeated approval in trusted modes:
+
+- `npm test`, `npm t`, and safe `npm run` scripts such as build/test/lint/typecheck/check.
+- Equivalent safe `pnpm` and `yarn` scripts.
+- `tsc --noEmit`, `tsc -b`, `vitest`, `jest`, `pytest`, and direct `node` execution of test/spec files.
+
+Verification states are explicit: `not-run`, `running`, `passed`, `failed`, or `skipped`.
+
+## Project Memory
+
+Memory is small, structured, visible, editable, and deletable. It stores project facts such as package manager, commands, main folders, rules, and last runtime config. It must not store full prompts, traces, diffs, file contents, or raw model thoughts.

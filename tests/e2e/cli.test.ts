@@ -36,8 +36,9 @@ function runCli(args: string[]): Promise<string> {
 async function testConfigShow() {
   const output = await runCli(['config', 'show', '--json']);
   const config = JSON.parse(output);
+  assert.strictEqual(config.provider, 'llamacpp');
   assert.strictEqual(config.model, 'gemma4:e4b');
-  assert.ok(config.baseUrl.includes('11434'));
+  assert.ok(config.baseUrl.includes('8080'));
 }
 
 async function testHelp() {

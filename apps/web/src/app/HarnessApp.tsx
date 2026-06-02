@@ -32,6 +32,8 @@ type ConversationMode = 'general' | 'architecture' | 'data-analysis' | 'code-rev
 type BackendStatus = 'ok' | 'degraded' | 'offline';
 type SettingsTab = 'connection' | 'workspace' | 'sessions' | 'activity' | 'agent';
 type ExecutionMode = 'chat' | 'agent';
+type UserMode = 'chat' | 'inspect' | 'plan' | 'trusted-edit' | 'full-agent' | 'danger-sandbox';
+type RuntimeProvider = 'llamacpp' | 'ollama-legacy' | 'openai-compatible';
 type FallbackPath = 'native_tools' | 'native_retry' | 'manual_fallback' | 'manual_repair' | 'final_noop_warning';
 
 interface ChatToolEvent {
@@ -69,6 +71,7 @@ interface ComposerImageAttachment extends MessageImageAttachment {
 }
 
 interface ConfigState {
+  provider: RuntimeProvider;
   baseUrl: string;
   model: string;
   profile: string;
@@ -95,6 +98,16 @@ interface ConfigState {
     maxToolCallsPerRun: number;
   };
 
+}
+
+interface ToolApiResponse {
+  success: boolean;
+  output: string;
+  error?: string;
+  metadata?: {
+    durationMs?: number;
+    truncated?: boolean;
+  };
 }
 
 interface SessionState {
@@ -289,6 +302,8 @@ interface ModelLifecyclePolicy {
 }
 
 interface ModelRuntimeState {
+  provider: RuntimeProvider;
+  baseUrl: string;
   configuredModel: string;
   activeModel: string | null;
   runtimeStatus?: 'ready' | 'idle' | 'configured_not_loaded' | 'unavailable';
@@ -320,6 +335,26 @@ interface RepoContext {
   readmes: Record<string, string>;
   entryPoints: string[];
   summary: string;
+}
+
+interface ProjectMemory {
+  projectName?: string;
+  workspaceRoot: string;
+  packageManager?: string;
+  runCommands: string[];
+  testCommands: string[];
+  mainFolders: string[];
+  entryPoints: string[];
+  userPreferences: string[];
+  rules: string[];
+  lastRuntimeConfig: {
+    provider: RuntimeProvider;
+    baseUrl: string;
+    model: string;
+    profile: string;
+  };
+  createdAt: number;
+  updatedAt: number;
 }
 
 interface AgentRunStep {
@@ -432,8 +467,8 @@ type ChatStreamEvent =
   | { type: 'command_policy_checked'; data: { command: string; allowed: boolean; approvalRequired: boolean; policyMode: string; status: string; reason?: string; workspaceRoot: string; shellOperatorsAllowed: boolean }; id?: string; timestamp?: number }
   | { type: 'tool_call_started'; data: { runId?: string; tool: string; inputSummary: string }; id?: string; timestamp?: number }
   | { type: 'tool_call_completed'; data: { runId?: string; tool: string; success: boolean; outputPreview: string }; id?: string; timestamp?: number }
-  | { type: 'verification_started'; data: { runId: string; command?: string }; id?: string; timestamp?: number }
-  | { type: 'verification_completed'; data: { runId: string; success: boolean; outputPreview: string }; id?: string; timestamp?: number }
+  | { type: 'verification_started'; data: { runId: string; command?: string; status?: string }; id?: string; timestamp?: number }
+  | { type: 'verification_completed'; data: { runId: string; success: boolean; status?: 'passed' | 'failed' | 'skipped' | 'not-run'; outputPreview: string }; id?: string; timestamp?: number }
   | { type: 'manual_tool_fallback'; data: { model: string; routedModel?: string; reason?: string; manualToolProtocol?: boolean; selectedTools?: string[]; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
   | { type: 'manual_tool_strategy_selected'; data: { model: string; routedModel?: string; reason?: string; manualToolProtocol?: boolean; selectedTools?: string[]; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
   | { type: 'native_tool_retry_requested'; data: { model: string; reason?: string; promptMode?: string; attempt?: number; selectedTools?: string[]; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
@@ -473,6 +508,15 @@ const CHAT_MODES: Array<{ id: ConversationMode; label: string }> = [
   { id: 'data-analysis', label: 'Data Analysis' },
   { id: 'code-review', label: 'Code Review' },
   { id: 'implementation', label: 'Implementation' },
+];
+
+const USER_MODES: Array<{ id: UserMode; label: string; note: string }> = [
+  { id: 'chat', label: 'Chat', note: 'No tools by default.' },
+  { id: 'inspect', label: 'Inspect', note: 'Deterministic read/search/git only.' },
+  { id: 'plan', label: 'Plan', note: 'AI can inspect and propose. No edits.' },
+  { id: 'trusted-edit', label: 'Trusted Edit', note: 'Scoped edits with fewer prompts.' },
+  { id: 'full-agent', label: 'Full Agent', note: 'Plan, edit, verify, summarize.' },
+  { id: 'danger-sandbox', label: 'Danger Sandbox', note: 'Dev sandbox only. Workspace boundary remains.' },
 ];
 
 const SETTINGS_TABS: Array<{ id: SettingsTab; label: string }> = [
@@ -545,6 +589,40 @@ function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     }
     return res.json() as Promise<T>;
   });
+}
+
+function isUserMode(value: string | null | undefined): value is UserMode {
+  return Boolean(value && USER_MODES.some((mode) => mode.id === value));
+}
+
+function modeToExecutionMode(mode: UserMode): ExecutionMode {
+  return mode === 'chat' || mode === 'inspect' ? 'chat' : 'agent';
+}
+
+function modeToPolicyMode(mode: UserMode): string {
+  return mode;
+}
+
+function modeFromPolicyMode(mode: string | undefined): UserMode {
+  if (isUserMode(mode)) return mode;
+  switch (mode) {
+    case 'read-only':
+      return 'inspect';
+    case 'workspace-write':
+      return 'full-agent';
+    case 'danger':
+      return 'danger-sandbox';
+    default:
+      return 'chat';
+  }
+}
+
+function getUserModeLabel(mode: UserMode): string {
+  return USER_MODES.find((entry) => entry.id === mode)?.label || 'Chat';
+}
+
+function getUserModeNote(mode: UserMode): string {
+  return USER_MODES.find((entry) => entry.id === mode)?.note || '';
 }
 
 function parseStructuredDiffResponse(response: { output?: string; metadata?: { structuredDiff?: StructuredDiff } }): StructuredDiff | null {
@@ -744,12 +822,23 @@ function patchTaskStep(taskPlan: TaskPlan | undefined, step: TaskPlan['steps'][n
 
 function getPermissionModeSummary(mode: string | undefined): string {
   switch (mode) {
+    case 'chat':
+      return 'Chat only. No repo tools by default.';
+    case 'inspect':
     case 'read-only':
-      return 'Reads only. Writes, deletes, and commands denied.';
+      return 'Deterministic reads/search/git only. Edits denied.';
+    case 'plan':
+      return 'AI may inspect and propose. Edits denied.';
+    case 'trusted-edit':
+      return 'Small in-workspace edits allowed. Deletes, installs, network, and secrets guarded.';
+    case 'full-agent':
+    case 'workspace-write':
+      return 'Plan, edit, verify. Writes show diff; risky actions require approval.';
+    case 'danger-sandbox':
     case 'danger':
-      return 'No approvals inside workspace. Outside-workspace actions still denied.';
+      return 'Dev sandbox mode. Outside-workspace and protected paths still guarded.';
     default:
-      return 'Writes preview + approval. Deletes and commands require approval.';
+      return 'Mode unknown.';
   }
 }
 
@@ -1244,19 +1333,27 @@ function HarnessApp() {
   const [repoContext, setRepoContext] = useState<RepoContext | null>(null);
   const [gitDiff, setGitDiff] = useState('');
   const [structuredDiff, setStructuredDiff] = useState<StructuredDiff | null>(null);
+  const [projectMemory, setProjectMemory] = useState<ProjectMemory | null>(null);
+  const [projectMemoryDraft, setProjectMemoryDraft] = useState('');
+  const [projectMemoryStatus, setProjectMemoryStatus] = useState('');
+  const [workspaceSearchQuery, setWorkspaceSearchQuery] = useState('');
+  const [workspaceToolOutput, setWorkspaceToolOutput] = useState('');
+  const [workspaceToolTitle, setWorkspaceToolTitle] = useState('Workspace Tools');
+  const [workspaceToolBusy, setWorkspaceToolBusy] = useState(false);
 
   // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [chatMode, setChatMode] = useState<ConversationMode>('general');
-  const [isAgentic, setIsAgentic] = useState(() => {
-    if (typeof window === 'undefined') return false;
+  const [userMode, setUserMode] = useState<UserMode>(() => {
+    if (typeof window === 'undefined') return 'chat';
     const stored = window.localStorage.getItem(MODE_STORAGE_KEY);
-    if (stored === 'agent') return true;
-    if (stored === 'chat') return false;
+    if (isUserMode(stored)) return stored;
+    if (stored === 'agent') return 'full-agent';
+    if (stored === 'chat') return 'chat';
     const legacy = window.localStorage.getItem(LEGACY_AGENTIC_STORAGE_KEY);
-    return legacy === 'true';
+    return legacy === 'true' ? 'full-agent' : 'chat';
   });
   const [thinkingEnabled, setThinkingEnabled] = useState(() => {
     if (typeof window === 'undefined') return false;
@@ -1277,9 +1374,10 @@ function HarnessApp() {
 
   // Settings drafts
   const [baseUrlDraft, setBaseUrlDraft] = useState('');
+  const [providerDraft, setProviderDraft] = useState<RuntimeProvider>('llamacpp');
   const [modelDraft, setModelDraft] = useState('');
   const [profileDraft, setProfileDraft] = useState('balanced');
-  const [modeDraft, setModeDraft] = useState('workspace-write');
+  const [modeDraft, setModeDraft] = useState('chat');
   const [workspaceRootDraft, setWorkspaceRootDraft] = useState('');
   const [internetAccessDraft, setInternetAccessDraft] = useState(false);
   const [streamIdleTimeoutDraft, setStreamIdleTimeoutDraft] = useState('45');
@@ -1394,6 +1492,10 @@ function HarnessApp() {
   const skillAudit = session?.skillAudit ?? plan?.skillAudit;
   const filteredSkillAudit = skillAudit?.records.filter((entry) => entry.status === 'filtered') ?? [];
   const missingSkillAudit = skillAudit?.records.filter((entry) => entry.status === 'missing') ?? [];
+  const executionMode = modeToExecutionMode(userMode);
+  const isAgentic = executionMode === 'agent';
+  const userModeLabel = getUserModeLabel(userMode);
+  const userModeNote = getUserModeNote(userMode);
   const showAgentWorkbench = isAgentic;
 
   /* ─── Refresh dashboard data ─── */
@@ -1446,6 +1548,7 @@ function HarnessApp() {
         if (cfg) {
           const sig = JSON.stringify({
             workspaceRoot: cfg.workspaceRoot,
+            provider: cfg.provider,
             baseUrl: cfg.baseUrl,
             model: cfg.model,
             profile: cfg.profile,
@@ -1464,10 +1567,12 @@ function HarnessApp() {
           if (sig !== lastConfigSigRef.current) {
             lastConfigSigRef.current = sig;
             setWorkspaceRootDraft(cfg.workspaceRoot);
+            setProviderDraft(cfg.provider);
             setBaseUrlDraft(cfg.baseUrl);
             setModelDraft(cfg.model);
             setProfileDraft(cfg.profile);
-            setModeDraft(cfg.mode);
+            setModeDraft(modeFromPolicyMode(cfg.mode));
+            setUserMode(modeFromPolicyMode(cfg.mode));
             setInternetAccessDraft(cfg.internetAccessEnabled);
             setStreamIdleTimeoutDraft(String(Math.round(cfg.streamIdleTimeoutMs / 1000)));
             setContextBudgetDraft(String(cfg.contextBudget));
@@ -1496,7 +1601,7 @@ function HarnessApp() {
         return;
       }
 
-      const [health, cfg, tr, ap, pl, mrt, sess, sessList, sk] = await Promise.all([
+      const [health, cfg, tr, ap, pl, mrt, sess, sessList, sk, memory] = await Promise.all([
         safe<{ status: BackendStatus }>(`${API}/health`, { status: 'offline' }),
         safe<ConfigState | null>(`${API}/config`, null),
         safe<TraceEntry[]>(traceUrl, []),
@@ -1506,11 +1611,16 @@ function HarnessApp() {
         safe<SessionState | null>(`${API}/session`, null),
         safe<SessionState[]>(`${API}/sessions`, []),
         safe<SkillMetadata[]>(`${API}/skills`, []),
+        safe<ProjectMemory | null>(`${API}/project-memory`, null),
       ]);
 
       applyCoreState(health, cfg, tr, ap, pl, mrt, sess);
       setSessions(sessList);
       setSkills(sk);
+      if (memory) {
+        setProjectMemory(memory);
+        setProjectMemoryDraft(JSON.stringify(memory, null, 2));
+      }
 
       if (includeHeavy) {
         const [repo, diff, structured] = await Promise.all([
@@ -1567,12 +1677,12 @@ function HarnessApp() {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(MODE_STORAGE_KEY, isAgentic ? 'agent' : 'chat');
+      window.localStorage.setItem(MODE_STORAGE_KEY, userMode);
       window.localStorage.removeItem(LEGACY_AGENTIC_STORAGE_KEY);
     } catch {
       // ignore storage errors
     }
-  }, [isAgentic]);
+  }, [userMode]);
 
   useEffect(() => {
     try {
@@ -1670,6 +1780,79 @@ function HarnessApp() {
     setSettingsStatus(`${preset.title} preset loaded. Save to apply.`);
   }
 
+  async function selectUserMode(nextMode: UserMode) {
+    setUserMode(nextMode);
+    const nextPolicyMode = modeToPolicyMode(nextMode);
+    setModeDraft(nextPolicyMode);
+    if (!config || config.mode === nextPolicyMode) {
+      return;
+    }
+
+    try {
+      await fetchJson<ConfigState>(`${API}/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: nextPolicyMode }),
+      });
+      await refreshDashboard('live');
+    } catch (error) {
+      setSettingsStatus(`Mode switch failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  async function answerInspectRequest(content: string): Promise<{ response: string; activity: string[] }> {
+    const normalized = content.toLowerCase();
+    const withTiming = (label: string, result: ToolApiResponse) => ({
+      response: result.success ? result.output : `Inspect failed: ${result.output || result.error || 'Unknown error'}`,
+      activity: [`${label}${typeof result.metadata?.durationMs === 'number' ? ` (${result.metadata.durationMs}ms)` : ''}`],
+    });
+
+    if (attachedImages.length > 0) {
+      return {
+        response: 'Inspect Mode is model-free and does not send image attachments. Use Chat, Plan, or Full Agent for model reasoning.',
+        activity: ['Blocked model-only attachment in Inspect Mode'],
+      };
+    }
+
+    if (/\bgit status\b/.test(normalized) || (/\bgit\b/.test(normalized) && /\bstatus\b/.test(normalized))) {
+      return withTiming('gitStatus', await fetchJson<ToolApiResponse>(`${API}/workspace/git/status`));
+    }
+    if (/\bgit diff\b/.test(normalized) || (/\bgit\b/.test(normalized) && /\bdiff\b/.test(normalized))) {
+      return withTiming('gitDiff', await fetchJson<ToolApiResponse>(`${API}/workspace/git/diff`));
+    }
+    if (/\b(package scripts?|scripts?|commands?)\b/.test(normalized)) {
+      return withTiming('readPackageScripts', await fetchJson<ToolApiResponse>(`${API}/workspace/project/commands`));
+    }
+    if (/\b(model|runtime)\b/.test(normalized) && /\b(status|state|loaded|active|server)\b/.test(normalized)) {
+      const runtime = await fetchJson<ModelRuntimeState>(`${API}/model/runtime`);
+      return {
+        response: JSON.stringify(runtime, null, 2),
+        activity: ['getModelRuntimeStatus'],
+      };
+    }
+    if (/\b(list|show|open)\b/.test(normalized) && /\b(files?|folders?|directories|workspace|root)\b/.test(normalized)) {
+      return withTiming('listDir', await fetchJson<ToolApiResponse>(`${API}/workspace/list?path=.`));
+    }
+
+    const searchMatch = content.match(/\b(?:search|grep|find text|look for|find)\b\s+(.+)$/i);
+    if (searchMatch?.[1]) {
+      const query = encodeURIComponent(searchMatch[1].replace(/^["']|["']$/g, '').trim());
+      return withTiming('searchText', await fetchJson<ToolApiResponse>(`${API}/workspace/search?q=${query}`));
+    }
+
+    const fileMatch = content.match(/(?:read|open|show)\s+([A-Za-z0-9_./@-]+\.[A-Za-z0-9]+)/i);
+    const selectedPath = workspacePreview?.path || browserPreview?.path || '';
+    const readPath = fileMatch?.[1] || (/\b(selected|current) file\b/.test(normalized) ? selectedPath : '');
+    if (readPath) {
+      return withTiming('readFile', await fetchJson<ToolApiResponse>(`${API}/workspace/file?path=${encodeURIComponent(readPath)}`));
+    }
+
+    return {
+      response: 'Inspect Mode is model-free. Use Project Explorer, File Viewer, Search, Git panels, or ask for: list files, read <path>, search <text>, git status, git diff, package scripts, or runtime status.',
+      activity: ['No model call made'],
+    };
+  }
+
   /* ─── Chat ─── */
   async function sendChat() {
     const content = draft.trim();
@@ -1687,7 +1870,7 @@ function HarnessApp() {
         role: 'user',
         content,
         mode: chatMode,
-        executionMode: isAgentic ? 'agent' : 'chat',
+        executionMode,
         createdAt: now,
         activity: [],
         toolEvents: [],
@@ -1699,13 +1882,26 @@ function HarnessApp() {
         role: 'assistant',
         content: '',
         mode: chatMode,
-        executionMode: isAgentic ? 'agent' : 'chat',
+        executionMode,
         createdAt: now + 1,
         activity: [],
         toolEvents: [],
         status: 'sending',
       };
       placeholderId = placeholder.id;
+      setMessages(cur => [...cur, userMsg, placeholder]);
+      setDraft('');
+
+      if (userMode === 'inspect') {
+        const inspect = await answerInspectRequest(content);
+        setMessages(cur => cur.map(m => (
+          m.id === placeholderId
+            ? { ...m, content: inspect.response, activity: inspect.activity, status: 'sent' }
+            : m
+        )));
+        return;
+      }
+
       const browserContext = buildBrowserContextMessage(browserSelection, browserPreview);
       const prompt = buildSystemPrompt(chatMode, {
         workspace: config?.workspaceRoot,
@@ -1720,8 +1916,6 @@ function HarnessApp() {
         ...messages.map(m => ({ role: m.role, content: m.content })),
         { role: 'user' as const, content },
       ];
-      setMessages(cur => [...cur, userMsg, placeholder]);
-      setDraft('');
       const requestMessages = [
         { role: 'system' as const, content: prompt },
         ...(browserContext ? [{ role: 'system' as const, content: browserContext }] : []),
@@ -1732,8 +1926,8 @@ function HarnessApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: requestMessages,
-          mode: isAgentic ? 'agent' : 'chat',
-          advancedTools: isAgentic && Boolean(config?.advancedAgentToolsEnabled),
+          mode: executionMode,
+          advancedTools: executionMode === 'agent' && Boolean(config?.advancedAgentToolsEnabled),
           thinking: thinkingEnabled,
           images: attachedImages.map(image => image.base64),
         }),
@@ -2011,6 +2205,7 @@ function HarnessApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           workspaceRoot: workspaceRootDraft.trim(),
+          provider: providerDraft,
           baseUrl: baseUrlDraft.trim(),
           model: modelDraft.trim(),
           profile: profileDraft,
@@ -2039,6 +2234,34 @@ function HarnessApp() {
       await refreshDashboard('full', { includeHeavy: true });
     } catch (err) {
       setSettingsStatus(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  }
+
+  async function saveProjectMemory() {
+    try {
+      const parsed = JSON.parse(projectMemoryDraft || '{}') as Partial<ProjectMemory>;
+      const saved = await fetchJson<ProjectMemory>(`${API}/project-memory`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsed),
+      });
+      setProjectMemory(saved);
+      setProjectMemoryDraft(JSON.stringify(saved, null, 2));
+      setProjectMemoryStatus('Saved.');
+    } catch (error) {
+      setProjectMemoryStatus(`Error: ${error instanceof Error ? error.message : 'Invalid memory JSON'}`);
+    }
+  }
+
+  async function deleteProjectMemory() {
+    try {
+      await fetchJson(`${API}/project-memory`, { method: 'DELETE' });
+      const empty = await fetchJson<ProjectMemory>(`${API}/project-memory`);
+      setProjectMemory(empty);
+      setProjectMemoryDraft(JSON.stringify(empty, null, 2));
+      setProjectMemoryStatus('Deleted.');
+    } catch (error) {
+      setProjectMemoryStatus(`Error: ${error instanceof Error ? error.message : 'Delete failed'}`);
     }
   }
 
@@ -2162,6 +2385,42 @@ function HarnessApp() {
     } catch { /* ignore */ }
   }
 
+  async function runWorkspaceTool(title: string, loader: () => Promise<ToolApiResponse | ModelRuntimeState>) {
+    setWorkspaceToolBusy(true);
+    setWorkspaceToolTitle(title);
+    try {
+      const result = await loader();
+      if ('success' in result) {
+        const timing = typeof result.metadata?.durationMs === 'number' ? `\n\n[${result.metadata.durationMs}ms${result.metadata.truncated ? ', truncated' : ''}]` : '';
+        setWorkspaceToolOutput(`${result.output}${timing}`);
+      } else {
+        setWorkspaceToolOutput(JSON.stringify(result, null, 2));
+      }
+    } catch (error) {
+      setWorkspaceToolOutput(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setWorkspaceToolBusy(false);
+    }
+  }
+
+  async function runWorkspaceSearch() {
+    const query = workspaceSearchQuery.trim();
+    if (!query) {
+      setWorkspaceToolTitle('Search');
+      setWorkspaceToolOutput('Enter text to search.');
+      return;
+    }
+    await runWorkspaceTool('Search', () => fetchJson<ToolApiResponse>(`${API}/workspace/search?q=${encodeURIComponent(query)}`));
+  }
+
+  async function runVerificationCommand(command: string) {
+    await runWorkspaceTool(`Verification: ${command}`, () => fetchJson<ToolApiResponse>(`${API}/workspace/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command }),
+    }));
+  }
+
   function togglePath(p: string) {
     setExpandedPaths(cur => {
       const next = new Set(cur);
@@ -2209,25 +2468,21 @@ function HarnessApp() {
             <strong>{config?.internetAccessEnabled ? 'On' : 'Off'}</strong>
           </div>
           <div className="topbar-badge">
-            <span>{isAgentic ? 'Agent Work' : 'Chat'}</span>
+            <span>{userModeLabel}</span>
           </div>
           <div className="topbar-mode-switch" aria-label="Execution mode">
-            <button
-              className={!isAgentic ? 'topbar-mode-option topbar-mode-option-active' : 'topbar-mode-option'}
-              type="button"
-              onClick={() => setIsAgentic(false)}
-              aria-pressed={!isAgentic}
-            >
-              Chat
-            </button>
-            <button
-              className={isAgentic ? 'topbar-mode-option topbar-mode-option-active' : 'topbar-mode-option'}
-              type="button"
-              onClick={() => setIsAgentic(true)}
-              aria-pressed={isAgentic}
-            >
-              Agent Work
-            </button>
+            {USER_MODES.map((mode) => (
+              <button
+                key={mode.id}
+                className={userMode === mode.id ? 'topbar-mode-option topbar-mode-option-active' : 'topbar-mode-option'}
+                type="button"
+                onClick={() => void selectUserMode(mode.id)}
+                aria-pressed={userMode === mode.id}
+                title={mode.note}
+              >
+                {mode.label}
+              </button>
+            ))}
           </div>
           {session && (
             <div className="topbar-badge">
@@ -2382,9 +2637,9 @@ function HarnessApp() {
             <div className="command-center-hero">
               <div className="command-center-copy">
                 <span className="command-center-kicker">Harness posture</span>
-                <h1>{isAgentic ? 'Agent Work armed for workspace action' : 'Chat Mode for low-friction help'}</h1>
+                <h1>{userModeLabel}</h1>
                 <p>
-                  Chat stays lean by default. Agent Work shows workspace, action, checks, blockers, and final result without opening logs.
+                  {userModeNote} Workspace, action, checks, blockers, and final result stay visible when runs start.
                 </p>
               </div>
               <div className="command-center-meta">
@@ -2402,10 +2657,43 @@ function HarnessApp() {
             </div>
 
             <div className="command-center-grid">
+              <div className="command-center-card workspace-tools-card">
+                <div className="command-center-section-head">
+                  <span>Workspace Tools</span>
+                  <span>{workspaceToolBusy ? 'Running' : 'Model-free'}</span>
+                </div>
+                <div className="workspace-tools-search">
+                  <input
+                    value={workspaceSearchQuery}
+                    onChange={e => setWorkspaceSearchQuery(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        void runWorkspaceSearch();
+                      }
+                    }}
+                    placeholder="Search text in workspace"
+                  />
+                  <button className="btn-sm" onClick={() => void runWorkspaceSearch()} type="button">Search</button>
+                </div>
+                <div className="workspace-tools-actions">
+                  <button className="btn-sm" onClick={() => void runWorkspaceTool('Git Status', () => fetchJson<ToolApiResponse>(`${API}/workspace/git/status`))} type="button">Git Status</button>
+                  <button className="btn-sm" onClick={() => void runWorkspaceTool('Git Diff', () => fetchJson<ToolApiResponse>(`${API}/workspace/git/diff`))} type="button">Git Diff</button>
+                  <button className="btn-sm" onClick={() => void runWorkspaceTool('Package Scripts', () => fetchJson<ToolApiResponse>(`${API}/workspace/project/commands`))} type="button">Scripts</button>
+                  <button className="btn-sm" onClick={() => void runVerificationCommand('npm test')} type="button">Run Test</button>
+                  <button className="btn-sm" onClick={() => void runVerificationCommand('npm run build')} type="button">Run Build</button>
+                  <button className="btn-sm" onClick={() => void runVerificationCommand('npm run lint')} type="button">Run Lint</button>
+                  <button className="btn-sm" onClick={() => void runWorkspaceTool('Runtime Status', () => fetchJson<ModelRuntimeState>(`${API}/model/runtime`))} type="button">Runtime</button>
+                </div>
+                <div className="workspace-tools-output">
+                  <strong>{workspaceToolTitle}</strong>
+                  <pre>{workspaceToolOutput || 'Use these controls to browse, search, check git, read scripts, and inspect runtime without asking chat.'}</pre>
+                </div>
+              </div>
               <div className="command-center-card command-center-card-primary">
                 <span className="command-center-card-label">Agent</span>
-                <strong>{isAgentic ? 'Agent Work' : 'Chat Mode'}</strong>
-                <p>{isAgentic ? 'Inspect, act, verify, summarize.' : 'Lean answers without tool orchestration.'}</p>
+                <strong>{userModeLabel}</strong>
+                <p>{userModeNote}</p>
                 <div className="command-center-chip-row">
                   <span className="command-center-chip">{thinkingEnabled ? 'Thinking on' : 'Thinking off'}</span>
                   <span className="command-center-chip">{config?.selfCheckEnabled ? 'Self-check on' : 'Self-check off'}</span>
@@ -2653,20 +2941,19 @@ function HarnessApp() {
               )}
               <div className="composer-actions">
                 <div className="composer-actions-left">
-                  {isAgentic && (
+                  <select
+                    className="composer-select"
+                    value={userMode}
+                    onChange={e => void selectUserMode(e.target.value as UserMode)}
+                    title={userModeNote}
+                  >
+                    {USER_MODES.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+                  </select>
+                  {executionMode === 'agent' && (
                     <select className="composer-select" value={chatMode} onChange={e => setChatMode(e.target.value as ConversationMode)}>
                       {CHAT_MODES.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
                     </select>
                   )}
-                  <button
-                    className={`composer-toggle ${isAgentic ? 'composer-toggle-active' : ''}`}
-                    onClick={() => setIsAgentic(v => !v)}
-                    title={isAgentic ? 'Agent Work enabled' : 'Chat Mode enabled'}
-                    aria-pressed={isAgentic}
-                    type="button"
-                  >
-                    {isAgentic ? 'Agent Work' : 'Chat'}
-                  </button>
                   <button
                     className={`composer-toggle composer-toggle-thinking ${thinkingEnabled ? 'composer-toggle-active' : ''}`}
                     onClick={() => setThinkingEnabled(v => !v)}
@@ -2771,8 +3058,16 @@ function HarnessApp() {
                   <div className="settings-section">
                     <div className="settings-section-title">Model Provider</div>
                     <div className="settings-field">
-                      <label>Base URL (Ollama endpoint)</label>
-                      <input className="settings-input" value={baseUrlDraft} onChange={e => setBaseUrlDraft(e.target.value)} placeholder="http://127.0.0.1:11434/v1" />
+                      <label>Provider</label>
+                      <select className="settings-select" value={providerDraft} onChange={e => setProviderDraft(e.target.value as RuntimeProvider)}>
+                        <option value="llamacpp">llama.cpp (default)</option>
+                        <option value="openai-compatible">OpenAI-compatible custom</option>
+                        <option value="ollama-legacy">Ollama legacy</option>
+                      </select>
+                    </div>
+                    <div className="settings-field">
+                      <label>Base URL (llama.cpp / OpenAI-compatible)</label>
+                      <input className="settings-input" value={baseUrlDraft} onChange={e => setBaseUrlDraft(e.target.value)} placeholder="http://127.0.0.1:8080/v1" />
                     </div>
                     <div className="settings-field">
                       <label>Model</label>
@@ -2796,9 +3091,9 @@ function HarnessApp() {
                       <div className="settings-field">
                         <label>Permission Mode</label>
                         <select className="settings-select" value={modeDraft} onChange={e => setModeDraft(e.target.value)}>
-                          <option value="read-only">Read Only</option>
-                          <option value="workspace-write">Workspace Write</option>
-                          <option value="danger">Danger (Full Access)</option>
+                          {USER_MODES.map(mode => (
+                            <option key={mode.id} value={mode.id}>{mode.label}</option>
+                          ))}
                         </select>
                       </div>
                     </div>
@@ -2812,6 +3107,14 @@ function HarnessApp() {
                   <div className="settings-section">
                     <div className="settings-section-title">Runtime Status</div>
                     <div className="settings-info">
+                      <div className="settings-info-row">
+                        <span>Provider</span>
+                        <span>{modelRuntime?.provider || config?.provider || 'llamacpp'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Endpoint</span>
+                        <span>{modelRuntime?.baseUrl || config?.baseUrl || 'N/A'}</span>
+                      </div>
                       <div className="settings-info-row">
                         <span>Status</span>
                         <span>{modelRuntimeStatusLabel}</span>
@@ -3129,6 +3432,26 @@ function HarnessApp() {
                         ))}
                       </div>
                     )}
+                  </div>
+
+                  <div className="settings-section">
+                    <div className="settings-section-title">Project Memory</div>
+                    <div className="settings-info">
+                      <div className="settings-info-row"><span>Updated</span><span>{projectMemory ? new Date(projectMemory.updatedAt).toLocaleString() : 'Not loaded'}</span></div>
+                      <div className="settings-info-row"><span>Scope</span><span>{projectMemory?.workspaceRoot || config?.workspaceRoot || 'Workspace'}</span></div>
+                    </div>
+                    <textarea
+                      className="settings-input project-memory-editor"
+                      value={projectMemoryDraft}
+                      onChange={e => setProjectMemoryDraft(e.target.value)}
+                      rows={12}
+                      spellCheck={false}
+                    />
+                    <div className="workspace-tools-actions">
+                      <button className="settings-btn" onClick={() => void saveProjectMemory()} type="button">Save Project Memory</button>
+                      <button className="btn-sm" onClick={() => void deleteProjectMemory()} type="button">Delete</button>
+                    </div>
+                    {projectMemoryStatus && <div className="settings-status">{projectMemoryStatus}</div>}
                   </div>
                 </>
               )}

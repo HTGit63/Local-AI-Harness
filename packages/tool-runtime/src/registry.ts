@@ -25,11 +25,40 @@ import { promisify } from 'util';
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT_LINES = 200;
 const MAX_BUFFER_BYTES = 1024 * 1024;
+const MAX_TEXT_FILE_BYTES = 256 * 1024;
+const BINARY_SAMPLE_BYTES = 8192;
 const MAX_WEB_RESULTS = 5;
 const MAX_WEB_FETCH_BYTES = 180_000;
 const MAX_WEB_FETCH_TEXT_CHARS = 16_000;
 const WEB_REQUEST_TIMEOUT_MS = 12_000;
 const CHECKPOINT_TARGET = '.gamma-harness/checkpoints';
+const IGNORED_DIR_NAMES = [
+  '.cache',
+  '.git',
+  '.gamma-harness',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  '.vite',
+  'base_repos',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'third_party',
+];
+
+function shouldIgnoreDirName(name: string): boolean {
+  return IGNORED_DIR_NAMES.includes(name);
+}
+
+function rgIgnoreArgs(): string[] {
+  return IGNORED_DIR_NAMES.flatMap((dirName) => ['--glob', `!${dirName}/**`]);
+}
+
+function grepIgnoreArgs(): string[] {
+  return IGNORED_DIR_NAMES.map((dirName) => `--exclude-dir=${dirName}`);
+}
 
 function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
@@ -87,6 +116,38 @@ function tokenizeCommand(command: string): string[] {
   }
 
   return tokens;
+}
+
+function isSafeVerificationPolicyMode(policyMode: string): boolean {
+  return policyMode === 'trusted-edit' || policyMode === 'full-agent' || policyMode === 'workspace-write';
+}
+
+function isSafeScriptName(scriptName: string): boolean {
+  return /^(test|tests|lint|build|typecheck|check|verify)(?::[\w.-]+|-[\w.-]+)?$/i.test(scriptName);
+}
+
+function isSafeVerificationCommand(commandName: string, commandArgs: string[]): boolean {
+  if (commandName === 'npm') {
+    if (commandArgs[0] === 'test' || commandArgs[0] === 't') return true;
+    if (commandArgs[0] === 'run' && commandArgs[1]) return isSafeScriptName(commandArgs[1]);
+    return false;
+  }
+
+  if (commandName === 'pnpm' || commandName === 'yarn') {
+    if (commandArgs[0] === 'test') return true;
+    if (commandArgs[0] === 'run' && commandArgs[1]) return isSafeScriptName(commandArgs[1]);
+    return commandArgs[0] ? isSafeScriptName(commandArgs[0]) : false;
+  }
+
+  if (commandName === 'node') {
+    return commandArgs.some((arg) => /(^|\/)tests?\/.+\.(?:test|spec)\.[cm]?[jt]sx?$/.test(arg) || /(^|\/)tests?\/.+\.[cm]?[jt]sx?$/.test(arg));
+  }
+
+  if (commandName === 'tsc') {
+    return commandArgs.length === 0 || commandArgs.includes('--noEmit') || commandArgs.includes('-b');
+  }
+
+  return ['vitest', 'jest', 'pytest'].includes(commandName);
 }
 
 function containsUnsupportedShellSyntax(command: string): boolean {
@@ -350,7 +411,7 @@ async function walkFiles(cwd: string, currentDir = cwd): Promise<string[]> {
   const results: string[] = [];
 
   for (const entry of entries) {
-    if (['.git', 'node_modules', 'dist', 'build', '.next'].includes(entry.name)) {
+    if (entry.isDirectory() && shouldIgnoreDirName(entry.name)) {
       continue;
     }
 
@@ -364,6 +425,35 @@ async function walkFiles(cwd: string, currentDir = cwd): Promise<string[]> {
   }
 
   return results.sort();
+}
+
+async function readFileChunk(filePath: string, bytes: number): Promise<Buffer> {
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+function looksBinary(buffer: Buffer): boolean {
+  if (buffer.includes(0)) {
+    return true;
+  }
+  if (buffer.length === 0) {
+    return false;
+  }
+
+  let suspicious = 0;
+  for (const byte of buffer) {
+    const allowedControl = byte === 9 || byte === 10 || byte === 13;
+    if (byte < 32 && !allowedControl) {
+      suspicious += 1;
+    }
+  }
+  return suspicious / buffer.length > 0.08;
 }
 
 function countDiffStatsFromContent(before: string, after: string): ToolDiffStats {
@@ -633,6 +723,15 @@ export class ToolRegistry {
     const startedAt = Date.now();
     this.context.emitTrace('tool_call', { name, inputSummary });
     this.context.emitTrace('tool_call_started', { tool: name, inputSummary });
+    if (this.context.signal?.aborted) {
+      const durationMs = Date.now() - startedAt;
+      return Promise.resolve({
+        success: false,
+        output: 'Cancelled before tool started.',
+        error: 'Operation cancelled.',
+        metadata: { durationMs },
+      });
+    }
     return executor()
       .then((result) => {
         const durationMs = Date.now() - startedAt;
@@ -683,15 +782,57 @@ export class ToolRegistry {
     return this.wrapExecution('read_file', `Reading ${filePath}`, async () => {
       const policy = this.context.checkPolicy('read', filePath);
       if (!policy.allowed) {
-        return { success: false, output: `Denied: ${policy.reason}` };
+        return { success: false, output: `Denied: ${policy.reason}`, error: policy.reason };
       }
 
-      const content = await fs.readFile(this.resolveTarget(filePath), 'utf8');
+      const absolutePath = this.resolveTarget(filePath);
+      const stat = await fs.stat(absolutePath);
+      if (stat.isDirectory()) {
+        return { success: false, output: 'Path is a directory, not a text file.', error: 'Path is a directory.' };
+      }
+
+      const sample = await readFileChunk(absolutePath, Math.min(BINARY_SAMPLE_BYTES, Math.max(1, stat.size)));
+      if (looksBinary(sample)) {
+        return {
+          success: false,
+          output: `Binary file not rendered as text: ${filePath}`,
+          error: 'Binary file not rendered as text.',
+          metadata: {
+            fileReads: [filePath],
+            truncated: true,
+          },
+        };
+      }
+
+      if (stat.size > MAX_TEXT_FILE_BYTES) {
+        const chunk = await readFileChunk(absolutePath, MAX_TEXT_FILE_BYTES);
+        return {
+          success: true,
+          output: `${chunk.toString('utf8')}\n... file truncated at ${MAX_TEXT_FILE_BYTES} bytes of ${stat.size} bytes ...`,
+          data: {
+            path: filePath,
+            bytesRead: chunk.length,
+            totalBytes: stat.size,
+          },
+          metadata: {
+            fileReads: [filePath],
+            truncated: true,
+          },
+        };
+      }
+
+      const content = await fs.readFile(absolutePath, 'utf8');
       return {
         success: true,
         output: content,
+        data: {
+          path: filePath,
+          bytesRead: Buffer.byteLength(content),
+          totalBytes: stat.size,
+        },
         metadata: {
           fileReads: [filePath],
+          truncated: false,
         },
       };
     });
@@ -705,7 +846,8 @@ export class ToolRegistry {
       }
 
       const entries = await fs.readdir(this.resolveTarget(dirPath), { withFileTypes: true });
-      const output = entries
+      const visibleEntries = entries.filter((entry) => !(entry.isDirectory() && shouldIgnoreDirName(entry.name)));
+      const output = visibleEntries
         .map((entry) => `${entry.isDirectory() ? 'dir ' : 'file'} ${entry.name}`)
         .sort()
         .join('\n');
@@ -713,6 +855,11 @@ export class ToolRegistry {
       return {
         success: true,
         output: output || 'No entries',
+        data: {
+          entries: visibleEntries
+            .map((entry) => ({ name: entry.name, kind: entry.isDirectory() ? 'directory' : 'file' }))
+            .sort((left, right) => left.name.localeCompare(right.name)),
+        },
         metadata: {
           directoriesRead: [dirPath],
         },
@@ -730,7 +877,7 @@ export class ToolRegistry {
       try {
         const { stdout } = await execFileAsync(
           'rg',
-          ['--files', '--glob', pattern, '--glob', '!node_modules/**', '--glob', '!.git/**'],
+          ['--files', '--glob', pattern, ...rgIgnoreArgs()],
           { cwd: this.context.cwd, maxBuffer: MAX_BUFFER_BYTES },
         );
         const truncated = truncateOutputResult(stdout);
@@ -768,7 +915,7 @@ export class ToolRegistry {
       }
 
       try {
-        const rgArgs = ['-n', '--no-heading', '--color', 'never', '--glob', '!node_modules/**', '--glob', '!.git/**'];
+        const rgArgs = ['-n', '--no-heading', '--color', 'never', ...rgIgnoreArgs()];
         if (filePattern) {
           rgArgs.push('--glob', filePattern);
         }
@@ -812,7 +959,7 @@ export class ToolRegistry {
         }
       }
 
-      const grepArgs = ['-rnI', '--exclude-dir=node_modules', '--exclude-dir=.git'];
+      const grepArgs = ['-rnI', ...grepIgnoreArgs()];
       if (filePattern) {
         grepArgs.push(`--include=${filePattern}`);
       }
@@ -1761,13 +1908,14 @@ export class ToolRegistry {
         status: ToolCommandStatus,
         reason?: string,
         durationMs = Date.now() - startedAt,
+        approvalRequired = policy.requiresApproval,
       ) => ({
         command,
         success,
         status,
         reason,
         policyMode,
-        approvalRequired: policy.requiresApproval,
+        approvalRequired,
         durationMs,
       });
       const emitPolicyTrace = (status: ToolCommandStatus | 'approval_required' | 'allowed', reason?: string) => {
@@ -1852,8 +2000,19 @@ export class ToolRegistry {
         };
       }
 
-      emitPolicyTrace(policy.requiresApproval ? 'approval_required' : 'allowed', policy.requiresApproval ? 'Approval required before execution.' : undefined);
-      if (policy.requiresApproval) {
+      const verificationAllowlisted = policy.requiresApproval &&
+        isSafeVerificationPolicyMode(policyMode) &&
+        isSafeVerificationCommand(commandName, commandArgs);
+      const requiresApproval = policy.requiresApproval && !verificationAllowlisted;
+      emitPolicyTrace(
+        requiresApproval ? 'approval_required' : 'allowed',
+        requiresApproval
+          ? 'Approval required before execution.'
+          : verificationAllowlisted
+            ? 'Safe verification command allowlisted.'
+            : undefined,
+      );
+      if (requiresApproval) {
         const approved = await this.withApproval('run_command', command, preview);
         if (!approved) {
           return {
@@ -1861,7 +2020,7 @@ export class ToolRegistry {
             output: 'Rejected by user.',
             preview,
             metadata: {
-              command: commandMetadata(false, 'rejected', 'Rejected by user.'),
+              command: commandMetadata(false, 'rejected', 'Rejected by user.', undefined, true),
             },
           };
         }
@@ -1881,7 +2040,13 @@ export class ToolRegistry {
           output: truncated.text,
           preview,
           metadata: {
-            command: commandMetadata(true, 'executed', undefined, Date.now() - commandStartedAt),
+            command: commandMetadata(
+              true,
+              'executed',
+              verificationAllowlisted ? 'Safe verification command allowlisted.' : undefined,
+              Date.now() - commandStartedAt,
+              requiresApproval,
+            ),
             truncated: truncated.truncated,
           },
         };
@@ -1893,7 +2058,7 @@ export class ToolRegistry {
           preview,
           error: error?.message || output,
           metadata: {
-            command: commandMetadata(false, 'failed', error?.message || output, Date.now() - commandStartedAt),
+            command: commandMetadata(false, 'failed', error?.message || output, Date.now() - commandStartedAt, requiresApproval),
             truncated: output.includes('... output truncated ...'),
           },
         };

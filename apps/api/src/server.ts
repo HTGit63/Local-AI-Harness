@@ -2,7 +2,6 @@ import * as http from 'http';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { CoreEngine } from '@local-harness/core';
-import { ModelAdapter } from '@local-harness/model-adapter';
 import type { ModelRuntimeState } from '@local-harness/model-adapter';
 
 const PORT = parseInt(process.env.API_PORT || '3001', 10);
@@ -21,17 +20,22 @@ const MODEL_RUNTIME_CACHE_TTL_MS = Number.isFinite(modelRuntimeCacheTtlSetting)
   ? Math.max(5_000, Math.min(15_000, modelRuntimeCacheTtlSetting))
   : 10_000;
 const WORKSPACE_RESOLVE_IGNORES = new Set([
+  '.gamma-harness',
   '.git',
   '.next',
   '.nuxt',
   '.cache',
+  '.turbo',
+  '.vite',
   '.idea',
   '.vscode',
   '.yarn',
+  'base_repos',
   'node_modules',
   'dist',
   'build',
   'coverage',
+  'third_party',
 ]);
 
 const defaultAllowedOrigins = [
@@ -66,7 +70,10 @@ function parseExecutionMode(body: Record<string, unknown>): ApiExecutionMode {
   if (body.mode === 'agent') {
     return 'agent';
   }
-  if (body.mode === 'chat') {
+  if (body.mode === 'plan' || body.mode === 'trusted-edit' || body.mode === 'full-agent' || body.mode === 'danger-sandbox') {
+    return 'agent';
+  }
+  if (body.mode === 'chat' || body.mode === 'inspect') {
     return 'chat';
   }
   if (body.agentic === true) {
@@ -504,10 +511,25 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/api/config' && method === 'POST') {
       const body = await readBody(req);
-      const validModes = new Set(['read-only', 'workspace-write', 'danger']);
+      const validModes = new Set([
+        'chat',
+        'inspect',
+        'plan',
+        'trusted-edit',
+        'full-agent',
+        'danger-sandbox',
+        'read-only',
+        'workspace-write',
+        'danger',
+      ]);
+      const validProviders = new Set(['llamacpp', 'ollama-legacy', 'openai-compatible']);
       const validProfiles = new Set(['fast', 'balanced', 'deep']);
       const validBudgetProfiles = new Set(['lean', 'balanced', 'deep']);
 
+      if (body.provider !== undefined && (typeof body.provider !== 'string' || !validProviders.has(body.provider))) {
+        sendBadRequest(req, res, 'provider must be one of llamacpp, ollama-legacy, or openai-compatible.');
+        return;
+      }
       if (body.baseUrl !== undefined && typeof body.baseUrl !== 'string') {
         sendBadRequest(req, res, 'baseUrl must be a string.');
         return;
@@ -525,7 +547,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (body.mode !== undefined && (typeof body.mode !== 'string' || !validModes.has(body.mode))) {
-        sendBadRequest(req, res, 'mode must be one of read-only, workspace-write, or danger.');
+        sendBadRequest(req, res, 'mode must be one of chat, inspect, plan, trusted-edit, full-agent, danger-sandbox, or a legacy mode.');
         return;
       }
       if (body.profile !== undefined && (typeof body.profile !== 'string' || !validProfiles.has(body.profile))) {
@@ -609,6 +631,26 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/api/plan' && method === 'GET') {
       sendJson(req, res, 200, engine.getPlanState());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/project-memory' && method === 'GET') {
+      sendJson(req, res, 200, await engine.getProjectMemory());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/project-memory' && method === 'POST') {
+      const body = await readBody(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        sendBadRequest(req, res, 'Project memory body must be an object.');
+        return;
+      }
+      sendJson(req, res, 200, await engine.updateProjectMemory(body as any));
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/project-memory' && method === 'DELETE') {
+      sendJson(req, res, 200, { deleted: await engine.deleteProjectMemory() });
       return;
     }
 
@@ -980,6 +1022,17 @@ const server = http.createServer(async (req, res) => {
 
     if (requestUrl.pathname === '/api/workspace/project/commands' && method === 'GET') {
       sendJson(req, res, 200, await engine.detectProjectCommands());
+      return;
+    }
+
+    if (requestUrl.pathname === '/api/workspace/run' && method === 'POST') {
+      const body = await readBody(req);
+      const command = typeof body.command === 'string' ? body.command.trim() : '';
+      if (!command) {
+        sendBadRequest(req, res, 'command is required.');
+        return;
+      }
+      sendJson(req, res, 200, await engine.runCommand(command));
       return;
     }
 

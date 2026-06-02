@@ -135,6 +135,8 @@ a {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .topbar-right {
@@ -1215,6 +1217,13 @@ a {
   cursor: not-allowed;
 }
 
+.project-memory-editor {
+  min-height: 240px;
+  resize: vertical;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  line-height: 1.45;
+}
+
 .settings-select {
   width: 100%;
   padding: 7px 10px;
@@ -1819,14 +1828,18 @@ a {
   display: inline-flex;
   align-items: center;
   gap: 2px;
+  max-width: min(52vw, 720px);
   min-height: 30px;
   padding: 2px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #101010;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .topbar-mode-option {
+  flex: 0 0 auto;
   min-height: 26px;
   padding: 0 10px;
   border: 0;
@@ -1846,6 +1859,55 @@ a {
 .topbar-mode-option-active {
   background: var(--surface-active);
   color: var(--text);
+}
+
+.workspace-tools-card {
+  grid-column: 1 / -1;
+}
+
+.workspace-tools-search,
+.workspace-tools-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.workspace-tools-search input {
+  min-width: 220px;
+  flex: 1 1 260px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.workspace-tools-output {
+  margin-top: 10px;
+  padding: 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.workspace-tools-output strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.workspace-tools-output pre {
+  max-height: 180px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .tool-call-row strong {

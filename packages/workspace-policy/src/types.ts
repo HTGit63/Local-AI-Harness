@@ -1,4 +1,13 @@
-export type PolicyMode = 'read-only' | 'workspace-write' | 'danger';
+export type PolicyMode =
+  | 'chat'
+  | 'inspect'
+  | 'plan'
+  | 'trusted-edit'
+  | 'full-agent'
+  | 'danger-sandbox'
+  | 'read-only'
+  | 'workspace-write'
+  | 'danger';
 
 export interface WorkspacePolicyConfig {
   workspaceRoot: string;

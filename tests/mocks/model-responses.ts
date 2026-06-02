@@ -45,7 +45,13 @@ function encodeStreamChunks(chunks: string[]): ReadableStream<Uint8Array> {
 }
 
 function createStreamingChatBody(response: typeof MOCK_CHAT_RESPONSE): ReadableStream<Uint8Array> {
-  const content = response.choices[0]?.message?.content || '';
+  const message = response.choices[0]?.message as {
+    role?: string;
+    content?: string;
+    tool_calls?: any[];
+  } | undefined;
+  const content = message?.content || '';
+  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
   const midpoint = Math.max(1, Math.floor(content.length / 2));
   const parts = [content.slice(0, midpoint), content.slice(midpoint)].filter(Boolean);
   const chunks = parts.map((part) => `data: ${JSON.stringify({
@@ -57,13 +63,29 @@ function createStreamingChatBody(response: typeof MOCK_CHAT_RESPONSE): ReadableS
       finish_reason: null,
     }],
   })}\n\n`);
+
+  if (toolCalls.length > 0) {
+    chunks.push(`data: ${JSON.stringify({
+      id: response.id,
+      object: 'chat.completion.chunk',
+      choices: [{
+        index: 0,
+        delta: {
+          role: message?.role || 'assistant',
+          tool_calls: toolCalls.map((toolCall, index) => ({ ...toolCall, index })),
+        },
+        finish_reason: null,
+      }],
+    })}\n\n`);
+  }
+
   chunks.push(`data: ${JSON.stringify({
     id: response.id,
     object: 'chat.completion.chunk',
     choices: [{
       index: 0,
       delta: {},
-      finish_reason: 'stop',
+      finish_reason: response.choices[0]?.finish_reason || (toolCalls.length > 0 ? 'tool_calls' : 'stop'),
     }],
   })}\n\n`);
   chunks.push('data: [DONE]\n\n');

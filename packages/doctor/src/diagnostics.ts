@@ -15,25 +15,26 @@ export interface DiagnosticsOptions {
 
 export async function runDiagnostics(options: DiagnosticsOptions = {}) {
   const repoRoot = path.resolve(options.repoRoot || path.join(__dirname, '../../..'));
-  const baseUrl = options.baseUrl || process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1';
+  const provider = process.env.HARNESS_RUNTIME_PROVIDER || 'llamacpp';
+  const baseUrl = options.baseUrl || process.env.OPENAI_BASE_URL || 'http://127.0.0.1:8080/v1';
   const model = options.model || 'gemma4:e4b';
   const workspaceRoot = path.resolve(options.workspaceRoot || process.cwd());
   const results: Record<string, 'pass' | 'fail' | 'warn'> = {};
 
   try {
-    const res = await fetch(baseUrl.replace(/\/v1$/, ''));
-    results.ollama_reachable = res.ok ? 'pass' : 'fail';
+    const res = await fetch(`${baseUrl.replace(/\/$/, '')}/models`);
+    results.model_runtime_reachable = res.ok ? 'pass' : 'fail';
   } catch {
-    results.ollama_reachable = 'fail';
+    results.model_runtime_reachable = 'fail';
   }
 
   try {
-    const res = await fetch(baseUrl.replace(/\/v1$/, '/api/tags'));
-    const data = await res.json() as { models?: Array<{ name: string }> };
-    const models = data.models?.map((entry) => entry.name) || [];
-    results.model_gemma4_installed = models.includes(model) ? 'pass' : 'warn';
+    const res = await fetch(`${baseUrl.replace(/\/$/, '')}/models`);
+    const data = await res.json() as { data?: Array<{ id: string }> };
+    const models = data.data?.map((entry) => entry.id) || [];
+    results.model_gemma4_available = models.length === 0 || models.includes(model) ? 'pass' : 'warn';
   } catch {
-    results.model_gemma4_installed = 'fail';
+    results.model_gemma4_available = 'fail';
   }
 
   try {
@@ -43,7 +44,8 @@ export async function runDiagnostics(options: DiagnosticsOptions = {}) {
     results.base_url_valid = 'fail';
   }
 
-  results.api_key_placeholder_valid = (process.env.OPENAI_API_KEY || 'ollama') === 'ollama' ? 'pass' : 'warn';
+  results.provider_configured = provider === 'llamacpp' || provider === 'ollama-legacy' || provider === 'openai-compatible' ? 'pass' : 'warn';
+  results.api_key_placeholder_valid = (process.env.OPENAI_API_KEY || 'no-key') === 'no-key' ? 'pass' : 'warn';
 
   try {
     const testFile = path.join(workspaceRoot, '.doctor_test_write');

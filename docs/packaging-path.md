@@ -1,71 +1,32 @@
-# Packaging Path — Web-to-Standalone
+# Packaging Path
 
-## Current Architecture (v1): Localhost Web Mode
+## Current Localhost Mode
 
-The harness runs as two processes on the developer's machine:
-
-```
-┌──────────────┐       ┌──────────────┐       ┌──────────────┐
-│  apps/web    │◄─────►│  apps/api    │◄─────►│  Ollama      │
-│  (Vite dev)  │       │  localhost:  │       │  localhost:  │
-│  localhost:  │       │  3001        │       │  11434       │
-│  5173        │       └──────────────┘       └──────────────┘
-└──────────────┘
-       ▲
-       │ same machine
-       ▼
-┌──────────────┐
-│  apps/cli    │
-│  (Node.js)   │
-└──────────────┘
+```text
+apps/web  <->  apps/api  <->  local OpenAI-compatible model server
+  5173          3001          default: llama.cpp on 127.0.0.1:8080/v1
 ```
 
-All data stays local. No cloud services required.
+All data stays local. No cloud service is required.
 
----
+## Packaging-Ready Boundaries
 
-## Future: Desktop Bundle Mode
+| Concern | Current state |
+|---|---|
+| Web UI | Vite React SPA |
+| API | Local Node process on `localhost:3001` |
+| Model server | Separate local process, default `llama.cpp` |
+| Storage | File-based workspace/session/project memory data |
+| Config | Environment variables plus local config files |
 
-The architecture is intentionally designed to be packaging-friendly for Tauri or Electron.
+## Desktop Bundle Path
 
-### Why this works today
+Tauri or Electron can wrap the Web UI and spawn the API process. The model server can remain a documented prerequisite or become a managed sidecar later.
 
-| Concern | Current state | Packaging-ready? |
-|---|---|---|
-| Web UI | Vite React SPA, no SSR | ✅ Trivially wrappable |
-| API calls | Web UI targets the local `apps/api` process on `localhost:3001` | ✅ No cloud dependency and easy to wrap |
-| Storage | File-based JSON in workspace | ✅ Portable, no external DB |
-| Config paths | Relative to `cwd` or `$HOME` | ✅ Works in sandboxed apps |
-| Model server | Ollama as separate process | ⚠️ Must be bundled or required as prerequisite |
+Avoid:
 
-### Tauri path (recommended)
-
-1. Build `apps/web` as static assets: `npm run build`
-2. Create a Tauri project pointing to `dist/`
-3. Tauri's Rust backend can optionally manage the Ollama lifecycle
-4. All `packages/*` compile to standard JS — no native addons needed
-
-### Electron path (alternative)
-
-1. Same static build approach
-2. Electron's `main.js` spawns the local API server
-3. Renderer loads the Vite output
-
-### What to avoid
-
-- ❌ Do not add SSR or server-side rendering — breaks packaging
-- ❌ Do not add native Node.js addons — breaks Tauri compatibility
-- ❌ Do not hardcode absolute paths — use `path.resolve` and env vars
-- ❌ Do not add external network dependencies — breaks offline guarantee
-
----
-
-## Config Path Strategy
-
-All configuration follows this resolution order:
-
-1. `$HARNESS_CONFIG_DIR` environment variable (if set)
-2. `$HOME/.gamma-harness/` (default)
-3. `./.gamma-harness/` in workspace root (project-local override)
-
-This ensures portability across bare localhost, Tauri sandbox, and Electron `userData` directories.
+- SSR requirements
+- native Node addons
+- hardcoded absolute paths
+- required external network access
+- assumptions that GPU, vLLM, Ollama, or Gemma 4 26B are available

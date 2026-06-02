@@ -26,7 +26,6 @@ FROM deps AS build
 COPY apps/api ./apps/api
 COPY apps/cli ./apps/cli
 COPY packages ./packages
-COPY third_party/agency-agents ./third_party/agency-agents
 
 RUN npm run build:packages \
  && npm run build --workspace @local-harness/api \
@@ -42,7 +41,9 @@ ENV NODE_ENV=production
 ENV API_HOST=0.0.0.0
 ENV API_PORT=3001
 ENV HARNESS_WORKSPACE_ROOT=/workspace
-ENV OPENAI_API_KEY=ollama
+ENV HARNESS_RUNTIME_PROVIDER=llamacpp
+ENV OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+ENV OPENAI_API_KEY=no-key
 
 COPY --from=deps /app/package.json /app/package-lock.json ./
 COPY --from=deps /app/node_modules ./node_modules

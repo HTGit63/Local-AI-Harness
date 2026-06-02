@@ -2,7 +2,7 @@
   "name": "gamma4-local-harness",
   "version": "0.1.0",
   "private": true,
-  "description": "Local-first coding harness running Gemma 4 (E4B) via Ollama",
+  "description": "Web-first local coding harness running Gemma 4 E4B via llama.cpp or another OpenAI-compatible local runtime",
   "workspaces": [
     "packages/*",
     "apps/*"

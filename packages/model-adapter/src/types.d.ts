@@ -23,7 +23,9 @@ export interface ChatCompletionRequest {
     tools?: any[];
     signal?: AbortSignal;
 }
+export type RuntimeProvider = 'llamacpp' | 'ollama-legacy' | 'openai-compatible';
 export interface AdapterOptions {
+    provider?: RuntimeProvider;
     baseUrl?: string;
     apiKey?: string;
     model?: string;
@@ -64,7 +66,16 @@ export interface ModelSwitchResult {
     supportsLifecycle: boolean;
     message: string;
 }
+export interface ModelLifecyclePolicy {
+    preloadKeepAlive: string;
+    unloadKeepAlive: number;
+    chatTimeoutMs: number;
+    preloadTimeoutMs: number;
+    unloadTimeoutMs: number;
+}
 export interface ModelRuntimeState {
+    provider: RuntimeProvider;
+    baseUrl: string;
     configuredModel: string;
     activeModel: string | null;
     runtimeStatus: 'ready' | 'idle' | 'configured_not_loaded' | 'unavailable';
@@ -73,6 +84,9 @@ export interface ModelRuntimeState {
     installedModels: string[];
     availableModels: AvailableModel[];
     supportsLifecycle: boolean;
+    lifecyclePolicy: ModelLifecyclePolicy;
+    reasoningSupported?: boolean;
+    nativeToolCallingSupported?: boolean;
     configuredModelCapabilities?: string[];
     lastSwitchResult?: ModelSwitchResult;
 }

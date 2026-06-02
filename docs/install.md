@@ -2,52 +2,57 @@
 
 ## Prerequisites
 
-- **Node.js** ≥ 18
-- **Ollama** installed and running
-- **Gemma 4 E4B** model pulled
+- Node.js >= 18
+- A local `llama.cpp` server binary
+- A Gemma 4 E4B GGUF model file
+- 16 GB RAM target, CPU-first, no GPU required
 
-## Step 1: Install Ollama
+## 1. Start The Model Server
+
+Run `llama.cpp` with an OpenAI-compatible endpoint:
 
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh
+./llama-server \
+  -m /path/to/gemma-4-e4b.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --ctx-size 8192
 ```
 
-## Step 2: Pull the model
+Verify the server:
 
 ```bash
-ollama pull gemma4:e4b
+curl http://127.0.0.1:8080/v1/models
 ```
 
-Verify it's running:
+Expected harness defaults:
+
 ```bash
-curl http://127.0.0.1:11434/api/tags
+export HARNESS_RUNTIME_PROVIDER=llamacpp
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=no-key
+export HARNESS_MODEL=gemma4:e4b
 ```
 
-## Step 3: Clone and install
+## 2. Install The Harness
 
 ```bash
-git clone <repo-url> gamma-harness
-cd gamma-harness
+git clone <repo-url> gemma4-harness
+cd gemma4-harness
 npm install
-```
-
-## Step 4: Build the workspace
-
-```bash
 npm run build
 ```
 
-## Step 5: Run doctor
+## 3. Run Doctor
 
 ```bash
 node apps/cli/dist/cli.js doctor
 ```
 
-All checks should show ✅.
+Doctor checks local config, workspace access, provider setup, and runtime reachability. If the server is offline, the runtime check reports it clearly instead of requiring Ollama.
 
-## Step 6: Launch
+## 4. Launch The Web UI
 
-**Web UI:**
 ```bash
 # terminal 1
 npm run dev --workspace @local-harness/api
@@ -55,9 +60,31 @@ npm run dev --workspace @local-harness/api
 # terminal 2
 npm run dev --workspace web
 ```
-Open `http://localhost:5173`
 
-**CLI:**
+Open:
+
+```text
+http://localhost:5173
+```
+
+The project explorer, file viewer, search, git panels, settings, and runtime card work without loading a model.
+
+## 5. Optional CLI
+
 ```bash
 node apps/cli/dist/cli.js chat
+node apps/cli/dist/cli.js prompt --agent "inspect this repo"
+```
+
+The CLI exists for scripting. The Web UI is the primary product surface.
+
+## Optional Ollama Legacy Provider
+
+Ollama can still be used for older local setups:
+
+```bash
+export HARNESS_RUNTIME_PROVIDER=ollama-legacy
+export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+export OPENAI_API_KEY=ollama
+ollama pull gemma4:e4b
 ```

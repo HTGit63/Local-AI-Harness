@@ -1,170 +1,186 @@
-# Gamma 4 Harness
+# Gemma 4 Harness
 
-A local-first, offline-capable coding harness optimized for **Gemma 4 E4B** running on CPU-only hardware via **Ollama**.
+Web-first local AI coding harness for **Gemma 4 E4B** on a CPU-first Linux machine. The stable runtime target is a local `llama.cpp` server exposing an OpenAI-compatible `/v1` API.
+
+The harness stays useful when no model is loaded. File browsing, file reads, search, git status, git diff, package-script detection, runtime status, and verification command buttons are deterministic backend operations.
 
 ## What This Is
 
-A self-contained agentic coding assistant that runs entirely on your machine. It provides:
-- A **CLI** and **Web UI** for interacting with a local LLM
-- **Tool execution** (file read/write, git, shell) with full visibility and approval gates
-- **Workspace safety** boundaries preventing silent broad edits
-- **Curated skill personas** sourced from vetted upstream repositories
-- **Prompt recipes** optimized for small local models
+- A localhost Web UI for inspecting, planning, editing, verifying, and reviewing code.
+- A local API and CLI sharing the same workspace policy, model adapter, tools, sessions, and traces.
+- A deterministic tool layer that handles workspace basics without model calls.
+- A provider-based runtime adapter. Default: `llamacpp`; optional: `ollama-legacy` and `openai-compatible`.
+- A small native skill pack bundled in `packages/skills`, with no required external reference repos.
 
 ## What This Is Not
 
-- Not a cloud service — everything runs on `localhost`
-- Not a VS Code extension (yet) — it's a standalone harness
-- Not dependent on GPT-4 or any large model — designed for 4B parameter models
-- Not a RAG system — uses lightweight file indexing, not vector databases
+- Not a cloud service.
+- Not Ollama-dependent. Ollama is optional legacy support.
+- Not a VS Code extension.
+- Not a RAG system or full-repo memory system.
+- Not a Gemma 4 26B product yet. 26B is future advanced mode after E4B stability.
 
 ## Quick Start
 
-```bash
-# 1. Install Ollama and pull the model
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull gemma4:e4b
+Start a local `llama.cpp` server with your Gemma 4 E4B GGUF model:
 
-# 2. Install dependencies and build once
+```bash
+./llama-server \
+  -m /path/to/gemma-4-e4b.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --ctx-size 8192
+```
+
+Install and run the harness:
+
+```bash
 npm install
 npm run build
 
-# 3. Start the API server in one terminal
+# terminal 1
 npm run dev --workspace @local-harness/api
 
-# 4. Start the Web UI in another terminal
+# terminal 2
 npm run dev --workspace web
+```
 
-# 5. Build the CLI and run diagnostics or chat
-npm run build --workspace @local-harness/cli
+Open the Web UI:
+
+```text
+http://localhost:5173
+```
+
+Run CLI diagnostics when needed:
+
+```bash
 node apps/cli/dist/cli.js doctor
-node apps/cli/dist/cli.js model list --json
-node apps/cli/dist/cli.js chat
-```
-
-The web UI is organized around:
-- A left folder browser that opens local files directly in the browser
-- A focused main workspace with tabs for conversation, file preview, activity, history, and settings
-- A bottom composer with direct-chat and agentic-coding toggles, a thinking toggle, image attachments, and prompt-mode presets (`architecture`, `data analysis`, `code review`, `implementation`, `general`)
-
-## Using Models
-
-Installed local models are discovered from Ollama automatically. The harness can switch between them and, when Ollama lifecycle control is available, it unloads the previous running model before warming the requested one.
-
-Current local models on this machine:
-- `gemma4:e4b`
-- `qwen3.5:9b-q4_K_M`
-- `deepseek-coder-v2:latest`
-
-CLI:
-
-```bash
-# Show installed and active models
 node apps/cli/dist/cli.js model status --json
-node apps/cli/dist/cli.js model list --json
-
-# Activate a model
-node apps/cli/dist/cli.js model use gemma4:e4b --json
-node apps/cli/dist/cli.js model use qwen3.5:9b-q4_K_M --json
-node apps/cli/dist/cli.js model use deepseek-coder-v2:latest --json
-
-# Verify what Ollama actually has loaded
-ollama ps
 ```
 
-Web UI:
+## Web UI Workflow
 
-1. Open `http://localhost:8080`
-2. Go to `Settings`
-3. Pick a model from the `Model` dropdown
-4. Click `Save runtime config`
-5. Confirm the `Active:` badge and the `Model runtime` card show the requested model
+Use the Web UI as the control center:
 
-The top bar shows the selected model and the active loaded model separately, so you can tell whether the backend config and the live Ollama runtime match.
+1. Pick a workspace.
+2. Use the project explorer, file viewer, search, git status, and git diff panels without AI.
+3. Pick a mode: Chat, Inspect, Plan, Trusted Edit, Full Agent, or Danger Sandbox.
+4. Use the runtime card to confirm provider, endpoint, model, and health.
+5. Review tool activity, approvals, diffs, terminal output, and verification status in the run panels.
+6. Save small project memory facts in Settings only when they help routing.
 
-## Benchmarking
+## Runtime Defaults
 
-Run built API/CLI for real timings:
+| Setting | Default |
+|---|---|
+| Provider | `llamacpp` |
+| Base URL | `http://127.0.0.1:8080/v1` |
+| API key | `no-key` |
+| Model | `gemma4:e4b` |
+| Stable hardware target | 16 GB RAM, CPU-first, no GPU assumption |
+
+Override with:
 
 ```bash
-npm run build
-node apps/cli/dist/cli.js benchmark
+export HARNESS_RUNTIME_PROVIDER=llamacpp
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=no-key
+export HARNESS_MODEL=gemma4:e4b
 ```
 
-The benchmark CLI targets `http://127.0.0.1:3001/api` by default. It measures direct chat, agentic chat, tool call, image turn, and think on/off turns, each with cold and warm passes plus first-token timing. Direct chat is the think-off baseline.
+Ollama remains available as a legacy provider:
 
-Use built app or CLI for measurement. Vite dev noise and sandboxed port-binding results are not the baseline.
+```bash
+export HARNESS_RUNTIME_PROVIDER=ollama-legacy
+export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+export OPENAI_API_KEY=ollama
+```
+
+## Modes
+
+| Mode | Purpose |
+|---|---|
+| Chat | Model chat, no tools by default. |
+| Inspect | Deterministic read/search/git tools only; no edits; no model required. |
+| Plan | AI can inspect and propose; no edits or hidden checkpoints. |
+| Trusted Edit | Scoped in-workspace edits with fewer prompts; protected paths still blocked. |
+| Full Agent | Plan, edit, verify, summarize with visible timeline and bounded loops. |
+| Danger Sandbox | Advanced sandbox/dev mode; outside-workspace and protected-path boundaries still apply. |
 
 ## Docker Run
 
-If you want to run the harness without leaving the IDE open, use Docker Compose from the repo root:
+Docker Compose runs the Web UI and API. The model server still runs separately on the host.
 
 ```bash
 docker compose up --build
 ```
 
-This starts:
-- Web UI on `http://localhost:8080`
-- API on `http://localhost:3001`
+Defaults:
 
-Notes:
-- The web container proxies `/api` to the API container, so the browser UI works as a single app.
-- The API container mounts `${HARNESS_WORKSPACE_SOURCE:-.}` into `/workspace`, which means it can operate on the current repo by default.
-- On Linux, the API container uses host networking so it can reach Ollama on the host loopback address by default.
-- The API uses `${HARNESS_MODEL_BASE_URL:-http://127.0.0.1:11434/v1}` by default.
-- Use `http://localhost:8080` in your browser for the app. If you want to probe the API directly, use `http://localhost:3001/api/health`.
-- Do not browse to `http://0.0.0.0:3001`; `0.0.0.0` is only the bind address shown in server logs.
-- To point the container at a different repo or folder, set `HARNESS_WORKSPACE_SOURCE` before running Compose.
+- Web UI: `http://localhost:8080`
+- API: `http://localhost:3001/api`
+- Workspace mount: `${HARNESS_WORKSPACE_SOURCE:-.}` to `/workspace`
+- Runtime provider: `${HARNESS_RUNTIME_PROVIDER:-llamacpp}`
+- Runtime base URL: `${HARNESS_MODEL_BASE_URL:-http://127.0.0.1:8080/v1}`
 
 Example:
 
 ```bash
-HARNESS_WORKSPACE_SOURCE=/absolute/path/to/your/project \
-HARNESS_MODEL_BASE_URL=http://127.0.0.1:11434/v1 \
+HARNESS_WORKSPACE_SOURCE=/absolute/path/to/project \
+HARNESS_RUNTIME_PROVIDER=llamacpp \
+HARNESS_MODEL_BASE_URL=http://127.0.0.1:8080/v1 \
 docker compose up --build
 ```
 
 ## Project Structure
 
+```text
+apps/
+  api/               Local API bridge to the core engine
+  cli/               Terminal interface
+  web/               Primary localhost Web UI
+packages/
+  core/              Orchestration engine, modes, memory, run traces
+  model-adapter/     Provider-based local runtime client
+  workspace-policy/  Mode-based permissions and protected-path checks
+  session-store/     File-based session persistence
+  trace-bus/         Tool/model/run event bus
+  tool-runtime/      Deterministic workspace, git, file, and command tools
+  planner/           Run-phase display state
+  approval-workflow/ Approval queue and diff review
+  repo-indexer/      Lightweight bounded project scanner
+  skills/            Native bundled skill pack and exporter
+  prompt-recipes/    Prompt patterns for small local models
+  doctor/            Diagnostics and benchmarks
+tests/               Unit, integration, and e2e tests
+docs/                Architecture, safety, install, runtime, and workflow docs
 ```
-├── apps/
-│   ├── cli/              # Terminal interface
-│   ├── api/              # Local API bridge to core engine
-│   └── web/              # Localhost web UI (Vite + React)
-├── packages/
-│   ├── core/             # Main orchestration engine
-│   ├── model-adapter/    # Ollama/OpenAI-compatible client
-│   ├── workspace-policy/ # Read-only / write / danger modes
-│   ├── session-store/    # File-based session persistence
-│   ├── trace-bus/        # Event bus for tool execution logging
-│   ├── tool-runtime/     # File, git, and shell tools
-│   ├── planner/          # UX-friendly execution state traces
-│   ├── approval-workflow/# Pending write queue and diff approval
-│   ├── repo-indexer/     # Lightweight project context scanner
-│   ├── skills/           # Skill indexer and Antigravity exporter
-│   ├── prompt-recipes/   # Optimized prompt patterns for local models
-│   └── doctor/           # Diagnostics and benchmarking
-├── third_party/          # Vendored upstream repos (read-only)
-├── tests/                # Unit, integration, and e2e tests
-└── docs/                 # Architecture, safety, install guides
+
+`base_repos/` and `third_party/` are not normal project context. They are ignored if they appear locally.
+
+## Development Commands
+
+```bash
+npm run build:packages
+npm run build:apps
+node --import tsx tests/unit/core.test.ts
+node --import tsx tests/integration/workflow.test.ts
+node --import tsx tests/e2e/cli.test.ts
+node --import tsx tests/e2e/api.test.ts
 ```
 
 ## Documentation
 
 | Doc | Purpose |
 |---|---|
-| [Architecture](docs/architecture.md) | System design and component diagram |
-| [Install Guide](docs/install.md) | Step-by-step setup |
-| [Local Models](docs/local-models.md) | Ollama configuration and profiles |
-| [Skills](docs/skills.md) | Skill system and persona activation |
-| [Prompt Recipes](docs/prompt-recipes.md) | Optimized prompt patterns |
-| [Safety](docs/safety.md) | Workspace boundaries and approval gates |
-| [Approvals](docs/approvals.md) | Diff review and write control |
-| [Antigravity](docs/antigravity.md) | Skill export and IDE integration |
-| [Benchmarks](docs/benchmarks.md) | Performance baselines |
-| [Stage Audit](docs/stage-audit.md) | Stage 1-20 completion status and cleanup summary |
-| [Provenance](docs/provenance-map.md) | Upstream repo origins and licenses |
+| [Architecture](docs/architecture.md) | System design |
+| [Install Guide](docs/install.md) | Setup and launch |
+| [Local Models](docs/local-models.md) | Runtime provider config |
+| [Safety](docs/safety.md) | Modes, protected paths, approvals |
+| [Skills](docs/skills.md) | Native skill pack |
+| [Benchmarks](docs/benchmarks.md) | Measurement guidance |
+| [Release Gate](docs/release-gate.md) | Acceptance criteria |
 
 ## License
 
-See individual vendored repositories in `third_party/` for their respective licenses.
+Project source is local-harness code. External reference repos are not required runtime inputs.

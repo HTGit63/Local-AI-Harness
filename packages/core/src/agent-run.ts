@@ -146,6 +146,9 @@ function inferCompactOutcome(run: AgentRun): CompactRunOutcome {
   if (run.approvals.some((approval) => approval.approved !== true)) {
     return 'blocked';
   }
+  if (run.commands.some((command) => !command.success || command.status === 'denied' || command.status === 'rejected')) {
+    return 'blocked';
+  }
   return 'done';
 }
 

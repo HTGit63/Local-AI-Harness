@@ -409,7 +409,7 @@ export async function runBenchmarks(options: BenchmarkOptions = {}): Promise<Ben
     hardware: {
       cpuOnly: true,
       ram: '16 GB',
-      runtime: 'Local Ollama',
+      runtime: 'Local llama.cpp/OpenAI-compatible',
     },
     scenarios: matrix,
     support,

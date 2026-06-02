@@ -21,7 +21,7 @@ Skills are agent personas that shape the model's behavior for specific tasks. Ea
 | Workflow Architect | Specialized | Low |
 | Reality Checker | Testing | Medium |
 
-The curated pack currently contains 12 skills and is regenerated from `third_party/agency-agents` during `packages/skills` build.
+The curated pack currently contains 12 native harness skills from `packages/skills/src/harness-native.ts`. External reference repositories are not required for normal builds.
 
 ## Activating Skills
 

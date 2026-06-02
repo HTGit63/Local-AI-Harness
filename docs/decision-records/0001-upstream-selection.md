@@ -1,17 +1,17 @@
 # Decision Record: 0001 - Upstream Repository Selection
 
 **Date**: 2026-04-10
-**Status**: Accepted
+**Status**: Superseded by the 2026-06-02 web-first reset in `AGENTS.md`
 
 ## Context
-We need to build a new local coding harness optimized for Gemma 4 E4B, offline usage, and low-resource environments (e.g., CPU-first inference, 16GB RAM) by leveraging code and concepts from four upstream repos: `openclaw`, `claw-code`, `agency-agents`, and `Prompt-Engineering-Guide`. Merging blindly from all four will result in a bloated, incompatible product.
+This historical record captured an early source-study plan. The current reset keeps the lightweight/offline goal, but removes external reference repositories from normal architecture and makes `llama.cpp` the stable runtime target.
 
 ## Decision
 We will not adopt any single upstream repository wholesale as the base runtime. Instead, we implement a composite intake strategy based on the Capability Audit:
 
 1. **`openclaw`**: We reject the multi-channel gateway routing, voice, and mobile networking nodes. We will selectively wrap its workspace bounding policies and adapt its Web UI for local usage only.
-2. **`claw-code`**: We reject its Anthropic dependencies and hidden reasoning "spinners." We will extract and directly import its strong CLI slash-commands, REPL scaffolding, and tool-action boundary concepts while repointing the inference core aggressively to `localhost:11434`.
-3. **`agency-agents`**: We will treat this repository as static metadata rather than a direct import. We will synthesize only the specialized coding/review personas into active skill configurations while ignoring marketing and sales personas.
+2. **`claw-code`**: We reject its Anthropic dependencies and hidden reasoning "spinners." Early CLI and tool-boundary ideas were useful, but the current product is Web UI first.
+3. **`agency-agents`**: Superseded. The current stable build uses native bundled harness skills and does not require external skill repos.
 4. **`Prompt-Engineering-Guide`**: We will not attempt to implement the entirety of this guide natively. We will synthesize lightweight, ReAct-focused prompt templates that fit the strict context requirements of a 4B parameter local model.
 
 ## Consequences

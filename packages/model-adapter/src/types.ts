@@ -26,7 +26,10 @@ export interface ChatCompletionRequest {
   signal?: AbortSignal;
 }
 
+export type RuntimeProvider = 'llamacpp' | 'ollama-legacy' | 'openai-compatible';
+
 export interface AdapterOptions {
+  provider?: RuntimeProvider;
   baseUrl?: string;
   apiKey?: string;
   model?: string;
@@ -82,6 +85,8 @@ export interface ModelLifecyclePolicy {
 }
 
 export interface ModelRuntimeState {
+  provider: RuntimeProvider;
+  baseUrl: string;
   configuredModel: string;
   activeModel: string | null;
   runtimeStatus: 'ready' | 'idle' | 'configured_not_loaded' | 'unavailable';

@@ -1,42 +1,36 @@
 # Benchmarks
 
-Run benchmarks from built CLI:
+Run benchmarks from built API/CLI:
 
 ```bash
 npm run build
 node apps/cli/dist/cli.js benchmark
 ```
 
-The benchmark runner targets `http://127.0.0.1:3001/api` by default. Use built API/CLI for timings; Vite dev noise and sandboxed port-binding results are not the baseline.
+The benchmark runner targets `http://127.0.0.1:3001/api` by default. Use built code for baseline timings.
 
 ## Matrix
 
-Each row runs twice. First pass is cold. Second pass is warm. Report first-token timing, full-response timing, status count, and execution-loop count.
-
-| Scenario | Route | Flags | What it checks | Target |
-|---|---|---|---|---|
-| Direct chat | `/api/chat/stream` | `agentic=false`, `thinking=false` | Plain turn baseline | first token < 2000ms, full < 5000ms |
-| Agentic chat | `/api/chat/stream` | `agentic=true`, `thinking=false` | Planner and trace overhead | separate from direct path |
-| Tool call | `/api/chat/stream` | `agentic=true`, workspace-file prompt | Native tool loop | tool loop < 15ms |
-| Image turn | `/api/chat/stream` | `agentic=false`, `images=[...]` | Multimodal path | image survives end-to-end |
-| Think on | `/api/chat/stream` | `agentic=false`, `thinking=true` | Provider thinking stream | reasoning visible separately |
-
-Direct chat is the think-off baseline. Think on repeats the same short prompt with reasoning enabled.
-
-## Support Metrics
-
-| Metric | Target | Notes |
+| Scenario | Route | What it checks |
 |---|---|---|
-| File write latency | < 5ms | Local disk I/O |
-| File read latency | < 5ms | Local disk I/O |
-| Write-preview latency | < 5ms | Diff generation |
-| Tool-loop event overhead | < 15ms | TraceBus fan-out sanity |
-| UI event lag | < 2ms | TraceBus event propagation |
+| Direct chat | `/api/chat/stream` | Plain model turn and first-token timing |
+| Agent chat | `/api/chat/stream` | Planner and trace overhead |
+| Tool call | `/api/chat/stream` | Bounded tool loop |
+| Image turn | `/api/chat/stream` | Multimodal payload survives API/runtime |
+| Think on | `/api/chat/stream` | Provider-emitted thinking is separated when returned |
+| Deterministic list/read/search/git | `/api/workspace/*` | Zero model calls and immediate tool timing |
+
+## Targets
+
+| Metric | Target |
+|---|---:|
+| List root folder | < 200 ms |
+| Read normal file | < 100 ms |
+| Git status | < 500 ms |
+| Search normal repo | < 2 sec |
+| Deterministic model calls | 0 |
+| Tool event overhead | < 15 ms |
 
 ## Hardware Context
 
-All benchmarks assume:
-- CPU-only inference
-- 16 GB RAM
-- Linux x86_64
-- Ollama with `gemma4:e4b`
+Baseline assumes local Linux, 16 GB RAM, CPU-first inference, `llama.cpp`, and Gemma 4 E4B.

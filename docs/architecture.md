@@ -1,55 +1,85 @@
 # Architecture
 
-## Overview
-This document defines the core architecture for the local coding harness. The system is designed to be lightweight, offline-capable, and optimized for running on local CPU inference with limited RAM (e.g., 16 GB), prioritizing operator visibility without exposing internal reasoning clutter.
+## Product Shape
 
-## Core Decisions
+The harness is a web-first local coding tool. The Web UI is the control center; the CLI is secondary. Deterministic workspace operations are backend features and must work without the model.
 
-### Model & Transport
-- **Local Model Server**: Ollama
-- **Default Model**: `gemma4:e4b`
-- **Primary Transport**: Ollama native chat API (`/api/chat`) for local thinking visibility and reliable `think` control
-- **Compatibility Transports**: OpenAI-compatible API (`/v1`) and Anthropic-compatible API (`/v1/messages`) for external tool ecosystems and future provider adapters
+## Layer Order
 
-### Runtime Composition
-The application runtime is broken down into modular packages:
-- **Core Engine**: Orchestrates execution, memory, and task flow.
-- **Planner**: Manages task phases, plan states, reasoning summaries, and logical progression.
-- **Tool Runtime**: Executes bounded local operations securely inside the workspace.
-- **Skill Manager**: Ingests, parses, and provides curated skill prompts and behaviors.
-- **UI Event Bus**: Provides low-latency event streams indicating state changes and tool usage to connected surfaces.
-- **Session Storage**: Manages conversation history, metadata, and active state.
-- **Workspace Policy**: Enforces safety, read/write permissions, and boundaries around file operations.
+1. Deterministic tools
+2. Web UI control center
+3. Permission and sandbox policy
+4. Runtime provider adapter
+5. Agent brain
+6. Verification loop
+7. Project memory
 
-### Surfaces
-- **CLI**: Real terminal harness for fast programmatic, scripting, and pure-text interactions.
-- **Web UI**: Primary localhost frontend exposing comprehensive control over tasks, approvals, and diff reviews.
+This order matters. Simple file, search, git, and runtime status work must not route through Gemma.
 
-### Visibility & Tracing (Hard Rule)
-> **Constraint**: Do **not** fabricate or infer hidden reasoning. Only surface model-emitted thinking when the provider returns it explicitly.
+## Runtime
 
-The UI Event Bus and all surfaces must build their display logic around structured, concise operational visibility:
-- Current overall plan
-- Active phase
-- Tool name being executed
-- Tool input summary
-- Tool output summary
-- File diffs representing proposed state changes
-- Concise rationale blocks (why is the agent doing this?)
-- Model-emitted `thinking` or `<think>...</think>` blocks in a visually separate channel
+| Field | Stable value |
+|---|---|
+| Provider | `llamacpp` |
+| Transport | OpenAI-compatible `/v1` |
+| Base URL | `http://127.0.0.1:8080/v1` |
+| API key | `no-key` |
+| Model | `gemma4:e4b` |
 
-### Agentic Coding Compatibility
-- **Gemma 4 / Qwen 3.5**: Prefer native Ollama chat for non-tool turns so the harness can preserve `thinking` output and explicitly suppress or reduce thinking on simple inspect requests.
-- **Tool strategy**: Small local reasoning models should default to deterministic local shortcuts for trivial workspace questions, native Ollama tool calling first, and stepwise/manual tool protocol only when native tool calling is flaky or unsupported.
-- **Workspace truth**: The sidebar and CLI must reflect the same backend workspace root the tools use; browser-only folder attachments are secondary context, not the source of truth.
-- **Surface parity**: CLI and Web must share the same session phases, thinking presentation, workspace root, model runtime status, and approval workflow language so the harness feels consistent across both surfaces.
-- **Mode split**: Direct chat and agentic coding are separate runtime paths; style overlays must never change approval or safety copy.
+Optional providers:
 
-### Storage
-- **Session Storage Engine**: Local file-based JSON/text formats or a local SQLite database suitable for persistent session history, configuration parameters, and metadata storage.
+- `openai-compatible` for custom local servers.
+- `ollama-legacy` for existing Ollama setups and lifecycle calls.
 
-### Extension Paths
-The system must be built with clear extension paths to prevent technical debt:
-- **Antigravity Exporter**: Architecture must yield to exporting custom workflows and skills into Antigravity packages.
-- **IDE Extensions**: Provide clear IPC or port logic to enable future VS Code / editor integrations.
-- **Standalone App Packaging**: Core logic decoupling allowing for future GUI bundling via Tauri or Electron for consumer installation.
+Provider-specific behavior is isolated inside `packages/model-adapter`.
+
+## Core Packages
+
+- `packages/core`: mode routing, orchestration, traces, project memory, and agent runs.
+- `packages/tool-runtime`: deterministic workspace, file, git, diff, and command tools.
+- `packages/workspace-policy`: mode-based permissions, workspace boundary, and protected-path checks.
+- `packages/model-adapter`: provider-based local runtime client.
+- `packages/repo-indexer`: bounded project summaries, ignoring reference folders and build output.
+- `packages/skills`: native bundled skill metadata and Antigravity export.
+- `packages/doctor`: diagnostics and benchmarks.
+
+## Web UI Contract
+
+The Web UI exposes:
+
+- workspace selection
+- project explorer
+- file viewer
+- text search
+- git status and diff
+- runtime/model status
+- mode selector
+- tool activity
+- agent timeline
+- approvals
+- diff review
+- terminal output
+- verification result
+- project memory editor
+
+Raw traces and raw structured diff details are advanced-only.
+
+## Agent Contract
+
+The agent is one feature on top of tools, UI, runtime, and policy. It must:
+
+- inspect minimal evidence
+- search before reading broad files
+- plan before editing
+- avoid full repo context
+- show diffs
+- run or report verification truthfully
+- stop after bounded loops
+
+Inspect and Plan modes do not edit or create hidden checkpoints.
+
+## Context And Memory
+
+`base_repos/` and `third_party/` are not normal project context. They are ignored if they exist locally.
+
+Project memory is structured routing data, not repo memory. It is visible and user-editable.

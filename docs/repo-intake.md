@@ -1,27 +1,13 @@
 # Repository Intake Process
 
-## Purpose
-This document outlines the rules for what may be copied, wrapped, referenced, or transformed from the upstream vendor repositories in the `third_party` directory.
+External reference repositories are not part of the normal harness architecture.
 
-## General Rules
-1. **Preservation**: Vendored repositories under `third_party/` are preserved intact. Do not destructively modify vendored source code or content.
-2. **Composition over Merging**: Favor writing new code that composes or calls into vendored assets, rather than merging files directly.
-3. **Traceability**: All borrowed pieces must be traceable back to their upstream repository. Read `provenance-map.md` for specific license and attribution obligations.
+Rules:
 
-## Specific Repository Intake
+1. Do not add `base_repos/` or `third_party/` as normal project context.
+2. Do not scan copied external repos for model context by default.
+3. Keep ignore rules for these folders so accidental local copies do not slow tools or bias prompts.
+4. If external source material is needed, bring in only the specific idea or small artifact with clear attribution.
+5. Normal builds must work from this repo's source code and bundled native skill pack.
 
-### `openclaw/openclaw`
-- **What to Keep**: Local-first architecture mindset, gateway/control-plane concepts, WebChat UI ideas, skills/workspace injection, and operator ergonomics.
-- **Rules**: Can reference architectures and borrow UI concepts. Multi-channel messaging and mobile node stacks must be avoided.
-
-### `ultraworkers/claw-code`
-- **What to Keep**: CLI harness patterns, REPL ideas, session model, read-only/workspace-write permissions, and OpenAI-compatible provider routes.
-- **Rules**: Can copy command parsing logic and session structural code, provided Anthropic-first defaults and output budgeting limits are rewritten to favor `gemma4:e4b`.
-
-### `msitarzewski/agency-agents`
-- **What to Keep**: Full agent library vendored intact, Antigravity skill formatting, role descriptions, and expert coding personas.
-- **Rules**: Do not modify directly. Wrap and extract metadata to generate runtime-ready curated skills. Only activate a small local-coding optimized set by default.
-
-### `dair-ai/Prompt-Engineering-Guide`
-- **What to Keep**: ReAct tools, prompt design patterns, eval concepts, constraint patterns, and documentation.
-- **Rules**: Treat strictly as reference material. Do not execute or directly embed this guide as runtime logic. Extract useful prompts into separate lightweight recipes under `packages/prompt-recipes/`.
+Historical source studies may remain documented, but they are not runtime dependencies.

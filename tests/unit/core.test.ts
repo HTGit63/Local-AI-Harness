@@ -17,7 +17,7 @@ function assertAgentWorkResponse(response: string, expectedPrefix: string) {
 }
 
 function assertLeanThinkingControl(value: unknown) {
-  assert.ok(value === false || value === 'low', `Expected lean thinking control, got: ${String(value)}`);
+  assert.ok(value === undefined || value === false || value === 'none' || value === 'low', `Expected lean thinking control, got: ${String(value)}`);
 }
 
 function getLatestAgentRunSummary(engine: CoreEngine) {
@@ -31,9 +31,10 @@ async function testConfigDefaults() {
   const engine = new CoreEngine();
   const config = engine.getPublicConfig();
 
-  assert.ok(config.baseUrl.includes('11434'));
+  assert.strictEqual(config.provider, 'llamacpp');
+  assert.ok(config.baseUrl.includes('8080'));
   assert.strictEqual(config.model, 'gemma4:e4b');
-  assert.strictEqual(config.mode, 'workspace-write');
+  assert.strictEqual(config.mode, 'chat');
   assert.strictEqual(config.profile, 'balanced');
   assert.strictEqual(config.contextBudget, 16000);
   assert.strictEqual(config.toolRetryMax, 2);
@@ -71,16 +72,152 @@ async function testPromptAnalyzerIsPassThrough() {
 
 function testWorkspacePolicy() {
   const root = '/tmp/gamma-project';
-  const policy = new WorkspacePolicy({ workspaceRoot: root, mode: 'workspace-write' });
-  const dangerPolicy = new WorkspacePolicy({ workspaceRoot: root, mode: 'danger' });
+  const policy = new WorkspacePolicy({ workspaceRoot: root, mode: 'full-agent' });
+  const trustedPolicy = new WorkspacePolicy({ workspaceRoot: root, mode: 'trusted-edit' });
+  const chatPolicy = new WorkspacePolicy({ workspaceRoot: root, mode: 'chat' });
+  const dangerPolicy = new WorkspacePolicy({ workspaceRoot: root, mode: 'danger-sandbox' });
 
   assert.deepStrictEqual(policy.checkAction('read', 'src/index.ts').allowed, true);
   assert.deepStrictEqual(policy.checkAction('write', 'src/index.ts').requiresApproval, true);
   assert.deepStrictEqual(policy.checkAction('write', '/etc/passwd').allowed, false);
   assert.deepStrictEqual(policy.checkAction('write', `${root}-outside/file.ts`).allowed, false);
+  assert.deepStrictEqual(policy.checkAction('read', '.env').allowed, false);
+  assert.deepStrictEqual(trustedPolicy.checkAction('write', 'src/index.ts').requiresApproval, false);
+  assert.deepStrictEqual(trustedPolicy.checkAction('delete', 'src/index.ts').requiresApproval, true);
+  assert.deepStrictEqual(chatPolicy.checkAction('write', 'src/index.ts').allowed, false);
   assert.deepStrictEqual(dangerPolicy.checkAction('write', 'src/index.ts').allowed, true);
   assert.deepStrictEqual(dangerPolicy.checkAction('write', 'src/index.ts').requiresApproval, false);
   assert.deepStrictEqual(dangerPolicy.checkAction('write', '/etc/passwd').allowed, false);
+}
+
+async function testPlanModeDoesNotExposeEditToolsOrCheckpoints() {
+  const originalFetch = globalThis.fetch;
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-plan-mode-'));
+  const chatRequests: any[] = [];
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Plan only: inspect src/index.ts, patch the export, then run targeted verification after edit mode is enabled.' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, mode: 'plan', model: 'gemma4:e4b' });
+    const response = await engine.chat([
+      { role: 'user', content: 'Edit src/index.ts and run npm test.' },
+    ]);
+
+    assert.ok(response.includes('Plan only:'));
+    assert.ok(chatRequests.length >= 1);
+    const exposedTools = new Set<string>((chatRequests[0].tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name).filter(Boolean));
+    for (const deniedTool of ['writeFile', 'patchFile', 'runCommand', 'createCheckpoint', 'rollbackToCheckpoint']) {
+      assert.ok(!exposedTools.has(deniedTool), `${deniedTool} should not be exposed in Plan Mode`);
+    }
+    assert.ok(exposedTools.has('listDir') || exposedTools.has('searchText') || exposedTools.has('readFile'));
+    assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'task_checkpoint_saved' || entry.type === 'run_auto_checkpoint_created'));
+
+    const write = await engine.writeFile('src/index.ts', 'export const changed = true;\n');
+    assert.strictEqual(write.success, false);
+    const checkpoint = await engine.createCheckpoint('plan should not checkpoint');
+    assert.strictEqual(checkpoint.success, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testInspectModeAllowsOnlyDeterministicReadTools() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-inspect-mode-'));
+  await fs.writeFile(path.join(workspaceRoot, 'file.txt'), 'hello inspect\n', 'utf8');
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, mode: 'inspect' });
+    const read = await engine.readFile('file.txt');
+    assert.strictEqual(read.success, true);
+    assert.ok(read.output.includes('hello inspect'));
+
+    const gitStatus = await engine.gitStatus();
+    assert.strictEqual(gitStatus.success, true);
+
+    const write = await engine.writeFile('file.txt', 'blocked\n');
+    assert.strictEqual(write.success, false);
+    assert.ok(write.output.includes('Denied'));
+
+    const command = await engine.runCommand('git status');
+    assert.strictEqual(command.success, false);
+    assert.ok(command.output.includes('Denied'));
+
+    const checkpoint = await engine.createCheckpoint('inspect should not checkpoint');
+    assert.strictEqual(checkpoint.success, false);
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testTrustedEditAllowsSafeVerificationCommandWithoutApproval() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-verify-allowlist-'));
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({
+    scripts: {
+      test: 'node -e "console.log(\'verification ok\')"',
+    },
+  }), 'utf8');
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, mode: 'trusted-edit' });
+    const result = await engine.runCommand('npm test');
+    assert.strictEqual(result.success, true);
+    assert.ok(result.output.includes('verification ok'));
+    assert.strictEqual(result.metadata?.command?.approvalRequired, false);
+    assert.strictEqual(result.metadata?.command?.status, 'executed');
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testProjectMemoryIsStructuredEditableAndSelective() {
+  const originalFetch = globalThis.fetch;
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-project-memory-'));
+  const chatRequests: any[] = [];
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'Memory-aware response.' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent' });
+    const saved = await engine.updateProjectMemory({
+      projectName: 'Memory Test',
+      packageManager: 'npm',
+      testCommands: ['npm test'],
+      userPreferences: ['keep replies terse'],
+      rules: ['do not run full build unless requested'],
+    });
+    assert.strictEqual(saved.projectName, 'Memory Test');
+    assert.ok(saved.updatedAt >= saved.createdAt);
+
+    await engine.chat([{ role: 'user', content: 'Fix the project test failure.' }]);
+    assert.ok(chatRequests.some((body) => JSON.stringify(body.messages).includes('[Project Memory]')));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'project_memory_loaded'));
+
+    assert.strictEqual(await engine.deleteProjectMemory(), true);
+    const empty = await engine.getProjectMemory();
+    assert.strictEqual(empty.projectName, undefined);
+    assert.deepStrictEqual(empty.testCommands, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
 }
 
 function testTaskOrchestratorClassifiesIntent() {
@@ -188,30 +325,58 @@ async function testModelAdapter() {
     }) as typeof MOCK_CHAT_RESPONSE;
     assert.strictEqual(response.choices[0].message.content, MOCK_CHAT_RESPONSE.choices[0].message.content);
     const runtimeBefore = await adapter.getRuntimeState();
-    assert.strictEqual(runtimeBefore.activeModel, null);
-    assert.strictEqual(runtimeBefore.runtimeStatus, 'idle');
+    assert.strictEqual(runtimeBefore.provider, 'llamacpp');
+    assert.strictEqual(runtimeBefore.activeModel, 'gemma4:e4b');
+    assert.strictEqual(runtimeBefore.runtimeStatus, 'ready');
     assert.ok(runtimeBefore.installedModels.includes('qwen3.5:9b-q4_K_M'));
-    assert.deepStrictEqual(runtimeBefore.configuredModelCapabilities, MOCK_MODEL_CAPABILITIES['gemma4:e4b']);
-    assert.strictEqual(runtimeBefore.reasoningSupported, true);
+    assert.deepStrictEqual(runtimeBefore.configuredModelCapabilities, ['tools']);
+    assert.strictEqual(runtimeBefore.reasoningSupported, false);
     assert.strictEqual(runtimeBefore.nativeToolCallingSupported, true);
     assert.strictEqual(runtimeBefore.lifecyclePolicy.preloadKeepAlive, '2m');
     assert.strictEqual(runtimeBefore.lifecyclePolicy.unloadKeepAlive, 0);
 
     const switchResult = await adapter.activateModel('qwen3.5:9b-q4_K_M', 'gemma4:e4b');
     assert.strictEqual(switchResult.activeModel, 'qwen3.5:9b-q4_K_M');
-    assert.deepStrictEqual(switchResult.runningModels.map((entry) => entry.model), ['qwen3.5:9b-q4_K_M']);
+    assert.strictEqual(switchResult.supportsLifecycle, false);
+    assert.deepStrictEqual(switchResult.runningModels.map((entry) => entry.model), []);
     assert.deepStrictEqual(switchResult.unloadedModels, []);
 
     const runtimeAfter = await adapter.getRuntimeState();
     assert.strictEqual(runtimeAfter.activeModel, 'qwen3.5:9b-q4_K_M');
-    assert.strictEqual(runtimeAfter.runtimeStatus, 'configured_not_loaded');
+    assert.strictEqual(runtimeAfter.runtimeStatus, 'ready');
     assert.strictEqual(runtimeAfter.lastSwitchResult?.requestedModel, 'qwen3.5:9b-q4_K_M');
     assert.strictEqual(runtimeAfter.lifecyclePolicy.chatTimeoutMs >= 180_000, true);
     assert.strictEqual(PROFILES.fast.max_tokens, 512);
 
     const secondSwitch = await adapter.activateModel('gemma4:e4b', 'qwen3.5:9b-q4_K_M');
     assert.deepStrictEqual(secondSwitch.unloadedModels, []);
-    assert.deepStrictEqual(secondSwitch.runningModels.map((entry) => entry.model).sort(), ['gemma4:e4b', 'qwen3.5:9b-q4_K_M'].sort());
+    assert.deepStrictEqual(secondSwitch.runningModels.map((entry) => entry.model), []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testModelAdapterLegacyOllamaLifecycle() {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = createMockFetch() as typeof fetch;
+
+  try {
+    const adapter = new ModelAdapter({
+      provider: 'ollama-legacy',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      apiKey: 'ollama',
+    });
+    const runtimeBefore = await adapter.getRuntimeState();
+    assert.strictEqual(runtimeBefore.provider, 'ollama-legacy');
+    assert.strictEqual(runtimeBefore.activeModel, null);
+    assert.strictEqual(runtimeBefore.runtimeStatus, 'idle');
+    assert.deepStrictEqual(runtimeBefore.configuredModelCapabilities, MOCK_MODEL_CAPABILITIES['gemma4:e4b']);
+    assert.strictEqual(runtimeBefore.reasoningSupported, true);
+
+    const switchResult = await adapter.activateModel('qwen3.5:9b-q4_K_M', 'gemma4:e4b');
+    assert.strictEqual(switchResult.activeModel, 'qwen3.5:9b-q4_K_M');
+    assert.deepStrictEqual(switchResult.runningModels.map((entry) => entry.model), ['qwen3.5:9b-q4_K_M']);
+    assert.strictEqual(switchResult.supportsLifecycle, true);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -230,7 +395,11 @@ async function testModelAdapterPrefersNativeOllamaChat() {
   }) as typeof fetch;
 
   try {
-    const adapter = new ModelAdapter();
+    const adapter = new ModelAdapter({
+      provider: 'ollama-legacy',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      apiKey: 'ollama',
+    });
     await adapter.createChatCompletion({
       messages: [{ role: 'user', content: 'Describe this image', images: ['abc123'] }],
       think: true,
@@ -242,6 +411,26 @@ async function testModelAdapterPrefersNativeOllamaChat() {
     assert.deepStrictEqual(chatRequest?.body.messages?.[0]?.images, ['abc123']);
     assert.strictEqual(chatRequest?.body.think, true);
     assert.ok(!requests.some((entry) => entry.url.includes('/v1/chat/completions')));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testModelAdapterReportsLlamaCppOffline() {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error('offline');
+  }) as typeof fetch;
+
+  try {
+    const adapter = new ModelAdapter({
+      provider: 'llamacpp',
+      baseUrl: 'http://127.0.0.1:8080/v1',
+    });
+    const runtime = await adapter.getRuntimeState(0);
+    assert.strictEqual(runtime.runtimeStatus, 'unavailable');
+    assert.strictEqual(runtime.activeModel, null);
+    assert.ok(runtime.statusMessage.includes('not reachable'));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -270,7 +459,7 @@ async function testModelAdapterCapsLocalOutputTokens() {
         max_tokens: 50000,
       });
       const latestRequest = chatRequests[chatRequests.length - 1];
-      assert.strictEqual(latestRequest.options.num_predict, expectedCap);
+      assert.strictEqual(latestRequest.max_tokens, expectedCap);
     }
   } finally {
     globalThis.fetch = originalFetch;
@@ -282,7 +471,7 @@ async function testEnginePromptRecipeSelection() {
   globalThis.fetch = createMockFetch() as typeof fetch;
 
   try {
-    const engine = new CoreEngine();
+    const engine = new CoreEngine({ mode: 'full-agent' });
     const response = await engine.chat([
       { role: 'user', content: 'Review this diff for regressions' },
     ]);
@@ -358,7 +547,7 @@ async function testEngineChatStream() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine();
+    const engine = new CoreEngine({ mode: 'full-agent' });
     const response = await engine.chatStream(
       [{ role: 'user', content: 'Explain what you are doing' }],
       {
@@ -428,7 +617,8 @@ async function testEngineChatStreamEmitsToolEvents() {
   try {
     const engine = new CoreEngine({
       workspaceRoot,
-      model: 'qwen3.5:9b-q4_K_M',
+      mode: 'full-agent',
+      model: 'gemma4:e4b',
     });
     const response = await engine.chatStream(
       [{ role: 'user', content: 'Read src/index.ts and tell me what it exports' }],
@@ -542,7 +732,7 @@ async function testDirectChatStreamRetriesVisibleOnIdle() {
   globalThis.fetch = (async (url: any, opts?: any) => {
     const requestUrl = String(url);
     const body = typeof opts?.body === 'string' && opts.body.trim() ? JSON.parse(opts.body) : {};
-    if (requestUrl.includes('/api/chat') && body.stream) {
+    if (requestUrl.includes('/v1/chat/completions') && body.stream) {
       stalledStreamCalls += 1;
       const error = new Error('stream stalled') as Error & { code: string; receivedContent: boolean };
       error.code = 'stream_idle_timeout';
@@ -745,11 +935,68 @@ async function testRepoIndexerBuildsWorkspaceInventory() {
     const indexer = new RepoIndexer(workspaceRoot);
     const inventory = await indexer.buildWorkspaceInventory();
     assert.strictEqual(inventory.rootPackageName, 'gamma-root');
-    assert.deepStrictEqual(inventory.workspaceGlobs, ['apps/*', 'packages/*']);
-    assert.deepStrictEqual(inventory.apps.map((entry) => entry.name), ['@local-harness/api']);
-    assert.deepStrictEqual(inventory.packages.map((entry) => entry.name), ['@local-harness/core']);
-    assert.ok(inventory.references.some((entry) => entry.area === 'base_repos' && entry.entries.includes('claw-code')));
-    assert.ok(inventory.references.some((entry) => entry.area === 'third_party' && entry.entries.includes('openclaw')));
+  assert.deepStrictEqual(inventory.workspaceGlobs, ['apps/*', 'packages/*']);
+  assert.deepStrictEqual(inventory.apps.map((entry) => entry.name), ['@local-harness/api']);
+  assert.deepStrictEqual(inventory.packages.map((entry) => entry.name), ['@local-harness/core']);
+  assert.deepStrictEqual(inventory.references, []);
+  assert.ok(!inventory.topLevelAreas.includes('base_repos'));
+  assert.ok(!inventory.topLevelAreas.includes('third_party'));
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDeterministicToolsBoundLargeAndBinaryFiles() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-tool-bounds-'));
+  const largeText = `${'x'.repeat(300_000)}\nend\n`;
+  await fs.writeFile(path.join(workspaceRoot, 'large.txt'), largeText, 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'binary.bin'), Buffer.from([0, 1, 2, 3, 4, 5, 0, 8]));
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot });
+    const large = await engine.readFile('large.txt');
+    assert.strictEqual(large.success, true);
+    assert.ok(large.output.includes('file truncated'));
+    assert.strictEqual(large.metadata?.truncated, true);
+    assert.ok(typeof large.metadata?.durationMs === 'number');
+
+    const binary = await engine.readFile('binary.bin');
+    assert.strictEqual(binary.success, false);
+    assert.ok(binary.output.includes('Binary file not rendered as text'));
+    assert.strictEqual(binary.metadata?.truncated, true);
+    assert.ok(typeof binary.metadata?.durationMs === 'number');
+  } finally {
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDeterministicToolsIgnoreHeavyAndReferenceDirs() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-tool-ignore-'));
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'node_modules', 'demo'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'third_party', 'demo'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'base_repos', 'demo'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const kept = "needle";\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'node_modules', 'demo', 'ignored.ts'), 'needle\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'third_party', 'demo', 'ignored.ts'), 'needle\n', 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'base_repos', 'demo', 'ignored.ts'), 'needle\n', 'utf8');
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot });
+    const listing = await engine.listDir('.');
+    assert.strictEqual(listing.success, true);
+    assert.ok(listing.output.includes('dir  src'));
+    assert.ok(!listing.output.includes('node_modules'));
+    assert.ok(!listing.output.includes('third_party'));
+    assert.ok(!listing.output.includes('base_repos'));
+    assert.ok(typeof listing.metadata?.durationMs === 'number');
+
+    const search = await engine.searchText('needle');
+    assert.strictEqual(search.success, true);
+    assert.ok(search.output.includes('src/index.ts'));
+    assert.ok(!search.output.includes('node_modules'));
+    assert.ok(!search.output.includes('third_party'));
+    assert.ok(!search.output.includes('base_repos'));
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
@@ -871,7 +1118,7 @@ async function testEnginePrefersNativeToolsForGemmaTargetedEdits() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine();
+    const engine = new CoreEngine({ mode: 'full-agent' });
     const response = await engine.chat([
       { role: 'user', content: 'Fix src/index.ts so it exports a default value' },
     ]);
@@ -903,7 +1150,13 @@ async function testEngineKeepsNativeToolsWhenCapabilitiesOmitTools() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ model: 'gemma4:e4b' });
+    const engine = new CoreEngine({
+      provider: 'ollama-legacy',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      apiKey: 'ollama',
+      model: 'gemma4:e4b',
+      mode: 'full-agent',
+    });
     const response = await engine.chat([
       { role: 'user', content: 'Fix src/index.ts so it exports a default value' },
     ]);
@@ -972,7 +1225,7 @@ async function testEngineRecoversFromPlanningOnlyNativeReply() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ workspaceRoot, model: 'gemma4:e4b' });
+    const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent', model: 'gemma4:e4b' });
     const response = await engine.chat([
       { role: 'user', content: 'Read src/index.ts and tell me what it exports.' },
     ]);
@@ -1018,7 +1271,7 @@ async function testEngineUsesManualToolProtocolWhenModelLacksNativeTools() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ workspaceRoot, model: 'deepseek-coder-v2:latest' });
+    const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent', model: 'deepseek-coder-v2:latest' });
     const response = await engine.chat([
       { role: 'user', content: 'Inspect src/index.ts and answer with its content' },
     ]);
@@ -1110,7 +1363,7 @@ async function testEngineDoesNotShortCircuitWritePromptsThatMentionProjectMetada
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ workspaceRoot, model: 'gemma4:e4b' });
+    const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent', model: 'gemma4:e4b' });
     const response = await engine.chat([
       {
         role: 'user',
@@ -1144,7 +1397,7 @@ async function testEnginePrefersNativeToolsForGemmaQuickInspect() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ workspaceRoot, model: 'gemma4:e4b' });
+    const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent', model: 'gemma4:e4b' });
     const response = await engine.chat([
       { role: 'user', content: 'Inspect src/index.ts and answer with its content' },
     ]);
@@ -1179,7 +1432,12 @@ async function testEngineWarnsWhenThinkingUnsupported() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ model: 'gemma4:e4b' });
+    const engine = new CoreEngine({
+      provider: 'ollama-legacy',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      apiKey: 'ollama',
+      model: 'gemma4:e4b',
+    });
     const response = await engine.chat([
       { role: 'user', content: 'Explain the plan briefly' },
     ], { think: true });
@@ -1339,7 +1597,7 @@ async function testEngineRejectsSimulatedToolTranscripts() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine();
+    const engine = new CoreEngine({ mode: 'full-agent' });
     const response = await engine.chat([
       { role: 'user', content: 'Create notes.txt with hello' },
     ]);
@@ -1491,6 +1749,7 @@ async function testEngineRequestsSelfCheckAfterWrite() {
   try {
     const engine = new CoreEngine({
       workspaceRoot,
+      mode: 'full-agent',
       selfCheckEnabled: true,
       toolRetryMax: 2,
     });
@@ -1659,7 +1918,7 @@ async function testEngineCompactsLargeToolOutputsForModel() {
   try {
     const engine = new CoreEngine({
       workspaceRoot,
-      model: 'qwen3.5:9b-q4_K_M',
+      model: 'gemma4:e4b',
     });
     const response = await engine.chat([
       { role: 'user', content: 'Read large.txt and summarize it for me.' },
@@ -1852,10 +2111,16 @@ async function run() {
   testPromptRecipes();
   await testPromptAnalyzerIsPassThrough();
   testWorkspacePolicy();
+  await testPlanModeDoesNotExposeEditToolsOrCheckpoints();
+  await testInspectModeAllowsOnlyDeterministicReadTools();
+  await testTrustedEditAllowsSafeVerificationCommandWithoutApproval();
+  await testProjectMemoryIsStructuredEditableAndSelective();
   testTaskOrchestratorClassifiesIntent();
   testTaskOrchestratorPlanAndStepTransitions();
   await testModelAdapter();
+  await testModelAdapterLegacyOllamaLifecycle();
   await testModelAdapterPrefersNativeOllamaChat();
+  await testModelAdapterReportsLlamaCppOffline();
   await testModelAdapterCapsLocalOutputTokens();
   await testEnginePromptRecipeSelection();
   await testEngineSanitizesDisabledSkills();
@@ -1870,6 +2135,8 @@ async function run() {
   await testEngineCreatesTaskPlanTraceAndCheckpoint();
   await testRepoIndexerExcludesVendoredAndSessionDirs();
   await testRepoIndexerBuildsWorkspaceInventory();
+  await testDeterministicToolsBoundLargeAndBinaryFiles();
+  await testDeterministicToolsIgnoreHeavyAndReferenceDirs();
   await testRepoIndexerInspectsGenericExpressProject();
   await testRepoIndexerBuildsTaskContext();
   await testEngineKeepsSimplePromptsLean();

@@ -17,9 +17,9 @@ async function testSessionStore() {
     createdAt: now,
     updatedAt: now,
     model: 'gemma4:e4b',
-    mode: 'workspace-write',
+    mode: 'full-agent',
     cwd: tempDir,
-    skillsActive: ['engineering-frontend-developer'],
+    skillsActive: ['repo-cartographer'],
     toolsAllowlist: ['read_file'],
     turnHistory: Array.from({ length: 55 }, (_, index) => ({
       timestamp: now + index,
@@ -101,7 +101,7 @@ async function testApprovalQueue() {
 
 async function testToolRegistry() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-tools-'));
-  const policy = new WorkspacePolicy({ workspaceRoot: tempDir, mode: 'workspace-write' });
+  const policy = new WorkspacePolicy({ workspaceRoot: tempDir, mode: 'full-agent' });
   const approvals: Array<{ resolve: (approved: boolean) => void }> = [];
   const traces: Array<{ type: string; data: any }> = [];
 
@@ -173,7 +173,7 @@ async function testToolRegistry() {
 
 async function testSaferEditTools() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-safe-edits-'));
-  const policy = new WorkspacePolicy({ workspaceRoot: tempDir, mode: 'danger' });
+  const policy = new WorkspacePolicy({ workspaceRoot: tempDir, mode: 'danger-sandbox' });
   const traces: Array<{ type: string; data: any }> = [];
 
   await fs.writeFile(path.join(tempDir, 'app.ts'), [

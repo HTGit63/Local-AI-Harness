@@ -11,8 +11,9 @@ services:
       HARNESS_WORKSPACE_ROOT: /workspace
       HARNESS_WORKSPACE_SEARCH_ROOTS: /host-projects
       HARNESS_ALLOWED_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
-      OPENAI_BASE_URL: ${HARNESS_MODEL_BASE_URL:-http://127.0.0.1:11434/v1}
-      OPENAI_API_KEY: ${HARNESS_MODEL_API_KEY:-ollama}
+      HARNESS_RUNTIME_PROVIDER: ${HARNESS_RUNTIME_PROVIDER:-llamacpp}
+      OPENAI_BASE_URL: ${HARNESS_MODEL_BASE_URL:-http://127.0.0.1:8080/v1}
+      OPENAI_API_KEY: ${HARNESS_MODEL_API_KEY:-no-key}
     volumes:
       - ${HARNESS_WORKSPACE_SOURCE:-.}:/workspace
       - ${HARNESS_WORKSPACE_SEARCH_SOURCE:-..}:/host-projects

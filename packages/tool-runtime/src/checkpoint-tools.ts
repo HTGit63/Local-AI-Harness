@@ -2,7 +2,21 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 
 const CHECKPOINT_DIR = '.gamma-harness/checkpoints';
-const IGNORED_DIRS = new Set(['.git', '.gamma-harness', 'node_modules', 'dist', 'build', '.next', 'base_repos', 'third_party']);
+const IGNORED_DIRS = new Set([
+  '.cache',
+  '.git',
+  '.gamma-harness',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  '.vite',
+  'base_repos',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'third_party',
+]);
 const MAX_SNAPSHOT_FILES = 5000;
 const MAX_SNAPSHOT_BYTES = 30 * 1024 * 1024;
 

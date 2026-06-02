@@ -15,6 +15,7 @@ const engine = new CoreEngine({
   workspaceRoot: process.cwd(),
   profile: 'balanced',
 });
+const POLICY_MODES = ['chat', 'inspect', 'plan', 'trusted-edit', 'full-agent', 'danger-sandbox', 'read-only', 'workspace-write', 'danger'] as const;
 
 function printJson(value: unknown) {
   console.log(JSON.stringify(value, null, 2));
@@ -121,6 +122,10 @@ async function handlePrompt() {
   const thinkingWarning = thinkingEnabled === true && !supportsThinking(runtime?.configuredModelCapabilities)
     ? 'Thinking unavailable on current model; toggle may be ignored.'
     : null;
+
+  if (useAgent && engine.getPublicConfig().mode === 'chat') {
+    await engine.updateConfig({ mode: 'full-agent' });
+  }
 
   if (isJson) {
     const promptMessages = [{ role: 'user' as const, content: promptText }];
@@ -306,7 +311,10 @@ async function handleConfig() {
   printOutput(engine.getPublicConfig());
 }
 
-function startRepl(executionMode: 'chat' | 'agent' = 'chat') {
+async function startRepl(executionMode: 'chat' | 'agent' = 'chat') {
+  if (executionMode === 'agent' && engine.getPublicConfig().mode === 'chat') {
+    await engine.updateConfig({ mode: 'full-agent' });
+  }
   const history: { role: 'user' | 'assistant'; content: string }[] = [];
   const session = engine.startSession();
   let thinkingEnabled = false;
@@ -506,13 +514,13 @@ function startRepl(executionMode: 'chat' | 'agent' = 'chat') {
 
       if (input.startsWith('/mode ') || input.startsWith('/permissions ')) {
         const nextMode = input.split(' ').slice(1).join(' ').trim();
-        if (!['read-only', 'workspace-write', 'danger'].includes(nextMode)) {
-          console.log('Mode must be one of read-only, workspace-write, or danger');
+        if (!POLICY_MODES.includes(nextMode as (typeof POLICY_MODES)[number])) {
+          console.log(`Mode must be one of ${POLICY_MODES.join(', ')}`);
           rl.prompt();
           return;
         }
 
-        await engine.updateConfig({ mode: nextMode as 'read-only' | 'workspace-write' | 'danger' });
+        await engine.updateConfig({ mode: nextMode as (typeof POLICY_MODES)[number] });
         console.log(JSON.stringify({ mode: engine.getPublicConfig().mode }, null, 2));
         rl.prompt();
         return;
@@ -617,13 +625,13 @@ async function main() {
       if (isJson) {
         throw new Error('JSON mode is not supported for interactive chat.');
       }
-      startRepl('chat');
+      await startRepl('chat');
       return;
     case 'agent':
       if (isJson) {
         throw new Error('JSON mode is not supported for interactive agent.');
       }
-      startRepl('agent');
+      await startRepl('agent');
       return;
     case 'inspect': {
       const inspection = await engine.inspectProject();

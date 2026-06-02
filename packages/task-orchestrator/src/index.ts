@@ -9,7 +9,7 @@ export type TaskIntent =
   | 'full_audit';
 
 export type TaskSizeEstimate = 'none' | 'small' | 'medium' | 'large';
-export type TaskPlanMode = 'chat' | 'agent';
+export type TaskPlanMode = 'chat' | 'agent' | 'plan';
 export type TaskPlanStatus = 'pending' | 'running' | 'blocked' | 'safe_idle' | 'done' | 'failed';
 export type ToolProfileName = 'chat' | 'inspect' | 'edit-basic' | 'verify' | 'advanced';
 
@@ -391,6 +391,31 @@ function planStepTemplates(intent: TaskIntent, files: string[]): TaskStep[] {
   }
 }
 
+function planOnlyStepTemplates(intent: TaskIntent, files: string[]): TaskStep[] {
+  const inspectTools = intent === 'summarize_changes'
+    ? ['gitStatus', 'gitDiff']
+    : ['listDir', 'searchText', 'readFile'];
+  return [
+    step(
+      'inspect_evidence',
+      'Inspect minimal evidence for plan',
+      'inspect',
+      inspectTools,
+      ['Only targeted evidence gathered; no edit, checkpoint, or shell command used'],
+      baseBudget({ maxToolCalls: 4, maxFilesToRead: 3, maxFilesToWrite: 0, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.lean.outputBudgetInspect }),
+      files.slice(0, 3),
+    ),
+    step(
+      'propose_plan',
+      'Propose plan and wait for edit mode',
+      'plan',
+      [],
+      ['Plan is shown before any file change; user can switch to Trusted Edit or Full Agent to apply it'],
+      baseBudget({ maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0, maxOutputTokens: LOCAL_MODEL_BUDGET_PROFILES.balanced.outputBudgetComplexPlan }),
+    ),
+  ];
+}
+
 export class TaskOrchestrator {
   classifyTaskIntent(input: ClassifyInput): TaskIntent {
     return inferIntent(input);
@@ -416,7 +441,8 @@ export class TaskOrchestrator {
       `Size ${sizeEstimate}.`,
       input.repoSummary ? `Context: ${input.repoSummary}` : '',
     ].filter(Boolean).join(' ');
-    const steps = planStepTemplates(intent, files);
+    const planOnly = input.mode === 'plan';
+    const steps = planOnly ? planOnlyStepTemplates(intent, files) : planStepTemplates(intent, files);
 
     return {
       id: createTaskPlanId(),
@@ -432,7 +458,7 @@ export class TaskOrchestrator {
       steps,
       evidence: [],
       nextAction: steps[0]?.title ?? 'Await input',
-      stopCondition: stopConditionForIntent(intent),
+      stopCondition: planOnly ? 'Stop after a grounded plan. Do not edit files, create checkpoints, or run commands.' : stopConditionForIntent(intent),
       createdAt: now,
       updatedAt: now,
     };

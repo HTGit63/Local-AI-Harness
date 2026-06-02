@@ -275,22 +275,6 @@ export class RepoIndexer {
     }
   }
 
-  private async collectReferenceEntries(area: string): Promise<WorkspaceReferenceInfo | null> {
-    const areaPath = path.join(this.cwd, area);
-
-    try {
-      const entries = await fs.readdir(areaPath, { withFileTypes: true });
-      const names = entries
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-        .sort((left, right) => left.localeCompare(right));
-
-      return names.length > 0 ? { area, entries: names } : null;
-    } catch {
-      return null;
-    }
-  }
-
   async buildWorkspaceInventory(forceRefresh = false): Promise<WorkspaceInventory> {
     if (!forceRefresh && this.inventoryCache && this.inventoryCache.expiresAt > Date.now()) {
       return this.inventoryCache.value;
@@ -308,15 +292,12 @@ export class RepoIndexer {
       ? rootManifest.workspaces.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
       : [];
 
-    const [apps, packages, baseRepos, thirdParty, topLevelEntries] = await Promise.all([
+    const [apps, packages, topLevelEntries] = await Promise.all([
       this.collectWorkspaceModules('apps'),
       this.collectWorkspaceModules('packages'),
-      this.collectReferenceEntries('base_repos'),
-      this.collectReferenceEntries('third_party'),
       fs.readdir(this.cwd, { withFileTypes: true }).catch(() => [] as Array<{ isDirectory(): boolean; name: string }>),
     ]);
 
-    const references = [baseRepos, thirdParty].filter((entry): entry is WorkspaceReferenceInfo => entry !== null);
     const topLevelAreas = topLevelEntries
       .filter((entry) => entry.isDirectory() && !IGNORED_DIR_NAMES.has(entry.name))
       .map((entry) => entry.name)
@@ -327,7 +308,7 @@ export class RepoIndexer {
       workspaceGlobs,
       apps,
       packages,
-      references,
+      references: [],
       topLevelAreas,
     };
     this.inventoryCache = this.buildCacheEntry(signature, inventory);
@@ -652,6 +633,7 @@ export class RepoIndexer {
       `Project READMEs: ${readmePaths.length > 0 ? readmePaths.join(', ') : 'none detected'}`,
       `Entry paths: ${ctx.entryPoints.length > 0 ? ctx.entryPoints.join(', ') : 'unknown'}`,
       `Ignored from auto-context: base_repos, third_party, .gamma-harness, .playwright-cli, and build outputs.`,
+      `External copied repositories are not treated as project knowledge unless explicitly selected.`,
       `Note: Do not read every file blindly. Start at entry points or manifests.`
     ].join('\n');
   }

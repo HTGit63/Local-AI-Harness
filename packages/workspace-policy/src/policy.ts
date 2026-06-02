@@ -24,6 +24,19 @@ export class WorkspacePolicy {
     return resolvedPath === root || resolvedPath.startsWith(rootPrefix);
   }
 
+  private isProtectedPath(targetPath: string): boolean {
+    const basename = path.basename(targetPath);
+    return (
+      basename === '.env' ||
+      basename === 'id_rsa' ||
+      basename === 'id_ed25519' ||
+      basename.startsWith('.env.') ||
+      /^secrets(?:\.|$)/i.test(basename) ||
+      /^credentials(?:\.|$)/i.test(basename) ||
+      /\.(pem|key|p12|pfx)$/i.test(basename)
+    );
+  }
+
   checkAction(action: ActionType, targetPath?: string): PolicyCheckResult {
     if (targetPath && !this.isPathWithinWorkspace(targetPath)) {
       return {
@@ -33,7 +46,15 @@ export class WorkspacePolicy {
       };
     }
 
-    if (this.mode === 'danger') {
+    if (targetPath && this.isProtectedPath(targetPath)) {
+      return {
+        allowed: false,
+        requiresApproval: false,
+        reason: 'Protected credential or secret-like path is denied by default.',
+      };
+    }
+
+    if (this.mode === 'danger' || this.mode === 'danger-sandbox') {
       return { allowed: true, requiresApproval: false };
     }
 
@@ -41,24 +62,32 @@ export class WorkspacePolicy {
       return { allowed: true, requiresApproval: false };
     }
 
-    if (this.mode === 'read-only') {
+    if (this.mode === 'read-only' || this.mode === 'chat' || this.mode === 'inspect' || this.mode === 'plan') {
       return { allowed: false, requiresApproval: false, reason: 'Workspace is in read-only mode.' };
     }
 
-    // In workspace-write mode
-    if (action === 'write' || action === 'delete' || action === 'execute') {
-      // Deletions always require approval
+    if (this.mode === 'trusted-edit') {
+      if (action === 'write') {
+        return { allowed: true, requiresApproval: false };
+      }
       if (action === 'delete') {
         return { allowed: true, requiresApproval: true, reason: 'Delete actions require approval.' };
       }
-      
-      // Broad execution requires approval
       if (action === 'execute') {
-        return { allowed: true, requiresApproval: true, reason: 'Execute actions potentially mutate state and require approval.' };
+        return { allowed: true, requiresApproval: true, reason: 'Command execution requires approval unless allowlisted by caller.' };
       }
+    }
 
-      // Direct write requires preview & approval
-      return { allowed: true, requiresApproval: true, reason: 'Write updates require preview and approval.' };
+    if (this.mode === 'workspace-write' || this.mode === 'full-agent') {
+      if (action === 'write' || action === 'delete' || action === 'execute') {
+        if (action === 'delete') {
+          return { allowed: true, requiresApproval: true, reason: 'Delete actions require approval.' };
+        }
+        if (action === 'execute') {
+          return { allowed: true, requiresApproval: true, reason: 'Execute actions potentially mutate state and require approval.' };
+        }
+        return { allowed: true, requiresApproval: true, reason: 'Write updates require preview and approval.' };
+      }
     }
 
     return { allowed: false, requiresApproval: false, reason: 'Unknown action type.' };

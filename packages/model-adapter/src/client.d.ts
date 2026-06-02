@@ -3,6 +3,7 @@ export declare class ModelAdapter {
     private baseUrl;
     private apiKey;
     private model;
+    private provider;
     private timeoutMs;
     private retries;
     private profileName;

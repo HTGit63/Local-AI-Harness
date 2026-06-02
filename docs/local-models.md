@@ -1,82 +1,79 @@
 # Local Models
 
-## Default Configuration
+## Stable Runtime
 
 | Setting | Value |
 |---|---|
-| Server | Ollama |
-| Base URL | `http://127.0.0.1:11434/v1` |
-| API Key | `ollama` (placeholder) |
+| Provider | `llamacpp` |
+| Protocol | OpenAI-compatible `/v1` |
+| Base URL | `http://127.0.0.1:8080/v1` |
+| API Key | `no-key` |
 | Default Model | `gemma4:e4b` |
-| Native Chat | Preferred automatically for Ollama requests when available; OpenAI-compatible fallback only when native chat is unavailable |
+| Hardware target | 16 GB RAM, CPU-first, no GPU assumption |
 
-## Inference Profiles
-
-| Profile | Max Tokens | Temperature | Use Case |
-|---|---|---|---|
-| `fast` | 512 | 0.1 | Quick file inspections, short answers |
-| `balanced` | 1536 | 0.3 | Standard coding tasks |
-| `deep` | 2048 | 0.6 | Complex multi-step reasoning |
-
-## Hardware Requirements
-
-- **CPU**: Any modern x86_64 or ARM64
-- **RAM**: 16GB recommended (8GB minimum)
-- **GPU**: Not required — CPU inference is the target
-- **Disk**: ~5GB for model weights
-
-## Adding Other Models
+Start `llama.cpp`:
 
 ```bash
-ollama pull <model-name>
+./llama-server \
+  -m /path/to/gemma-4-e4b.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --ctx-size 8192
 ```
 
-Then update the runtime config through the web settings page or by editing the environment before launch:
+Check health:
+
 ```bash
-node apps/cli/dist/cli.js config show --json
+curl http://127.0.0.1:8080/v1/models
 ```
 
-To inspect and switch models from the terminal:
+## Provider Configuration
+
 ```bash
-node apps/cli/dist/cli.js model status --json
-node apps/cli/dist/cli.js model list --json
-node apps/cli/dist/cli.js model use gemma4:e4b --json
-node apps/cli/dist/cli.js model use qwen3.5:9b-q4_K_M --json
-node apps/cli/dist/cli.js model use deepseek-coder-v2:latest --json
-ollama ps
+export HARNESS_RUNTIME_PROVIDER=llamacpp
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=no-key
+export HARNESS_MODEL=gemma4:e4b
 ```
 
-To switch from the web UI:
+Supported provider values:
 
-1. Open `http://localhost:8080`
-2. Open `Settings`
-3. Select the target model
-4. Click `Save runtime config`
-5. Check the `Active:` badge and the `Model runtime` card
+| Provider | Use |
+|---|---|
+| `llamacpp` | Stable local path for Gemma 4 E4B GGUF. |
+| `openai-compatible` | Custom OpenAI-compatible local server. |
+| `ollama-legacy` | Optional legacy path with Ollama lifecycle support. |
 
-When the selected provider is Ollama, the runtime unloads the previous running model and warms the requested model before reporting the switch complete.
+Ollama legacy:
+
+```bash
+export HARNESS_RUNTIME_PROVIDER=ollama-legacy
+export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+export OPENAI_API_KEY=ollama
+ollama pull gemma4:e4b
+```
 
 ## Runtime Budgets
 
-The current local defaults are:
+Defaults are conservative for local CPU-first use:
 
-- `profile`: `fast`
-- `timeoutMs`: `60000`
-- `retries`: `1`
-- `keep_alive`: `2m`
+- No full-repo context by default.
+- Deterministic tools skip model calls.
+- One active model generation by default.
+- Bounded model/tool loops in agent mode.
+- Small output limits from the active inference profile.
+- Prompt-size and runtime state are surfaced in the UI.
 
-These values keep local CPU-first runs bounded and avoid pinning memory longer than needed.
+## Inference Profiles
 
-## Model Notes
+| Profile | Max Tokens | Temperature | Use |
+|---|---:|---:|---|
+| `fast` | 512 | 0.1 | Quick answers and deterministic evidence summaries |
+| `balanced` | 1536 | 0.3 | Standard planning/editing |
+| `deep` | 2048 | 0.6 | Harder multi-step reasoning, still E4B-local |
 
-- `gemma4:e4b` and `qwen3.5:9b-q4_K_M` are treated as thinking-capable local models. The harness now prefers Ollama native chat for these non-tool turns so the UI and CLI can show their emitted thinking stream separately from the final answer.
-- For tool-heavy coding turns on `gemma4:e4b` and `qwen3.5:9b-q4_K_M`, the harness now prefers native tool calling first. Manual JSON fallback is only used when native tools are unsupported or explicitly fail, so the fast path stays native and the fallback stays bounded.
-- `deepseek-coder-v2:latest` remains supported, but it does not expose the same thinking channel and is better treated as a fast code-focused fallback than as the default agentic model.
-- If a selected model does not report `thinking` support, the UI and CLI now warn that the toggle may be ignored instead of hiding the mismatch.
-- For simple inspect requests like listing files or checking git status, the harness now answers directly from local tools instead of round-tripping through the model. This keeps Gemma and Qwen from wasting time thinking about deterministic workspace lookups.
+## Model Scope
 
-Or set environment variables:
-```bash
-export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-export OPENAI_API_KEY=ollama
-```
+`gemma4:e4b` is the stable default. Gemma 4 26B quantized is a future advanced mode only after the E4B harness passes the milestone gate.
+
+If the runtime server is offline, the UI and CLI report the endpoint and provider that failed. They do not silently fall back to another provider.

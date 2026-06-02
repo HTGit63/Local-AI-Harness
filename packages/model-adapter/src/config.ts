@@ -19,8 +19,9 @@ export const PROFILES: Record<string, ModelProfile> = {
 };
 
 export const DEFAULT_CONFIG: Required<Omit<AdapterOptions, 'profile'>> & { profile: 'fast' | 'balanced' | 'deep' } = {
-  baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1',
-  apiKey: process.env.OPENAI_API_KEY || 'ollama',
+  provider: (process.env.HARNESS_RUNTIME_PROVIDER as AdapterOptions['provider']) || 'llamacpp',
+  baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:8080/v1',
+  apiKey: process.env.OPENAI_API_KEY || 'no-key',
   model: process.env.HARNESS_MODEL || 'gemma4:e4b',
   profile: 'balanced',
   timeoutMs: 60000,

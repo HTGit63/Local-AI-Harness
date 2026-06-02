@@ -3,7 +3,21 @@ import * as path from 'path';
 import ts from 'typescript';
 
 const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx'];
-const IGNORED_DIRS = new Set(['.git', '.gamma-harness', 'node_modules', 'dist', 'build', '.next', 'base_repos', 'third_party']);
+const IGNORED_DIRS = new Set([
+  '.cache',
+  '.git',
+  '.gamma-harness',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  '.vite',
+  'base_repos',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'third_party',
+]);
 
 export interface ImportEntry {
   source: string;

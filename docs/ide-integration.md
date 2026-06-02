@@ -1,80 +1,43 @@
 # IDE Integration Guide
 
-## Architecture Boundary — Important
-
-The Gamma 4 Harness consists of three distinct layers. Understanding this separation is critical before integrating with any IDE or external tool.
+## Architecture Boundary
 
 | Layer | What it is | Portable? |
 |---|---|---|
-| **Skills / Personas** | Markdown-based agent instruction files (`SKILL.md`) | ✅ Yes — can be exported and used in any tool that supports skill files |
-| **Model Backend** | Ollama running `gemma4:e4b` on `localhost:11434` via OpenAI-compatible `/v1` | ✅ Yes — any tool supporting OpenAI-compatible endpoints can use it |
-| **Runtime Harness** | This project's core engine, planner, tool runtime, approval workflow, trace bus | ❌ No — this is specific to this harness |
+| Skills / Personas | Exported `SKILL.md` files | Yes |
+| Model Backend | Any configured local OpenAI-compatible server | Yes |
+| Runtime Harness | This repo's core engine, planner, tools, policy, approvals, traces | No |
 
-> [!IMPORTANT]
-> Exporting skills to Antigravity does **not** mean Antigravity will use this harness's runtime or model backend. Antigravity will use its own runtime and its own model. The skills are portable; the engine is not.
-
----
+Exporting skills to another IDE does not export this harness runtime. The other IDE uses its own runtime and model.
 
 ## Antigravity Skill Export
 
-### What gets exported
+```bash
+cd packages/skills
+npm run build
+npm run index
+```
 
-Each curated skill from `packages/skills/dist/antigravity_exports/` contains:
-- A `SKILL.md` file with YAML frontmatter (`name`, `description`) and markdown instructions
+Exports are written to:
 
-### Installation
+```text
+packages/skills/dist/antigravity_exports/
+```
+
+Install:
 
 ```bash
-# Copy all exported skills into Antigravity's skill directory
 cp -r packages/skills/dist/antigravity_exports/* ~/.gemini/antigravity/skills/
 ```
 
-After copying, Antigravity will discover and list these skills automatically on next session start.
+The exported skills are the native bundled harness skills. No external reference repo scan is required.
 
-### Regenerating exports
+## OpenAI-Compatible IDEs
 
-```bash
-cd packages/skills && npm run build && npm run index
-```
+Any IDE extension that supports a custom OpenAI-compatible endpoint can point at the same local `llama.cpp` server:
 
-This re-scans `third_party/agency-agents/` and regenerates both `all_skills.json`, `curated_pack.json`, and the `antigravity_exports/` directory.
+- Base URL: `http://127.0.0.1:8080/v1`
+- API key: `no-key`
+- Model: `gemma4:e4b`
 
----
-
-## VS Code Integration via Ollama
-
-VS Code can use the same local Ollama backend that powers this harness. No special plugin from this project is required.
-
-### Option 1: Continue (recommended)
-
-1. Install the [Continue](https://continue.dev) VS Code extension
-2. Configure `~/.continue/config.json`:
-
-```json
-{
-  "models": [{
-    "title": "Gemma 4 E4B (Local)",
-    "provider": "ollama",
-    "model": "gemma4:e4b",
-    "apiBase": "http://127.0.0.1:11434"
-  }]
-}
-```
-
-### Option 2: Any OpenAI-compatible extension
-
-Any VS Code extension that supports custom OpenAI endpoints can point to:
-- **Base URL**: `http://127.0.0.1:11434/v1`
-- **API Key**: `ollama` (placeholder, not validated)
-- **Model**: `gemma4:e4b`
-
----
-
-## What this harness does NOT provide to IDEs
-
-- ❌ A VS Code extension (not built in v1)
-- ❌ Language Server Protocol integration
-- ❌ Direct code action providers inside the editor
-- ❌ Automatic Antigravity runtime bridging
-
-These are future extension paths documented in `docs/architecture.md`.
+Ollama can still be used by IDEs separately, but it is not the stable harness default.

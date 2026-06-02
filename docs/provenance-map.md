@@ -1,25 +1,19 @@
 # Provenance Map
 
-This document serves as the declarative map documenting where each curated skill, idea, or recipe comes from. It tracks license obligations and origins.
+The current stable harness does not require vendored external repositories.
 
-## Repositories
+Normal product flow:
 
-### 1. `openclaw`
-- **Upstream**: https://github.com/openclaw/openclaw.git
-- **Local Location**: `third_party/openclaw`
-- **Attribution Obligation**: Preserve the original repository license. Annotate within UI component wrappers or server setup files whenever core control ideas are reused. Include an open source notices file in published builds.
+- Native skills live in `packages/skills/src/harness-native.ts`.
+- Prompt recipes live in `packages/prompt-recipes`.
+- Runtime logic lives in `packages/model-adapter`.
+- Deterministic tools live in `packages/tool-runtime`.
 
-### 2. `claw-code`
-- **Upstream**: https://github.com/ultraworkers/claw-code.git
-- **Local Location**: `third_party/claw-code`
-- **Attribution Obligation**: Preserve the original repository license. When borrowing Rust or UI patterns for CLI harness commands, leave a comment at the top of the file denoting the source from `claw-code`. 
+`base_repos/` and `third_party/` are ignored if they appear locally and are not included in normal context packs.
 
-### 3. `agency-agents`
-- **Upstream**: https://github.com/msitarzewski/agency-agents.git
-- **Local Location**: `third_party/agency-agents`
-- **Attribution Obligation**: These are skill content files. Keep the full clone untouched. When metadata is extracted, the exported local skill must include a `source: agency-agents` tag and link back to its original path.
+When adding an externally derived asset later, document:
 
-### 4. `Prompt-Engineering-Guide`
-- **Upstream**: https://github.com/dair-ai/Prompt-Engineering-Guide.git
-- **Local Location**: `third_party/Prompt-Engineering-Guide`
-- **Attribution Obligation**: Any generated prompt recipes referencing techniques or explicit texts from this repository must include a comment tag noting the `Prompt-Engineering-Guide` provenance.
+- upstream URL
+- license
+- exact local file
+- whether it is runtime source, documentation, or reference-only

@@ -81,6 +81,45 @@ async function startMockModelServer(): Promise<{ server: http.Server; baseUrl: s
       const rawBody = Buffer.concat(chunks).toString('utf8');
       const body = rawBody.trim() ? JSON.parse(rawBody) : {};
 
+      if (requestUrl.pathname === '/v1/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ id: 'gemma4:e4b', object: 'model', owned_by: 'local' }] }));
+        return;
+      }
+
+      if (requestUrl.pathname === '/v1/chat/completions') {
+        chatRequests.push(body);
+        if (body.stream) {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+          res.write(`data: ${JSON.stringify({
+            id: 'mock-openai-stream',
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: { role: 'assistant', content: 'Direct stream works.' }, finish_reason: null }],
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({
+            id: 'mock-openai-stream',
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'mock-openai',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: 'Direct stream works.' },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+        }));
+        return;
+      }
+
       if (requestUrl.pathname === '/api/tags') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ models: [{ name: 'gemma4:e4b' }] }));
@@ -219,6 +258,66 @@ async function startApprovalFlowMockModelServer(): Promise<{ server: http.Server
     req.on('end', () => {
       const rawBody = Buffer.concat(chunks).toString('utf8');
       const body = rawBody.trim() ? JSON.parse(rawBody) : {};
+
+      if (requestUrl.pathname === '/v1/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ id: 'gemma4:e4b', object: 'model', owned_by: 'local' }] }));
+        return;
+      }
+
+      if (requestUrl.pathname === '/v1/chat/completions') {
+        chatRequests.push(body);
+        const hasToolResults = Array.isArray(body.messages) && body.messages.some((message: { role?: string }) => message.role === 'tool');
+        const toolCalls = [
+          { id: 'call_read', type: 'function', function: { name: 'readFile', arguments: JSON.stringify({ filePath: 'src/index.ts' }) } },
+          { id: 'call_write', type: 'function', function: { name: 'writeFile', arguments: JSON.stringify({ filePath: 'notes.txt', content: 'approved complex content\n' }) } },
+        ];
+
+        if (body.stream) {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+          if (hasToolResults) {
+            res.write(`data: ${JSON.stringify({
+              id: 'mock-openai-approval',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { role: 'assistant', content: 'Complex task finished after approval.' }, finish_reason: null }],
+            })}\n\n`);
+            res.write(`data: ${JSON.stringify({
+              id: 'mock-openai-approval',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            })}\n\n`);
+          } else {
+            res.write(`data: ${JSON.stringify({
+              id: 'mock-openai-approval',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { role: 'assistant', tool_calls: toolCalls.map((toolCall, index) => ({ ...toolCall, index })) }, finish_reason: null }],
+            })}\n\n`);
+            res.write(`data: ${JSON.stringify({
+              id: 'mock-openai-approval',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+            })}\n\n`);
+          }
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'mock-openai-approval',
+          object: 'chat.completion',
+          choices: [{
+            index: 0,
+            message: hasToolResults
+              ? { role: 'assistant', content: 'Complex task finished after approval.' }
+              : { role: 'assistant', content: '', tool_calls: toolCalls },
+            finish_reason: hasToolResults ? 'stop' : 'tool_calls',
+          }],
+          usage: { prompt_tokens: 10, completion_tokens: hasToolResults ? 12 : 8, total_tokens: hasToolResults ? 22 : 18 },
+        }));
+        return;
+      }
 
       if (requestUrl.pathname === '/api/tags') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -414,6 +513,7 @@ async function testApiWorkflow() {
   try {
     const initialConfig = await fetchJson<{
       workspaceRoot: string;
+      provider: string;
       profile: string;
       mode: string;
       model: string;
@@ -428,6 +528,7 @@ async function testApiWorkflow() {
       localModelBudget?: { maxModelCallsPerRun: number; maxToolCallsPerRun: number };
     }>(`${API_BASE}/api/config`);
     assert.strictEqual(initialConfig.workspaceRoot, workspaceRoot);
+    assert.strictEqual(initialConfig.provider, 'llamacpp');
     assert.strictEqual(initialConfig.baseUrl, mockModel.baseUrl);
     assert.strictEqual(initialConfig.profile, 'balanced');
     assert.strictEqual(initialConfig.contextBudget, 16000);
@@ -440,6 +541,7 @@ async function testApiWorkflow() {
     assert.strictEqual(initialConfig.localModelBudget?.maxModelCallsPerRun, 10);
 
     const updatedConfig = await fetchJson<{
+      provider: string;
       profile: string;
       mode: string;
       model: string;
@@ -454,8 +556,9 @@ async function testApiWorkflow() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        provider: 'llamacpp',
         profile: 'fast',
-        mode: 'workspace-write',
+        mode: 'trusted-edit',
         model: 'gemma4:e4b',
         baseUrl: mockModel.baseUrl,
         contextBudget: 12000,
@@ -466,8 +569,9 @@ async function testApiWorkflow() {
         localModelBudgetProfile: 'lean',
       }),
     });
+    assert.strictEqual(updatedConfig.provider, 'llamacpp');
     assert.strictEqual(updatedConfig.profile, 'fast');
-    assert.strictEqual(updatedConfig.mode, 'workspace-write');
+    assert.strictEqual(updatedConfig.mode, 'trusted-edit');
     assert.strictEqual(updatedConfig.contextBudget, 12000);
     assert.strictEqual(updatedConfig.toolRetryMax, 1);
     assert.strictEqual(updatedConfig.sessionMemoryEnabled, true);
@@ -478,11 +582,11 @@ async function testApiWorkflow() {
     const session = await fetchJson<{ id: string; skillsActive: string[]; skillAudit?: { requested: string[]; catalog: string[]; records: Array<{ slug: string; status: string; reason: string }> } }>(`${API_BASE}/api/session`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ skills: ['caveman', 'engineering-code-reviewer', 'definitely-not-a-skill'] }),
+      body: JSON.stringify({ skills: ['caveman', 'patch-surgeon', 'definitely-not-a-skill'] }),
     });
     assert.ok(session.id);
-    assert.deepStrictEqual(session.skillsActive, ['engineering-code-reviewer']);
-    assert.deepStrictEqual(session.skillAudit?.requested, ['caveman', 'engineering-code-reviewer', 'definitely-not-a-skill']);
+    assert.deepStrictEqual(session.skillsActive, ['patch-surgeon']);
+    assert.deepStrictEqual(session.skillAudit?.requested, ['caveman', 'patch-surgeon', 'definitely-not-a-skill']);
     assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'caveman')?.status, 'filtered');
     assert.strictEqual(session.skillAudit?.records.find((entry) => entry.slug === 'definitely-not-a-skill')?.status, 'missing');
 
@@ -490,29 +594,15 @@ async function testApiWorkflow() {
     assert.strictEqual(sessionReloaded.skillAudit?.records.find((entry) => entry.slug === 'caveman')?.status, 'filtered');
     assert.strictEqual(sessionReloaded.skillAudit?.records.find((entry) => entry.slug === 'definitely-not-a-skill')?.status, 'missing');
 
-    const pendingWrite = fetchJson<ToolResult>(`${API_BASE}/api/workspace/write`, {
+    const writeResult = await fetchJson<ToolResult>(`${API_BASE}/api/workspace/write`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: 'notes.txt', content: 'approved content\n' }),
     });
-
-    const approval = await waitFor(async () => {
-      const approvals = await fetchJson<ApprovalItem[]>(`${API_BASE}/api/approvals`);
-      return approvals[0] || null;
-    });
-    assert.strictEqual(approval.target, 'notes.txt');
-    assert.ok((approval.diffPreview || '').includes('notes.txt'));
-
-    const resolution = await fetchJson<{ resolved: boolean }>(`${API_BASE}/api/approvals/${approval.id}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ approved: true }),
-    });
-    assert.strictEqual(resolution.resolved, true);
-
-    const writeResult = await pendingWrite;
     assert.strictEqual(writeResult.success, true);
     assert.strictEqual(await fs.readFile(path.join(workspaceRoot, 'notes.txt'), 'utf8'), 'approved content\n');
+    const approvalsAfterTrustedWrite = await fetchJson<ApprovalItem[]>(`${API_BASE}/api/approvals`);
+    assert.ok(!approvalsAfterTrustedWrite.some((approval) => approval.target === 'notes.txt'));
 
     const deniedWrite = await fetchJson<ToolResult>(`${API_BASE}/api/workspace/write`, {
       method: 'POST',
@@ -683,6 +773,16 @@ async function testApiApprovalStreamResumesComplexTask() {
   await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
 
   try {
+    await fetchJson(`${API_BASE}/api/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'llamacpp',
+        baseUrl: mockModel.baseUrl,
+        mode: 'full-agent',
+      }),
+    });
+
     const eventsPromise = fetchNdjsonWithIntervention(`${API_BASE}/api/chat/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -134,8 +134,8 @@ function toSkillMetadata(rootDir: string, division: string, filePath: string, co
     title,
     division,
     description,
-    sourceFile: filePath.replace(rootDir, 'third_party/agency-agents'),
-    sourceRepo: 'agency-agents',
+    sourceFile: path.relative(rootDir, filePath),
+    sourceRepo: 'external-skill-root',
     tags: [division, 'agent', slug],
     recommendedUse,
     riskLevel: inferRiskLevel(content),
@@ -143,7 +143,7 @@ function toSkillMetadata(rootDir: string, division: string, filePath: string, co
 }
 
 export async function indexSkills(options: IndexSkillsOptions = {}) {
-  const rootDir = path.resolve(options.rootDir || path.join(__dirname, '../../../third_party/agency-agents'));
+  const rootDir = path.resolve(options.rootDir || process.env.HARNESS_SKILLS_SOURCE_ROOT || path.join(__dirname, '../native-skills'));
   const outDir = path.resolve(options.outputDir || path.join(__dirname, '../dist'));
   const skills: SkillMetadata[] = [];
 

@@ -6,6 +6,7 @@ import {
   ModelRuntimeState,
   ModelSwitchResult,
   RunningModel,
+  RuntimeProvider,
 } from './types';
 import { DEFAULT_CONFIG, PROFILES } from './config';
 
@@ -239,6 +240,7 @@ function mapMessagesToOllama(messages: ChatMessage[]): Array<Record<string, unkn
 }
 
 export class ModelAdapter {
+  private provider: RuntimeProvider;
   private baseUrl: string;
   private apiKey: string;
   private model: string;
@@ -251,6 +253,7 @@ export class ModelAdapter {
   private runtimeStateCache: { value: ModelRuntimeState; expiresAt: number } | null = null;
 
   constructor(options: Partial<AdapterOptions> = {}) {
+    this.provider = options.provider ?? DEFAULT_CONFIG.provider;
     this.baseUrl = options.baseUrl ?? DEFAULT_CONFIG.baseUrl;
     this.apiKey = options.apiKey ?? DEFAULT_CONFIG.apiKey;
     this.model = options.model ?? DEFAULT_CONFIG.model;
@@ -260,6 +263,12 @@ export class ModelAdapter {
   }
 
   updateConfig(options: Partial<AdapterOptions> = {}) {
+    if (options.provider !== undefined) {
+      this.provider = options.provider;
+      this.capabilityCache.clear();
+      this.nativeChatSupported = null;
+      this.runtimeStateCache = null;
+    }
     if (options.baseUrl !== undefined) {
       this.baseUrl = options.baseUrl;
       this.capabilityCache.clear();
@@ -296,6 +305,10 @@ export class ModelAdapter {
     return this.baseUrl.replace(/\/v1\/?$/, '');
   }
 
+  private isOllamaLegacyProvider(): boolean {
+    return this.provider === 'ollama-legacy';
+  }
+
   private async fetchJson<T>(url: string, options: RequestInit, timeoutMs = this.timeoutMs): Promise<T> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -318,6 +331,10 @@ export class ModelAdapter {
   }
 
   private async supportsOllamaNativeChat(): Promise<boolean> {
+    if (!this.isOllamaLegacyProvider()) {
+      this.nativeChatSupported = false;
+      return false;
+    }
     if (this.nativeChatSupported !== null) {
       return this.nativeChatSupported;
     }
@@ -551,6 +568,12 @@ export class ModelAdapter {
   }
 
   private async tryListRunningModels(): Promise<{ supportsLifecycle: boolean; models: RunningModel[] }> {
+    if (!this.isOllamaLegacyProvider()) {
+      return {
+        supportsLifecycle: false,
+        models: [],
+      };
+    }
     try {
       const data = await this.fetchJson<{ models?: RunningModel[] }>(
         `${this.nativeBaseUrl}/api/ps`,
@@ -573,6 +596,12 @@ export class ModelAdapter {
   }
 
   private async listInstalledModels(): Promise<string[]> {
+    if (!this.isOllamaLegacyProvider()) {
+      const models = await this.listModels();
+      return models
+        .map((entry) => entry.id)
+        .filter((value): value is string => typeof value === 'string' && value.length > 0);
+    }
     try {
       const data = await this.fetchJson<{ models?: Array<{ name: string }> }>(
         `${this.nativeBaseUrl}/api/tags`,
@@ -595,6 +624,9 @@ export class ModelAdapter {
   }
 
   private async unloadModel(modelName: string): Promise<void> {
+    if (!this.isOllamaLegacyProvider()) {
+      return;
+    }
     await this.fetchJson(
       `${this.nativeBaseUrl}/api/generate`,
       {
@@ -610,6 +642,9 @@ export class ModelAdapter {
   }
 
   private async preloadModel(modelName: string): Promise<void> {
+    if (!this.isOllamaLegacyProvider()) {
+      return;
+    }
     await this.fetchJson(
       `${this.nativeBaseUrl}/api/generate`,
       {
@@ -664,25 +699,39 @@ export class ModelAdapter {
       return this.runtimeStateCache.value;
     }
 
+    const healthy = await this.isHealthy();
     const availableModels = await this.listModels() as AvailableModel[];
     const installedModels = await this.listInstalledModels();
     const runningInfo = await this.tryListRunningModels();
     const runningModels = runningInfo.models;
     const configuredModelActive = runningModels.find((entry) => entry.model === this.model || entry.name === this.model);
-    const runtimeStatus: ModelRuntimeState['runtimeStatus'] = !runningInfo.supportsLifecycle
-      ? 'unavailable'
-      : configuredModelActive
-        ? 'ready'
-        : runningModels.length > 0
-          ? 'configured_not_loaded'
-          : 'idle';
-    const statusMessage = !runningInfo.supportsLifecycle
-      ? 'Model lifecycle status is unavailable for this provider.'
-      : configuredModelActive
-        ? `Configured model ${this.model} is loaded.`
-        : runningModels.length > 0
-          ? `Configured model ${this.model} is not loaded; ${runningModels.length} other model${runningModels.length === 1 ? ' is' : 's are'} running.`
-          : `Configured model ${this.model} is idle.`;
+    const configuredModelListed = availableModels.some((entry) => entry.id === this.model);
+    const runtimeStatus: ModelRuntimeState['runtimeStatus'] = this.isOllamaLegacyProvider()
+      ? (!runningInfo.supportsLifecycle || !healthy
+          ? 'unavailable'
+          : configuredModelActive
+            ? 'ready'
+            : runningModels.length > 0
+              ? 'configured_not_loaded'
+              : 'idle')
+      : (!healthy
+          ? 'unavailable'
+          : configuredModelListed || availableModels.length > 0
+            ? 'ready'
+            : 'configured_not_loaded');
+    const statusMessage = this.isOllamaLegacyProvider()
+      ? (!runningInfo.supportsLifecycle || !healthy
+          ? 'Ollama legacy lifecycle status is unavailable.'
+          : configuredModelActive
+            ? `Configured model ${this.model} is loaded.`
+            : runningModels.length > 0
+              ? `Configured model ${this.model} is not loaded; ${runningModels.length} other model${runningModels.length === 1 ? ' is' : 's are'} running.`
+              : `Configured model ${this.model} is idle.`)
+      : (!healthy
+          ? `${this.provider} server is not reachable at ${this.baseUrl}.`
+          : configuredModelListed
+            ? `${this.provider} server is reachable and lists ${this.model}.`
+            : `${this.provider} server is reachable; configured model ${this.model} was not listed.`);
     const configuredModelCapabilities = await this.getModelCapabilities(this.model);
     const reasoningSupported = Array.isArray(configuredModelCapabilities)
       ? configuredModelCapabilities.some((capability) => capability === 'thinking' || capability === 'reasoning')
@@ -690,8 +739,12 @@ export class ModelAdapter {
     const nativeToolCallingSupported = await this.canAttemptNativeToolCalling(this.model, configuredModelCapabilities);
 
     const runtimeState = {
+      provider: this.provider,
+      baseUrl: this.baseUrl,
       configuredModel: this.model,
-      activeModel: configuredModelActive?.model || (runningModels.length === 1 ? runningModels[0].model : null),
+      activeModel: this.isOllamaLegacyProvider()
+        ? configuredModelActive?.model || (runningModels.length === 1 ? runningModels[0].model : null)
+        : healthy ? this.model : null,
       runtimeStatus,
       statusMessage,
       runningModels,
@@ -725,6 +778,13 @@ export class ModelAdapter {
     const normalizedModelName = modelName.trim();
     if (!normalizedModelName) {
       return null;
+    }
+
+    if (!this.isOllamaLegacyProvider()) {
+      const lower = normalizedModelName.toLowerCase();
+      const capabilities = lower.includes('gemma') ? ['tools'] : null;
+      this.capabilityCache.set(normalizedModelName, capabilities);
+      return capabilities;
     }
 
     if (this.capabilityCache.has(normalizedModelName)) {
@@ -761,6 +821,13 @@ export class ModelAdapter {
       return false;
     }
 
+    if (!this.isOllamaLegacyProvider()) {
+      if (Array.isArray(capabilities)) {
+        return capabilities.includes('tools');
+      }
+      return /gemma/i.test(normalizedModelName);
+    }
+
     if (Array.isArray(capabilities) && capabilities.includes('tools')) {
       return true;
     }
@@ -786,9 +853,30 @@ export class ModelAdapter {
       throw new Error('Model name cannot be empty.');
     }
 
+    if (!this.isOllamaLegacyProvider()) {
+      this.model = targetModel;
+      const healthy = await this.isHealthy();
+      const result: ModelSwitchResult = {
+        previousModel,
+        requestedModel: targetModel,
+        activeModel: healthy ? targetModel : null,
+        runningModels: [],
+        unloadedModels: [],
+        loadedModel: healthy ? targetModel : null,
+        supportsLifecycle: false,
+        message: healthy
+          ? `${this.provider} is reachable. Configured ${targetModel}; lifecycle warmup is not managed by the harness.`
+          : `${this.provider} is not reachable at ${this.baseUrl}. Configured ${targetModel}, but no runtime is active.`,
+      };
+      this.lastSwitchResult = result;
+      this.capabilityCache.clear();
+      this.runtimeStateCache = null;
+      return result;
+    }
+
     const installedModels = await this.listInstalledModels();
     if (installedModels.length > 0 && !installedModels.includes(targetModel)) {
-      throw new Error(`Model ${targetModel} is not installed in Ollama.`);
+      throw new Error(`Model ${targetModel} is not installed in Ollama legacy runtime.`);
     }
 
     const runningInfo = await this.tryListRunningModels();
@@ -896,15 +984,13 @@ export class ModelAdapter {
   }
 
   async createChatCompletion(request: ChatCompletionRequest) {
-    // Always prefer native Ollama API when available — it properly handles
-    // Gemma 4's native function calling tokens, thinking mode, and images.
-    // The OpenAI-compat endpoint lacks support for think, images, and
-    // Gemma 4's special tool control tokens.
+    // Ollama native chat is an optional legacy path. The stable path is
+    // OpenAI-compatible /v1 for llama.cpp and custom runtimes.
     if (await this.supportsOllamaNativeChat()) {
       return this.createOllamaChatCompletion(request);
     }
 
-    if (request.think === true) {
+    if (request.think === true && this.isOllamaLegacyProvider()) {
       console.warn('Model Adapter: think=true but native Ollama chat unavailable. Falling back to OpenAI-compat path; thinking may be ignored.');
     }
 

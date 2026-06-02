@@ -84,6 +84,7 @@ export interface ToolResultMetadata {
 export interface ToolResult {
   success: boolean;
   output: string;
+  data?: unknown;
   preview?: string;
   error?: string;
   metadata?: ToolResultMetadata;
@@ -104,6 +105,7 @@ export interface ToolActionContext {
   cwd: string;
   internetAccessEnabled?: boolean;
   policyMode?: string;
+  signal?: AbortSignal;
   emitTrace: (type: string, data: unknown) => void;
   checkPolicy: (action: 'read' | 'write' | 'delete' | 'execute', target?: string) => {
     allowed: boolean;
