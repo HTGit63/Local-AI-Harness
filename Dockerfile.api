@@ -41,9 +41,10 @@ ENV NODE_ENV=production
 ENV API_HOST=0.0.0.0
 ENV API_PORT=3001
 ENV HARNESS_WORKSPACE_ROOT=/workspace
-ENV HARNESS_RUNTIME_PROVIDER=llamacpp
-ENV OPENAI_BASE_URL=http://127.0.0.1:8080/v1
-ENV OPENAI_API_KEY=no-key
+ENV HARNESS_RUNTIME_PROVIDER=ollama-legacy
+ENV OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+ENV OPENAI_API_KEY=ollama
+ENV HARNESS_MODEL=gemma4:e4b
 
 COPY --from=deps /app/package.json /app/package-lock.json ./
 COPY --from=deps /app/node_modules ./node_modules

@@ -1,0 +1,20 @@
+services:
+  llama-cpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: llama-cpp-gemma4-e4b
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /home/hunde-tefera/models/gguf:/models:ro
+    command:
+      - "-m"
+      - "/models/gemma4-e4b-q4_k_m.gguf"
+      - "-c"
+      - "4096"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--alias"
+      - "gemma4:e4b"
