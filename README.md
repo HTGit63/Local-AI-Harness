@@ -118,17 +118,24 @@ docker compose up --build
 Defaults:
 
 - Web UI: `http://localhost:8080`
-- API: `http://localhost:3001/api`
+- API through Web UI proxy: `http://localhost:8080/api`
+- Internal API service: `api:3001`
 - Workspace mount: `${HARNESS_WORKSPACE_SOURCE:-.}` to `/workspace`
-- Runtime provider: `${HARNESS_RUNTIME_PROVIDER:-llamacpp}`
-- Runtime base URL: `${HARNESS_MODEL_BASE_URL:-http://127.0.0.1:8080/v1}`
+- Runtime provider: `${DOCKER_HARNESS_RUNTIME_PROVIDER:-ollama-legacy}`
+- Runtime base URL: `${DOCKER_HARNESS_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}`
+- Runtime model: `${DOCKER_HARNESS_MODEL:-gemma4:e4b}`
+
+Docker uses `host.docker.internal` for host model runtimes. Keep `127.0.0.1`
+for non-Docker local runs only; inside a container it points back at the
+container itself.
 
 Example:
 
 ```bash
 HARNESS_WORKSPACE_SOURCE=/absolute/path/to/project \
-HARNESS_RUNTIME_PROVIDER=llamacpp \
-HARNESS_MODEL_BASE_URL=http://127.0.0.1:8080/v1 \
+DOCKER_HARNESS_RUNTIME_PROVIDER=llamacpp \
+DOCKER_HARNESS_MODEL_BASE_URL=http://host.docker.internal:8080/v1 \
+DOCKER_HARNESS_MODEL=gemma4:e4b \
 docker compose up --build
 ```
 
