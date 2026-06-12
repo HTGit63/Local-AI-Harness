@@ -114,6 +114,8 @@ export interface TaskPlan extends LightweightPlan {
   updatedAt: number;
   completedAt?: number;
   failedAt?: number;
+  adaptivePlan?: import('./adaptive-plan').AdaptivePlan;
+  planArtifactPaths?: import('./adaptive-plan').AdaptivePlanArtifactPaths;
 }
 
 export interface LocalModelBudgetProfile {
@@ -272,6 +274,9 @@ function normalizeExternalIntent(intent: string): TaskIntent {
       return 'chat';
   }
 }
+
+export * from './adaptive-plan';
+export * from './adaptive-plan-prompts';
 
 function inferIntent(input: ClassifyInput): TaskIntent {
   const normalized = normalizeText(input.userRequest);

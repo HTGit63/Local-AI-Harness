@@ -38,6 +38,122 @@ interface SessionState {
   }>;
 }
 
+function requestText(body: any): string {
+  if (!Array.isArray(body.messages)) {
+    return '';
+  }
+  return body.messages
+    .map((message: { content?: unknown }) => typeof message.content === 'string' ? message.content : '')
+    .join('\n');
+}
+
+function isAdaptivePlanningRequest(body: any): boolean {
+  return requestText(body).includes('[Adaptive Planning Task]');
+}
+
+function workspaceRootFromPlanningRequest(body: any): string {
+  return requestText(body).match(/^Workspace root:\s*(.+)$/m)?.[1]?.trim() || '';
+}
+
+function simpleAdaptivePlan(body: any) {
+  const workspaceRoot = workspaceRootFromPlanningRequest(body);
+  return {
+    id: 'api_simple_adaptive_plan',
+    task: 'Answer agent request',
+    summary: 'Produce a bounded answer for the agent request.',
+    complexity: 'small',
+    mode: 'agent',
+    status: 'pending',
+    workspaceRoot,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    planner: 'ai',
+    goals: [{
+      id: 'G1',
+      title: 'Summarize agent response',
+      type: 'summarize',
+      status: 'pending',
+      tools: [],
+      files: [],
+      success_check: 'Final response is returned without unnecessary workspace changes.',
+      budget: {
+        maxModelCalls: 1,
+        maxToolCalls: 0,
+        maxFilesToRead: 0,
+        maxFilesToWrite: 0,
+        maxOutputTokens: 512,
+      },
+    }],
+  };
+}
+
+function approvalAdaptivePlan(body: any) {
+  const workspaceRoot = workspaceRootFromPlanningRequest(body);
+  return {
+    id: 'api_approval_adaptive_plan',
+    task: 'Read source and create approved notes',
+    summary: 'Read the target source file, write the requested notes file after approval, then verify and summarize.',
+    complexity: 'single_file',
+    mode: 'agent',
+    status: 'pending',
+    workspaceRoot,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    planner: 'ai',
+    goals: [
+      {
+        id: 'G1',
+        title: 'Inspect requested source file',
+        type: 'inspect',
+        status: 'pending',
+        tools: ['readFile'],
+        files: ['src/index.ts'],
+        success_check: 'src/index.ts is read before creating notes.',
+        budget: {
+          maxModelCalls: 0,
+          maxToolCalls: 1,
+          maxFilesToRead: 1,
+          maxFilesToWrite: 0,
+          maxOutputTokens: 512,
+        },
+      },
+      {
+        id: 'G2',
+        title: 'Create approved notes file',
+        type: 'edit',
+        status: 'pending',
+        tools: ['writeFile'],
+        files: ['notes.txt'],
+        success_check: 'notes.txt is written only through the approval workflow.',
+        requiresApproval: true,
+        budget: {
+          maxModelCalls: 0,
+          maxToolCalls: 1,
+          maxFilesToRead: 0,
+          maxFilesToWrite: 1,
+          maxOutputTokens: 512,
+        },
+      },
+      {
+        id: 'G3',
+        title: 'Verify and summarize approved write',
+        type: 'summarize',
+        status: 'pending',
+        tools: [],
+        files: ['notes.txt'],
+        success_check: 'Verification result and final summary are reported to the user.',
+        budget: {
+          maxModelCalls: 1,
+          maxToolCalls: 0,
+          maxFilesToRead: 0,
+          maxFilesToWrite: 0,
+          maxOutputTokens: 512,
+        },
+      },
+    ],
+  };
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   const body = await response.text();
@@ -89,6 +205,20 @@ async function startMockModelServer(): Promise<{ server: http.Server; baseUrl: s
 
       if (requestUrl.pathname === '/v1/chat/completions') {
         chatRequests.push(body);
+        if (isAdaptivePlanningRequest(body)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            id: 'mock-openai-plan',
+            object: 'chat.completion',
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', content: JSON.stringify(simpleAdaptivePlan(body)) },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 40, completion_tokens: 20, total_tokens: 60 },
+          }));
+          return;
+        }
         if (body.stream) {
           res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
           res.write(`data: ${JSON.stringify({
@@ -267,6 +397,20 @@ async function startApprovalFlowMockModelServer(): Promise<{ server: http.Server
 
       if (requestUrl.pathname === '/v1/chat/completions') {
         chatRequests.push(body);
+        if (isAdaptivePlanningRequest(body)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            id: 'mock-openai-approval-plan',
+            object: 'chat.completion',
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', content: JSON.stringify(approvalAdaptivePlan(body)) },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 50, completion_tokens: 40, total_tokens: 90 },
+          }));
+          return;
+        }
         const hasToolResults = Array.isArray(body.messages) && body.messages.some((message: { role?: string }) => message.role === 'tool');
         const toolCalls = [
           { id: 'call_read', type: 'function', function: { name: 'readFile', arguments: JSON.stringify({ filePath: 'src/index.ts' }) } },
@@ -824,9 +968,10 @@ async function testApiApprovalStreamResumesComplexTask() {
     await approveNextPendingApproval();
     const events = await eventsPromise;
 
-    const firstRequest = mockModel.getChatRequests()[0];
-    assert.ok(Array.isArray(firstRequest?.tools));
-    assert.ok(firstRequest.tools.length > 0);
+    const planningRequest = mockModel.getChatRequests().find((request) => isAdaptivePlanningRequest(request));
+    assert.ok(planningRequest);
+    const executionRequest = mockModel.getChatRequests().find((request) => Array.isArray(request?.tools) && request.tools.length > 0);
+    assert.ok(executionRequest);
 
     const approvalPending = events.find((event) => event.type === 'approval' && event.state === 'pending');
     assert.ok(approvalPending);
@@ -842,6 +987,10 @@ async function testApiApprovalStreamResumesComplexTask() {
     assert.ok(String(doneEvent?.response || '').includes('Complex task finished after approval.'));
     assert.ok(String(doneEvent?.response || '').includes('What I did:'));
     assert.strictEqual(await fs.readFile(path.join(workspaceRoot, 'notes.txt'), 'utf8'), 'approved complex content\n');
+    const planState = await fetchJson<{ taskPlan?: { adaptivePlan?: { planner?: string; goals?: unknown[] }; planArtifactPaths?: { json?: string; markdown?: string } } }>(`${API_BASE}/api/plan`);
+    assert.strictEqual(planState.taskPlan?.adaptivePlan?.planner, 'ai');
+    assert.ok(Array.isArray(planState.taskPlan?.adaptivePlan?.goals));
+    assert.ok(String(planState.taskPlan?.planArtifactPaths?.json || '').endsWith('plan.json'));
   } finally {
     await stopApiServer(server);
     await stopMockModelServer(mockModel.server);

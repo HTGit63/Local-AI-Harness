@@ -9,7 +9,30 @@ import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
 import { RepoIndexer, ProjectContext, ProjectInspection, TaskContext } from '@local-harness/repo-indexer';
 import { AgentFallbackPath, AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
-import { LOCAL_MODEL_BUDGET_PROFILES, LocalModelBudgetProfile, TaskIntent as PlanTaskIntent, TaskOrchestrator, TaskPlan, TaskSizeEstimate, TaskStep, TOOL_PROFILES, ToolProfileName } from '@local-harness/task-orchestrator';
+import {
+  AdaptivePlan,
+  AdaptivePlanArtifactPaths,
+  AdaptivePlanValidationResult,
+  LOCAL_MODEL_BUDGET_PROFILES,
+  LocalModelBudgetProfile,
+  TaskIntent as PlanTaskIntent,
+  TaskOrchestrator,
+  TaskPlan,
+  TaskSizeEstimate,
+  TaskStep,
+  TOOL_PROFILES,
+  ToolProfileName,
+  buildAdaptivePlanRepairPrompt,
+  buildAdaptivePlanningPrompt,
+  createFallbackAdaptivePlanFromTaskPlan,
+  createSafeFallbackAdaptivePlan,
+  normalizeAdaptivePlanToTaskPlan,
+  parseAdaptivePlanJson,
+  prepareTaskPlanForResume,
+  renderAdaptivePlanMarkdown,
+  syncAdaptivePlanFromTaskPlan,
+  validateAdaptivePlan,
+} from '@local-harness/task-orchestrator';
 import { ToolRegistry, ToolResult, ToolResultMetadata } from '@local-harness/tool-runtime';
 import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
@@ -163,6 +186,13 @@ export interface RunCheckpoint {
   runId: string;
   sessionId: string;
   taskPlan: TaskPlan;
+  activePlanId?: string;
+  currentGoalId?: string;
+  completedGoals?: string[];
+  failedGoals?: string[];
+  blockedGoals?: string[];
+  adaptivePlan?: AdaptivePlan;
+  planArtifactPaths?: AdaptivePlanArtifactPaths;
   currentStepId?: string;
   completedSteps: string[];
   failedSteps: string[];
@@ -982,8 +1012,130 @@ export class CoreEngine extends EventEmitter {
     return path.resolve(this.config.workspaceRoot, '.gamma-harness', 'runs');
   }
 
+  private getPlanDataDir(runId: string): string {
+    return path.resolve(this.config.workspaceRoot, '.gamma-harness', 'plans', runId);
+  }
+
   private getProjectMemoryPath(): string {
     return path.resolve(this.config.workspaceRoot, '.gamma-harness', 'project-memory.json');
+  }
+
+  private async persistAdaptivePlanArtifacts(runId: string, plan: AdaptivePlan): Promise<AdaptivePlanArtifactPaths> {
+    const planDir = this.getPlanDataDir(runId);
+    await fs.mkdir(planDir, { recursive: true });
+    const jsonPath = path.join(planDir, 'plan.json');
+    const markdownPath = path.join(planDir, 'plan.md');
+    await fs.writeFile(jsonPath, `${JSON.stringify(plan, null, 2)}\n`, 'utf8');
+    await fs.writeFile(markdownPath, renderAdaptivePlanMarkdown(plan), 'utf8');
+    this.traceBus.emitEvent({
+      type: 'adaptive_plan_persisted',
+      data: { runId, planId: plan.id, jsonPath, markdownPath },
+    });
+    return { json: jsonPath, markdown: markdownPath };
+  }
+
+  private isPlanContinuationRequest(message: string): boolean {
+    return /\b(continue|resume|keep going|act on the plan|run the plan|implement the plan|continue implementation|implement plan\.md)\b/i.test(message.trim());
+  }
+
+  private hasPendingPlanWork(plan: TaskPlan): boolean {
+    return plan.steps.some((entry) => entry.status === 'pending' || entry.status === 'running' || entry.status === 'failed' || entry.status === 'blocked')
+      && !plan.completedAt
+      && plan.status !== 'done';
+  }
+
+  private async findLatestActivePlanCheckpoint(sessionId?: string): Promise<RunCheckpoint | null> {
+    const runs = await this.listRuns();
+    return runs.find((checkpoint) =>
+      (!sessionId || checkpoint.sessionId === sessionId) &&
+      Boolean(checkpoint.taskPlan?.adaptivePlan) &&
+      this.hasPendingPlanWork(checkpoint.taskPlan)
+    ) ?? null;
+  }
+
+  private async createModelAdaptivePlan(params: {
+    userRequest: string;
+    intent: PlanTaskIntent;
+    sizeEstimate: TaskSizeEstimate;
+    workspaceRoot: string;
+    selectedToolNames: SupportedTool[];
+    taskContext: TaskContext | null;
+  }): Promise<AdaptivePlanValidationResult> {
+    const allowedTools = params.selectedToolNames;
+    const repoContext = params.taskContext
+      ? buildTaskContextPrompt(params.taskContext)
+      : 'No targeted repo context yet. First goal should inspect minimal workspace evidence.';
+    const validationOptions = {
+      workspaceRoot: params.workspaceRoot,
+      allowedTools,
+      maxGoalsPerPlan: 12,
+      maxWriteGoalsPerPlan: 4,
+    };
+    const planningPrompt = buildAdaptivePlanningPrompt({
+      userRequest: params.userRequest,
+      intent: params.intent,
+      sizeEstimate: params.sizeEstimate,
+      workspaceRoot: params.workspaceRoot,
+      availableTools: allowedTools,
+      policyMode: this.config.mode,
+      repoContext,
+      maxGoalsPerPlan: validationOptions.maxGoalsPerPlan,
+    });
+
+    let lastJsonText = '';
+    let lastErrors: string[] = [];
+    for (let attempt = 0; attempt <= 2; attempt += 1) {
+      const prompt = attempt === 0
+        ? planningPrompt
+        : buildAdaptivePlanRepairPrompt({
+            previousJson: lastJsonText,
+            validationErrors: lastErrors,
+            validationOptions,
+          });
+      const response = await this.modelAdapter.createChatCompletion({
+        model: this.config.model,
+        messages: [{ role: 'system', content: prompt }],
+        stream: false,
+        max_tokens: LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile].outputBudgetComplexPlan,
+        reasoning_effort: 'low',
+      });
+      const message = response?.choices?.[0]?.message;
+      const content = composeAssistantContent(message as Record<string, unknown>);
+      lastJsonText = content || '';
+      let parsed: unknown;
+      try {
+        parsed = parseAdaptivePlanJson(lastJsonText);
+      } catch (error: any) {
+        lastErrors = [error?.message || 'Adaptive plan response was invalid JSON.'];
+        this.traceBus.emitEvent({
+          type: 'adaptive_plan_validation_failed',
+          data: { attempt, errors: lastErrors },
+        });
+        continue;
+      }
+
+      const result = validateAdaptivePlan(parsed, validationOptions);
+      if (result.valid) {
+        this.traceBus.emitEvent({
+          type: 'adaptive_plan_validated',
+          data: { attempt, planId: result.plan?.id, goals: result.plan?.goals.length ?? 0 },
+        });
+        return result;
+      }
+      lastErrors = result.errors;
+      this.traceBus.emitEvent({
+        type: 'adaptive_plan_validation_failed',
+        data: { attempt, errors: lastErrors },
+      });
+    }
+
+    return { valid: false, errors: lastErrors.length ? lastErrors : ['Adaptive plan validation failed.'] };
+  }
+
+  private shouldUseAdaptivePlan(intent: PlanTaskIntent, plan: TaskPlan): boolean {
+    if (plan.mode === 'chat' || intent === 'chat') return false;
+    if (intent === 'inspect_project') return false;
+    return plan.sizeEstimate !== 'none';
   }
 
   private createProjectMemoryBase(existing?: Partial<ProjectMemory>): ProjectMemory {
@@ -2504,6 +2656,23 @@ export class CoreEngine extends EventEmitter {
     'writeFile', 'patchFile', 'replaceFunction', 'insertImport', 'addTypeProperty', 'renameIdentifier', 'replaceRange', 'insertAfter', 'insertBefore', 'replaceBlock', 'applyUnifiedPatch', 'makeDir', 'deleteFile', 'createCheckpoint', 'rollbackToCheckpoint',
   ]);
 
+  private normalizeWorkspaceRelativePath(filePath: string): string {
+    const root = path.resolve(this.config.workspaceRoot);
+    const resolved = path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(root, filePath);
+    return path.relative(root, resolved).split(path.sep).join('/');
+  }
+
+  private isTargetInsideGoalScope(targetPath: string, scopePaths: string[]): boolean {
+    if (scopePaths.length === 0) {
+      return true;
+    }
+    const target = this.normalizeWorkspaceRelativePath(targetPath);
+    return scopePaths.some((scopePath) => {
+      const scope = this.normalizeWorkspaceRelativePath(scopePath);
+      return target === scope || target.startsWith(`${scope}/`);
+    });
+  }
+
   private checkpointTargetsForTool(toolName: SupportedTool, args: Record<string, unknown>): string[] | undefined {
     if (toolName === 'applyUnifiedPatch') {
       const patchText = typeof args.patchText === 'string' ? args.patchText : '';
@@ -2804,6 +2973,7 @@ export class CoreEngine extends EventEmitter {
     currentMessages: ChatMessage[],
     handlers: ChatStreamHandlers | undefined,
     builder: AgentRunBuilder,
+    executeTool: (toolName: SupportedTool, args: Record<string, unknown>, runId?: string) => Promise<ToolResult>,
   ): Promise<void> {
     for (const stepPlan of plan) {
       const step = builder.startNamedStep(
@@ -2851,7 +3021,7 @@ export class CoreEngine extends EventEmitter {
       });
       this.planner.setCurrentTool(stepPlan.toolName);
 
-      const toolResult = await this.executeToolCall(stepPlan.toolName, stepPlan.args, builder.snapshot().id);
+      const toolResult = await executeTool(stepPlan.toolName, stepPlan.args, builder.snapshot().id);
       const toolOutput = toolResult.preview ? `${toolResult.output}\n\n${toolResult.preview}` : toolResult.output;
       this.emitChatToolEvent(handlers, {
         id: toolEventId,
@@ -4403,13 +4573,18 @@ export class CoreEngine extends EventEmitter {
 	    this.traceBus.on('trace', traceListener);
 
 	    let taskContext: TaskContext | null = null;
-	    let taskPlan = this.taskOrchestrator.createPlan({
-	      userRequest: latestUserMessage,
-	      intent: intentDecision.intent,
-	      workspaceRoot: this.config.workspaceRoot,
-	      mode: this.config.mode === 'plan' ? 'plan' : 'agent',
-	      knownFiles: [],
-	    });
+	    const resumeCheckpoint = this.isPlanContinuationRequest(latestUserMessage)
+	      ? await this.findLatestActivePlanCheckpoint(this.currentSession!.id)
+	      : null;
+	    let taskPlan = resumeCheckpoint?.taskPlan
+	      ? prepareTaskPlanForResume(resumeCheckpoint.taskPlan)
+	      : this.taskOrchestrator.createPlan({
+	          userRequest: latestUserMessage,
+	          intent: intentDecision.intent,
+	          workspaceRoot: this.config.workspaceRoot,
+	          mode: this.config.mode === 'plan' ? 'plan' : 'agent',
+	          knownFiles: [],
+	        });
 	    let currentTaskStep: TaskStep | null = null;
 	    const lastToolResults: RunCheckpoint['lastToolResults'] = [];
 
@@ -4424,22 +4599,32 @@ export class CoreEngine extends EventEmitter {
 	      }
 	    };
 
-	    const buildCheckpoint = (): RunCheckpoint => {
+	    const buildCheckpoint = (checkpointPlan = taskPlan): RunCheckpoint => {
 	      const run = runBuilder.snapshot();
+	      const activeGoalId = currentTaskStep?.id
+	        ?? checkpointPlan.currentStepId
+	        ?? checkpointPlan.steps.find((entry) => entry.status === 'pending' || entry.status === 'running')?.id;
 	      return {
 	        runId,
 	        sessionId: this.currentSession!.id,
-	        taskPlan,
-	        currentStepId: currentTaskStep?.id,
-	        completedSteps: taskPlan.steps.filter((entry) => entry.status === 'done' || entry.status === 'skipped').map((entry) => entry.id),
-	        failedSteps: taskPlan.steps.filter((entry) => entry.status === 'failed').map((entry) => entry.id),
-	        blockedSteps: taskPlan.steps.filter((entry) => entry.status === 'blocked').map((entry) => entry.id),
+	        taskPlan: checkpointPlan,
+	        activePlanId: checkpointPlan.adaptivePlan?.id,
+	        currentGoalId: activeGoalId,
+	        completedGoals: checkpointPlan.steps.filter((entry) => entry.status === 'done' || entry.status === 'skipped').map((entry) => entry.id),
+	        failedGoals: checkpointPlan.steps.filter((entry) => entry.status === 'failed').map((entry) => entry.id),
+	        blockedGoals: checkpointPlan.steps.filter((entry) => entry.status === 'blocked').map((entry) => entry.id),
+	        adaptivePlan: checkpointPlan.adaptivePlan,
+	        planArtifactPaths: checkpointPlan.planArtifactPaths,
+	        currentStepId: activeGoalId,
+	        completedSteps: checkpointPlan.steps.filter((entry) => entry.status === 'done' || entry.status === 'skipped').map((entry) => entry.id),
+	        failedSteps: checkpointPlan.steps.filter((entry) => entry.status === 'failed').map((entry) => entry.id),
+	        blockedSteps: checkpointPlan.steps.filter((entry) => entry.status === 'blocked').map((entry) => entry.id),
 	        filesRead: run.filesRead,
 	        filesWritten: run.filesWritten,
 	        filesDeleted: run.filesDeleted,
 	        commandsRun: run.commands.map((entry) => entry.command),
 	        approvals: run.approvals,
-	        summarySoFar: this.taskOrchestrator.summarizeProgress(taskPlan),
+	        summarySoFar: this.taskOrchestrator.summarizeProgress(checkpointPlan),
 	        lastToolResults: [...lastToolResults],
 	        createdAt: run.startedAt,
 	        updatedAt: Date.now(),
@@ -4450,7 +4635,16 @@ export class CoreEngine extends EventEmitter {
 	      if (this.config.mode === 'plan' || this.config.mode === 'inspect' || this.config.mode === 'read-only') {
 	        return;
 	      }
-	      const checkpointPath = await this.saveRunCheckpoint(buildCheckpoint());
+	      const syncedAdaptivePlan = syncAdaptivePlanFromTaskPlan(taskPlan);
+	      const checkpointPlan = syncedAdaptivePlan
+	        ? { ...taskPlan, adaptivePlan: syncedAdaptivePlan, updatedAt: Date.now() }
+	        : taskPlan;
+	      if (syncedAdaptivePlan && checkpointPlan.planArtifactPaths) {
+	        await fs.writeFile(checkpointPlan.planArtifactPaths.json, `${JSON.stringify(syncedAdaptivePlan, null, 2)}\n`, 'utf8');
+	        await fs.writeFile(checkpointPlan.planArtifactPaths.markdown, renderAdaptivePlanMarkdown(syncedAdaptivePlan), 'utf8');
+	        taskPlan = checkpointPlan;
+	      }
+	      const checkpointPath = await this.saveRunCheckpoint(buildCheckpoint(checkpointPlan));
 	      this.planner.emitTaskCheckpoint(runId, checkpointPath);
 	    };
 
@@ -4503,6 +4697,11 @@ export class CoreEngine extends EventEmitter {
 	      if (currentTaskStep) {
 	        await completeCurrentTaskStep(reason);
 	      }
+	      if (taskPlan.adaptivePlan && !reason.startsWith('Run ended with error') && !this.taskOrchestrator.isComplete(taskPlan)) {
+	        this.planner.updateTaskPlan(runId, taskPlan);
+	        await persistCheckpoint();
+	        return;
+	      }
 	      for (const pendingStep of taskPlan.steps.filter((entry) => entry.status === 'pending')) {
 	        taskPlan = this.taskOrchestrator.markStepSkipped(taskPlan, pendingStep.id, `Skipped: ${reason}`);
 	      }
@@ -4510,15 +4709,188 @@ export class CoreEngine extends EventEmitter {
 	      await persistCheckpoint();
 	    };
 
-    this.planner.setTaskPlan(runId, taskPlan);
+	    const scopedToolNamesForStep = (stepToScope: TaskStep | null): SupportedTool[] => {
+	      if (!stepToScope) {
+	        return selectedToolNames;
+	      }
+	      const allowed = new Set(stepToScope.toolsAllowed);
+	      return selectedToolNames.filter((toolName) => allowed.has(toolName));
+	    };
+
+	    const adaptiveGoalBudgetState = new Map<string, { toolCalls: number; filesRead: number; filesWritten: number }>();
+
+	    const budgetStateForGoal = (goalId: string) => {
+	      let state = adaptiveGoalBudgetState.get(goalId);
+	      if (!state) {
+	        state = { toolCalls: 0, filesRead: 0, filesWritten: 0 };
+	        adaptiveGoalBudgetState.set(goalId, state);
+	      }
+	      return state;
+	    };
+
+	    const enforceAdaptiveGoalBounds = (toolName: SupportedTool, args: Record<string, unknown>) => {
+	      if (!taskPlan.adaptivePlan || !currentTaskStep) {
+	        return;
+	      }
+	      const step = currentTaskStep;
+	      const state = budgetStateForGoal(step.id);
+	      const targets = this.checkpointTargetsForTool(toolName, args) ?? [];
+	      const isWriteTool = CoreEngine.WORKSPACE_MUTATING_TOOLS.has(toolName);
+	      const readTargetCount = isWriteTool ? 0 : targets.length;
+	      const writeTargetCount = isWriteTool ? Math.max(1, targets.length) : 0;
+
+	      const fail = (type: string, detail: Record<string, unknown>) => {
+	        this.traceBus.emitEvent({
+	          type,
+	          data: { runId, goalId: step.id, tool: toolName, ...detail },
+	        });
+	        throw new Error(String(detail.reason || `Tool ${toolName} violates current adaptive goal bounds.`));
+	      };
+
+	      for (const target of targets) {
+	        if (!this.isTargetInsideGoalScope(target, step.files ?? [])) {
+	          fail('adaptive_goal_file_scope_blocked', {
+	            target,
+	            allowedFiles: step.files ?? [],
+	            reason: `Tool ${toolName} target ${target} is outside current goal file scope.`,
+	          });
+	        }
+	      }
+
+	      if (state.toolCalls + 1 > step.budget.maxToolCalls) {
+	        fail('adaptive_goal_budget_blocked', {
+	          budget: 'maxToolCalls',
+	          used: state.toolCalls,
+	          limit: step.budget.maxToolCalls,
+	          reason: `Goal ${step.id} exceeded tool-call budget.`,
+	        });
+	      }
+	      if (state.filesRead + readTargetCount > step.budget.maxFilesToRead) {
+	        fail('adaptive_goal_budget_blocked', {
+	          budget: 'maxFilesToRead',
+	          used: state.filesRead,
+	          requested: readTargetCount,
+	          limit: step.budget.maxFilesToRead,
+	          reason: `Goal ${step.id} exceeded file-read budget.`,
+	        });
+	      }
+	      if (state.filesWritten + writeTargetCount > step.budget.maxFilesToWrite) {
+	        fail('adaptive_goal_budget_blocked', {
+	          budget: 'maxFilesToWrite',
+	          used: state.filesWritten,
+	          requested: writeTargetCount,
+	          limit: step.budget.maxFilesToWrite,
+	          reason: `Goal ${step.id} exceeded file-write budget.`,
+	        });
+	      }
+
+	      state.toolCalls += 1;
+	      state.filesRead += readTargetCount;
+	      state.filesWritten += writeTargetCount;
+	    };
+
+	    const executeCurrentStepTool = async (toolName: SupportedTool, args: Record<string, unknown>, toolRunId?: string): Promise<ToolResult> => {
+	      if (currentTaskStep) {
+	        const allowed = new Set(currentTaskStep.toolsAllowed);
+	        if (!allowed.has(toolName)) {
+	          const message = `Tool ${toolName} is not allowed for current goal ${currentTaskStep.id}.`;
+	          this.traceBus.emitEvent({
+	            type: 'adaptive_goal_tool_blocked',
+	            data: { runId: toolRunId ?? runId, goalId: currentTaskStep.id, tool: toolName },
+	          });
+	          throw new Error(message);
+	        }
+	      }
+	      enforceAdaptiveGoalBounds(toolName, args);
+	      return this.executeToolCall(toolName, args, toolRunId);
+	    };
+
     taskContext = workspaceBound
       ? await this.repoIndexer.buildTaskContext({
-          userRequest: latestUserMessage,
+          userRequest: taskPlan.userRequest,
           intent: intentDecision.intent,
           taskIntent: taskPlan.intent,
           sizeEstimate: taskPlan.sizeEstimate,
         }).catch(() => null)
       : null;
+
+    if (resumeCheckpoint?.taskPlan?.adaptivePlan) {
+      this.traceBus.emitEvent({
+        type: 'adaptive_plan_resumed',
+        data: { runId, previousRunId: resumeCheckpoint.runId, planId: resumeCheckpoint.taskPlan.adaptivePlan.id },
+      });
+    } else if (workspaceBound && selectedToolNames.length > 0 && this.shouldUseAdaptivePlan(taskPlan.intent, taskPlan)) {
+      this.emitChatStatus(streamHandlers, 'planning', 'Creating adaptive plan', loopCount);
+      let adaptiveResult: AdaptivePlanValidationResult;
+      try {
+        adaptiveResult = await this.createModelAdaptivePlan({
+          userRequest: latestUserMessage,
+          intent: taskPlan.intent,
+          sizeEstimate: taskPlan.sizeEstimate,
+          workspaceRoot: this.config.workspaceRoot,
+          selectedToolNames,
+          taskContext,
+        });
+      } catch (error: any) {
+        adaptiveResult = { valid: false, errors: [error?.message || 'Adaptive planner model call failed.'] };
+      }
+
+      let adaptivePlan = adaptiveResult.plan;
+      if (!adaptiveResult.valid || !adaptivePlan) {
+        const reason = adaptiveResult.errors.join('; ') || 'Unknown adaptive planning error.';
+        const templateFallback = createFallbackAdaptivePlanFromTaskPlan({
+          taskPlan,
+          reason,
+          allowedTools: selectedToolNames,
+        });
+        const templateResult = validateAdaptivePlan(templateFallback, {
+          workspaceRoot: this.config.workspaceRoot,
+          allowedTools: selectedToolNames,
+          maxGoalsPerPlan: 12,
+          maxWriteGoalsPerPlan: 4,
+        });
+        if (templateResult.valid && templateResult.plan) {
+          adaptivePlan = templateResult.plan;
+          this.traceBus.emitEvent({
+            type: 'adaptive_plan_fallback_used',
+            data: { runId, reason, fallback: 'validated_template' },
+          });
+        } else {
+          const safeFallback = createSafeFallbackAdaptivePlan({
+            task: taskPlan.goal,
+            intent: taskPlan.intent,
+            workspaceRoot: this.config.workspaceRoot,
+            reason,
+            allowedTools: selectedToolNames,
+          });
+          const safeResult = validateAdaptivePlan(safeFallback, {
+            workspaceRoot: this.config.workspaceRoot,
+            allowedTools: selectedToolNames,
+            maxGoalsPerPlan: 12,
+            maxWriteGoalsPerPlan: 4,
+          });
+          if (!safeResult.valid || !safeResult.plan) {
+            throw new Error(`Adaptive plan invalid and fallback failed: ${safeResult.errors.join('; ')}`);
+          }
+          adaptivePlan = safeResult.plan;
+          this.traceBus.emitEvent({
+            type: 'adaptive_plan_fallback_used',
+            data: { runId, reason, fallback: 'safe_inspect_plan' },
+          });
+        }
+      }
+
+      const artifactPaths = await this.persistAdaptivePlanArtifacts(runId, adaptivePlan);
+      taskPlan = normalizeAdaptivePlanToTaskPlan({
+        adaptivePlan,
+        intent: taskPlan.intent,
+        userRequest: latestUserMessage,
+        mode: this.config.mode === 'plan' ? 'plan' : 'agent',
+        artifactPaths,
+      });
+    }
+
+    this.planner.setTaskPlan(runId, taskPlan);
     await persistCheckpoint();
     const initialTaskStep = await startTaskStep();
     if (initialTaskStep && initialTaskStep.type === 'intake') {
@@ -4606,14 +4978,21 @@ export class CoreEngine extends EventEmitter {
       this.planner.setRuntimeContext({
         toolProtocol: manualToolProtocol ? 'manual' : 'native',
       });
-      let nativeToolDefinitions = selectedToolNames.length > 0 && !manualToolProtocol
-        ? this.getToolDefinitions(selectedToolNames)
-        : undefined;
-      const activeTaskStepForModel = await startTaskStep();
+	      const activeTaskStepForModel = await startTaskStep();
+	      let scopedToolNames = scopedToolNamesForStep(activeTaskStepForModel);
+	      let nativeToolDefinitions = scopedToolNames.length > 0 && !manualToolProtocol
+	        ? this.getToolDefinitions(scopedToolNames)
+	        : undefined;
+	      const refreshScopedToolDefinitions = () => {
+	        scopedToolNames = scopedToolNamesForStep(currentTaskStep);
+	        nativeToolDefinitions = scopedToolNames.length > 0 && !manualToolProtocol
+	          ? this.getToolDefinitions(scopedToolNames)
+	          : undefined;
+	      };
       const stepOutputBudget = activeTaskStepForModel?.budget.maxOutputTokens;
       const maxTokens = manualToolProtocol
-        ? Math.min(256, stepOutputBudget ?? this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0))
-        : Math.min(stepOutputBudget ?? Number.MAX_SAFE_INTEGER, this.selectMaxTokens(latestUserMessage, promptMode, selectedToolNames.length > 0));
+        ? Math.min(256, stepOutputBudget ?? this.selectMaxTokens(latestUserMessage, promptMode, scopedToolNames.length > 0))
+        : Math.min(stepOutputBudget ?? Number.MAX_SAFE_INTEGER, this.selectMaxTokens(latestUserMessage, promptMode, scopedToolNames.length > 0));
       const reasoningEffort = manualToolProtocol
         ? 'none'
         : this.selectReasoningEffort(latestUserMessage, promptMode, modelCapabilities);
@@ -4631,7 +5010,7 @@ export class CoreEngine extends EventEmitter {
             routedModel: capabilityRouteModel,
             reason: toolProtocol.reason,
             manualToolProtocol: true,
-            selectedTools: selectedToolNames,
+	            selectedTools: scopedToolNames,
           },
         });
         this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', 0);
@@ -4643,7 +5022,7 @@ export class CoreEngine extends EventEmitter {
             routedModel: capabilityRouteModel,
             reason: toolProtocol.reason,
             manualToolProtocol: true,
-            selectedTools: selectedToolNames,
+	            selectedTools: scopedToolNames,
           },
         });
         this.emitChatStatus(streamHandlers, 'mode', 'Manual tool protocol forced', 0);
@@ -4668,7 +5047,8 @@ export class CoreEngine extends EventEmitter {
         data: {
           executionMode: 'agent',
           promptMode,
-          toolNames: selectedToolNames,
+	          toolNames: scopedToolNames,
+	          sessionToolNames: selectedToolNames,
           toolProfile: advancedToolsEnabled ? 'advanced' : 'basic',
           advancedToolsEnabled,
           nativeTools: Boolean(nativeToolDefinitions),
@@ -4713,7 +5093,7 @@ export class CoreEngine extends EventEmitter {
         : this.applyPromptOptimization(
             requestMessages,
             promptMode,
-            includeRepoContext || promptMode !== 'quick_inspect' || (selectedToolNames.length > 0 && !manualToolProtocol),
+            includeRepoContext || promptMode !== 'quick_inspect' || (scopedToolNames.length > 0 && !manualToolProtocol),
           );
 
       const runtimeContract: ChatMessage = {
@@ -4723,7 +5103,7 @@ export class CoreEngine extends EventEmitter {
           `Intent: ${intentDecision.intent}`,
           `Workspace source: ${workspaceSource}`,
           `Workspace bound: ${workspaceBound ? 'yes' : 'no'}`,
-          `Available tools: ${selectedToolNames.length > 0 ? selectedToolNames.join(', ') : 'none'}`,
+	          `Available tools for current goal: ${scopedToolNames.length > 0 ? scopedToolNames.join(', ') : 'none'}`,
           this.modeRuntimeRule(),
           `Tool profile: ${advancedToolsEnabled ? 'advanced' : 'basic'}`,
           `Tool protocol: ${manualToolProtocol ? 'manual' : 'native'}`,
@@ -4750,21 +5130,22 @@ export class CoreEngine extends EventEmitter {
         ...(await this.buildContextMessages(requestMessages, promptMode, includeWorkspaceContext, includeRepoContext)) as EngineChatMessage[],
         runtimeContract,
         { role: 'system' as const, content: buildStepScopedPrompt(taskPlan, currentTaskStep, taskContext) },
-        ...(manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(selectedToolNames) }] : []),
+	        ...(manualToolProtocol ? [{ role: 'system' as const, content: this.buildManualToolProtocol(scopedToolNames) }] : []),
         ...promptMessages,
       ];
 
       if (workspaceBound) {
         const bootstrapPlan = this.mergeBootstrapPlans(
-          this.buildBootstrapPlan(intentDecision, promptMode, selectedToolNames),
-          this.buildTaskBootstrapPlan(taskPlan, taskContext, selectedToolNames),
+	          this.buildBootstrapPlan(intentDecision, promptMode, scopedToolNames),
+	          this.buildTaskBootstrapPlan(taskPlan, taskContext, scopedToolNames),
         );
         await this.executeBootstrapPlan(
           bootstrapPlan,
           currentMessages,
-          streamHandlers,
-          runBuilder,
-        );
+	          streamHandlers,
+	          runBuilder,
+	          executeCurrentStepTool,
+	        );
         const completedBootstrapWork = runBuilder.snapshot().steps.some((step) =>
           ['inventory', 'tool'].includes(step.type) && step.status === 'done',
         );
@@ -4785,7 +5166,7 @@ export class CoreEngine extends EventEmitter {
       let streamedToolEventCounter = 0;
       const nextStreamToolEventId = () => `tool-${++streamedToolEventCounter}`;
       let manualBootstrapTool = manualToolProtocol && workspaceBound
-        ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, selectedToolNames)
+        ? await this.inferManualBootstrapTool(latestUserMessage, promptMode, scopedToolNames)
         : null;
       const budgetProfile = LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile] ?? LOCAL_MODEL_BUDGET_PROFILES.lean;
       const maxLoopTarget = intentDecision.intent === 'edit_code'
@@ -4808,9 +5189,10 @@ export class CoreEngine extends EventEmitter {
         if (manualToolProtocol && manualBootstrapTool) {
           const bootstrapDecision = manualBootstrapTool;
           manualBootstrapTool = null;
-          loopCount += 1;
-          runBuilder.setLoopCount(loopCount);
-          await startTaskStep();
+	          loopCount += 1;
+	          runBuilder.setLoopCount(loopCount);
+	          await startTaskStep();
+	          refreshScopedToolDefinitions();
           const toolStep = runBuilder.startNamedStep('tool', `Bootstrap ${bootstrapDecision.name}`);
           this.planner.upsertRunStep({
             id: toolStep.id,
@@ -4842,7 +5224,7 @@ export class CoreEngine extends EventEmitter {
             inputSummary: summarizeToolArgs(bootstrapDecision.name, bootstrapDecision.args),
           });
           try {
-            const toolResult = await this.executeToolCall(bootstrapDecision.name, bootstrapDecision.args, runId);
+	            const toolResult = await executeCurrentStepTool(bootstrapDecision.name, bootstrapDecision.args, runId);
             const streamedOutput = toolResult.preview
               ? `${toolResult.output}\n\n${toolResult.preview}`
               : toolResult.output;
@@ -4907,10 +5289,11 @@ export class CoreEngine extends EventEmitter {
           continue;
         }
 
-        loopCount += 1;
-        runBuilder.setLoopCount(loopCount);
-        await startTaskStep();
-        currentMessages.push({
+	        loopCount += 1;
+	        runBuilder.setLoopCount(loopCount);
+	        await startTaskStep();
+	        refreshScopedToolDefinitions();
+	        currentMessages.push({
           role: 'system',
           content: buildStepScopedPrompt(taskPlan, currentTaskStep, taskContext),
         });
@@ -4992,7 +5375,7 @@ export class CoreEngine extends EventEmitter {
           const errorMessage = error?.message || '';
           if (errorMessage.includes('does not support tools') || errorMessage.includes('tools is not supported')) {
             nativeToolDefinitions = undefined;
-            manualToolProtocol = selectedToolNames.length > 0;
+            manualToolProtocol = scopedToolNames.length > 0;
             if (manualToolProtocol) {
               runBuilder.markManualFallback(errorMessage);
             }
@@ -5006,14 +5389,14 @@ export class CoreEngine extends EventEmitter {
                 model: this.config.model,
                 reason: errorMessage,
                 manualToolProtocol,
-                selectedTools: selectedToolNames,
+	          selectedTools: scopedToolNames,
               },
             });
             this.emitChatStatus(streamHandlers, 'warning', 'Native tools unavailable; manual fallback active', loopCount);
             if (manualToolProtocol && !manualProtocolPromptInjected) {
               currentMessages.push({
                 role: 'system',
-                content: this.buildManualToolProtocol(selectedToolNames),
+              content: this.buildManualToolProtocol(scopedToolNames),
               });
               manualProtocolPromptInjected = true;
             }
@@ -5068,9 +5451,10 @@ export class CoreEngine extends EventEmitter {
           this.planner.setPhase('execution');
           this.emitChatStatus(streamHandlers, 'execution', 'Executing tool calls', loopCount);
 
-          for (const toolCall of message.tool_calls) {
-            await startTaskStep();
-            const name = toolCall.function.name as SupportedTool;
+	          for (const toolCall of message.tool_calls) {
+	            await startTaskStep();
+	            refreshScopedToolDefinitions();
+	            const name = toolCall.function.name as SupportedTool;
             const toolStep = runBuilder.startNamedStep('tool', `Execute ${name}`);
             const toolEventId = nextStreamToolEventId();
             let args: Record<string, unknown> = {};
@@ -5116,7 +5500,7 @@ export class CoreEngine extends EventEmitter {
             });
 
             try {
-              const toolResult = await this.executeToolCall(name, args, runId);
+	              const toolResult = await executeCurrentStepTool(name, args, runId);
               const streamedOutput = toolResult.preview
                 ? `${toolResult.output}\n\n${toolResult.preview}`
                 : toolResult.output;
@@ -5190,9 +5574,9 @@ export class CoreEngine extends EventEmitter {
 
         const response = extractTextSegment(message.content);
         const visibleResponse = response.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-        const planningOnlyResponse = Boolean(
-          nativeToolDefinitions &&
-          selectedToolNames.length > 0 &&
+	        const planningOnlyResponse = Boolean(
+	          nativeToolDefinitions &&
+	          scopedToolNames.length > 0 &&
           response.includes('<think>') &&
           visibleResponse.length === 0,
         );
@@ -5222,7 +5606,7 @@ export class CoreEngine extends EventEmitter {
                 reason: retryReason,
                 promptMode,
                 attempt: planningOnlyNativeRetryCount,
-                selectedTools: selectedToolNames,
+	                selectedTools: scopedToolNames,
               },
             });
             currentMessages.push({
@@ -5233,7 +5617,7 @@ export class CoreEngine extends EventEmitter {
           }
 
           nativeToolDefinitions = undefined;
-          manualToolProtocol = selectedToolNames.length > 0;
+	          manualToolProtocol = scopedToolNames.length > 0;
           if (manualToolProtocol) {
             runBuilder.markManualFallback(retryReason);
             syncFallbackState('manual_fallback', retryReason);
@@ -5243,14 +5627,14 @@ export class CoreEngine extends EventEmitter {
                 model: this.config.model,
                 reason: retryReason,
                 manualToolProtocol: true,
-                selectedTools: selectedToolNames,
+	                selectedTools: scopedToolNames,
               },
             });
             this.emitChatStatus(streamHandlers, 'warning', 'Native tool retry failed; manual fallback active', loopCount);
             if (!manualProtocolPromptInjected) {
               currentMessages.push({
                 role: 'system',
-                content: this.buildManualToolProtocol(selectedToolNames),
+	                content: this.buildManualToolProtocol(scopedToolNames),
               });
               manualProtocolPromptInjected = true;
             }
@@ -5325,7 +5709,7 @@ export class CoreEngine extends EventEmitter {
                 reason: repairReason,
                 attempt: simulatedToolReplyCount,
                 manualToolProtocol: true,
-                selectedTools: selectedToolNames,
+	                selectedTools: scopedToolNames,
               },
             });
 
@@ -5349,7 +5733,7 @@ export class CoreEngine extends EventEmitter {
                 model: this.config.model,
                 reason: warning,
                 manualToolProtocol: true,
-                selectedTools: selectedToolNames,
+	                selectedTools: scopedToolNames,
               },
             });
             this.traceBus.emitEvent({
@@ -5359,10 +5743,11 @@ export class CoreEngine extends EventEmitter {
             return await finalizeRun(`${warning} Retry request or switch models.`, warning);
           }
 
-          const manualDecision = this.parseManualToolResponse(response, selectedToolNames);
-          if (manualDecision?.kind === 'tool') {
-            await startTaskStep();
-            const toolStep = runBuilder.startNamedStep('tool', `Execute ${manualDecision.name}`);
+	          const manualDecision = this.parseManualToolResponse(response, scopedToolNames);
+	          if (manualDecision?.kind === 'tool') {
+	            await startTaskStep();
+	            refreshScopedToolDefinitions();
+	            const toolStep = runBuilder.startNamedStep('tool', `Execute ${manualDecision.name}`);
             this.planner.setPhase('execution');
             this.planner.setCurrentTool(manualDecision.name);
             this.planner.setIntendedAction(`Executing ${manualDecision.name}`);
@@ -5384,7 +5769,7 @@ export class CoreEngine extends EventEmitter {
               inputSummary: summarizeToolArgs(manualDecision.name, manualDecision.args),
             });
             try {
-              const toolResult = await this.executeToolCall(manualDecision.name, manualDecision.args, runId);
+	              const toolResult = await executeCurrentStepTool(manualDecision.name, manualDecision.args, runId);
               const streamedOutput = toolResult.preview
                 ? `${toolResult.output}\n\n${toolResult.preview}`
                 : toolResult.output;
@@ -5480,7 +5865,7 @@ export class CoreEngine extends EventEmitter {
             return await finalizeRun(manualDecision.content);
           }
 
-          if (selectedToolNames.length > 0 && manualProtocolCorrectionCount < toolRetryMax) {
+	          if (scopedToolNames.length > 0 && manualProtocolCorrectionCount < toolRetryMax) {
             manualProtocolCorrectionCount += 1;
             const repairReason = 'Manual tool JSON was malformed or missing.';
             runBuilder.markManualRepair(repairReason);
@@ -5492,7 +5877,7 @@ export class CoreEngine extends EventEmitter {
                 reason: repairReason,
                 attempt: manualProtocolCorrectionCount,
                 manualToolProtocol: true,
-                selectedTools: selectedToolNames,
+	                selectedTools: scopedToolNames,
               },
             });
             currentMessages.push({
@@ -5502,7 +5887,7 @@ export class CoreEngine extends EventEmitter {
             continue;
           }
 
-          if (selectedToolNames.length > 0) {
+	          if (scopedToolNames.length > 0) {
             const warning = 'Manual tool protocol stayed malformed after correction retries.';
             runBuilder.markFinalNoopWarning(warning);
             syncFallbackState('final_noop_warning', warning);
@@ -5516,7 +5901,7 @@ export class CoreEngine extends EventEmitter {
                 model: this.config.model,
                 reason: warning,
                 manualToolProtocol: true,
-                selectedTools: selectedToolNames,
+	                selectedTools: scopedToolNames,
                 repairAttempts: manualProtocolCorrectionCount,
               },
             });
@@ -5550,7 +5935,7 @@ export class CoreEngine extends EventEmitter {
                 reason: retryReason,
                 promptMode,
                 attempt: simulatedToolReplyCount,
-                selectedTools: selectedToolNames,
+	                selectedTools: scopedToolNames,
               },
             });
             currentMessages.push({
@@ -5573,7 +5958,7 @@ export class CoreEngine extends EventEmitter {
               model: this.config.model,
               reason: warning,
               promptMode,
-              selectedTools: selectedToolNames,
+	              selectedTools: scopedToolNames,
             },
           });
           this.traceBus.emitEvent({
@@ -5597,7 +5982,7 @@ export class CoreEngine extends EventEmitter {
               model: this.config.model,
               reason: warning,
               promptMode,
-              selectedTools: selectedToolNames,
+	              selectedTools: scopedToolNames,
               manualToolProtocol,
             },
           });

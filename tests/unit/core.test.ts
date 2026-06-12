@@ -6,7 +6,12 @@ import { CoreEngine, PromptAnalyzer } from '@local-harness/core';
 import { ModelAdapter, PROFILES, type ChatMessage as AdapterChatMessage } from '@local-harness/model-adapter';
 import { PromptOptimizer, RECIPES } from '@local-harness/prompt-recipes';
 import { RepoIndexer } from '@local-harness/repo-indexer';
-import { TaskOrchestrator } from '@local-harness/task-orchestrator';
+import {
+  TaskOrchestrator,
+  normalizeAdaptivePlanToTaskPlan,
+  renderAdaptivePlanMarkdown,
+  validateAdaptivePlan,
+} from '@local-harness/task-orchestrator';
 import { WorkspacePolicy } from '@local-harness/workspace-policy';
 import { createMockFetch, MOCK_CHAT_RESPONSE, MOCK_MODEL_CAPABILITIES, MOCK_MODEL_LIST } from '../mocks/model-responses';
 
@@ -115,11 +120,12 @@ async function testPlanModeDoesNotExposeEditToolsOrCheckpoints() {
 
     assert.ok(response.includes('Plan only:'));
     assert.ok(chatRequests.length >= 1);
-    const exposedTools = new Set<string>((chatRequests[0].tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name).filter(Boolean));
+    const toolRequest = chatRequests.find((body) => Array.isArray(body.tools) && body.tools.length > 0) || chatRequests[0];
+    const exposedTools = new Set<string>((toolRequest.tools || []).map((tool: { function?: { name?: string } }) => tool.function?.name).filter(Boolean));
     for (const deniedTool of ['writeFile', 'patchFile', 'runCommand', 'createCheckpoint', 'rollbackToCheckpoint']) {
       assert.ok(!exposedTools.has(deniedTool), `${deniedTool} should not be exposed in Plan Mode`);
     }
-    assert.ok(exposedTools.has('listDir') || exposedTools.has('searchText') || exposedTools.has('readFile'));
+    assert.ok(exposedTools.size === 0 || exposedTools.has('listDir') || exposedTools.has('searchText') || exposedTools.has('readFile'));
     assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'task_checkpoint_saved' || entry.type === 'run_auto_checkpoint_created'));
 
     const write = await engine.writeFile('src/index.ts', 'export const changed = true;\n');
@@ -308,6 +314,115 @@ function testTaskOrchestratorPlanAndStepTransitions() {
   const safeIdle = orchestrator.markSafeIdle(done, 'Approval rejected');
   assert.strictEqual(safeIdle.status, 'safe_idle');
   assert.ok(safeIdle.evidence.includes('Approval rejected'));
+}
+
+function testAdaptivePlanValidationAndNormalization() {
+  const workspaceRoot = '/repo';
+  const validPlan = {
+    id: 'plan_valid',
+    task: 'Patch target component',
+    summary: 'Inspect target component, apply one focused patch, verify, then report.',
+    complexity: 'single_file',
+    mode: 'agent',
+    status: 'pending',
+    workspaceRoot,
+    createdAt: 1,
+    updatedAt: 1,
+    goals: [
+      {
+        id: 'G1',
+        title: 'Inspect target component file',
+        type: 'inspect',
+        status: 'pending',
+        tools: ['readFile'],
+        files: ['src/App.tsx'],
+        success_check: 'Target component behavior and edit location are understood.',
+        budget: { maxModelCalls: 0, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 0 },
+      },
+      {
+        id: 'G2',
+        title: 'Patch target component copy',
+        type: 'edit',
+        status: 'pending',
+        tools: ['patchFile'],
+        files: ['src/App.tsx'],
+        success_check: 'Focused component patch is applied without unrelated files.',
+        budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 1 },
+      },
+      {
+        id: 'G3',
+        title: 'Verify component build signal',
+        type: 'verify',
+        status: 'pending',
+        tools: ['runCommand'],
+        files: [],
+        success_check: 'Targeted verification command completes or failure is reported.',
+        budget: { maxModelCalls: 0, maxToolCalls: 1, maxFilesToRead: 0, maxFilesToWrite: 0 },
+      },
+      {
+        id: 'G4',
+        title: 'Report final plan result',
+        type: 'summarize',
+        status: 'pending',
+        tools: [],
+        files: [],
+        success_check: 'Changed files, checks, and remaining risk are summarized.',
+        budget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0 },
+      },
+    ],
+  };
+
+  const valid = validateAdaptivePlan(validPlan, {
+    workspaceRoot,
+    allowedTools: ['readFile', 'patchFile', 'runCommand'],
+  });
+  assert.strictEqual(valid.valid, true);
+  assert.ok(valid.plan);
+  const taskPlan = normalizeAdaptivePlanToTaskPlan({
+    adaptivePlan: valid.plan!,
+    intent: 'edit_file',
+    userRequest: 'Patch src/App.tsx',
+  });
+  assert.strictEqual(taskPlan.steps.length, 4);
+  assert.strictEqual(taskPlan.steps[1].toolsAllowed[0], 'patchFile');
+  assert.ok(taskPlan.adaptivePlan);
+  assert.ok(renderAdaptivePlanMarkdown(valid.plan!).includes('G2: Patch target component copy'));
+
+  const invalid = validateAdaptivePlan({
+    ...validPlan,
+    id: 'plan_invalid',
+    goals: [
+      {
+        id: 'G1',
+        title: 'fix',
+        type: 'inspect',
+        status: 'pending',
+        tools: ['patchFile', 'unknownTool'],
+        files: ['/etc/passwd'],
+        success_check: '',
+        budget: { maxModelCalls: 0, maxToolCalls: 20, maxFilesToRead: 0, maxFilesToWrite: 5 },
+      },
+      {
+        id: 'G1',
+        title: 'Another duplicate goal',
+        type: 'summarize',
+        status: 'pending',
+        tools: [],
+        files: [],
+        success_check: 'Final report exists.',
+        budget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0 },
+      },
+    ],
+  }, {
+    workspaceRoot,
+    allowedTools: ['readFile'],
+    maxGoalsPerPlan: 12,
+  });
+  assert.strictEqual(invalid.valid, false);
+  assert.ok(invalid.errors.some((error) => error.includes('vague title')));
+  assert.ok(invalid.errors.some((error) => error.includes('Duplicate goal id')));
+  assert.ok(invalid.errors.some((error) => error.includes('unknown tool')));
+  assert.ok(invalid.errors.some((error) => error.includes('outside workspace')));
 }
 
 async function testModelAdapter() {
@@ -888,6 +1003,318 @@ async function testEngineCreatesTaskPlanTraceAndCheckpoint() {
   }
 }
 
+async function testEngineCreatesAdaptivePlanArtifactsAndCanResume() {
+  const originalFetch = globalThis.fetch;
+  const chatRequests: any[] = [];
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-adaptive-plan-'));
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const value = 1;\n', 'utf8');
+  const planJson = {
+    id: 'plan_test_adaptive',
+    task: 'Update source value safely',
+    summary: 'Inspect src/index.ts, patch one value, verify with git diff, then report.',
+    complexity: 'single_file',
+    mode: 'agent',
+    status: 'pending',
+    workspaceRoot,
+    createdAt: 1,
+    updatedAt: 1,
+    goals: [
+      {
+        id: 'G1',
+        title: 'Inspect src index file',
+        type: 'inspect',
+        status: 'pending',
+        tools: ['readFile'],
+        files: ['src/index.ts'],
+        success_check: 'The current export in src/index.ts is known before editing.',
+        budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 0 },
+      },
+      {
+        id: 'G2',
+        title: 'Patch src index value',
+        type: 'edit',
+        status: 'pending',
+        tools: ['patchFile'],
+        files: ['src/index.ts'],
+        success_check: 'src/index.ts changes only the requested export value.',
+        budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 1 },
+      },
+      {
+        id: 'G3',
+        title: 'Verify focused git diff',
+        type: 'verify',
+        status: 'pending',
+        tools: ['gitDiff'],
+        files: [],
+        success_check: 'Git diff shows the focused source value change.',
+        budget: { maxModelCalls: 0, maxToolCalls: 1, maxFilesToRead: 0, maxFilesToWrite: 0 },
+      },
+      {
+        id: 'G4',
+        title: 'Report adaptive plan result',
+        type: 'summarize',
+        status: 'pending',
+        tools: [],
+        files: [],
+        success_check: 'User sees changed files, checks, and remaining risk.',
+        budget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0 },
+      },
+    ],
+  };
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder(body) {
+      const payload = JSON.stringify(body.messages || []);
+      if (payload.includes('[Adaptive Planning Task]')) {
+        return {
+          ...MOCK_CHAT_RESPONSE,
+          choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(planJson) }, finish_reason: 'stop' }],
+        };
+      }
+      return {
+        ...MOCK_CHAT_RESPONSE,
+        choices: [{ index: 0, message: { role: 'assistant', content: 'Goal worked.' }, finish_reason: 'stop' }],
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent', model: 'gemma4:e4b' });
+    const response = await engine.chat([
+      { role: 'user', content: 'Update src/index.ts value safely' },
+    ]);
+    assertAgentWorkResponse(response, 'Goal worked.');
+    assert.strictEqual(chatRequests.filter((body) => JSON.stringify(body.messages || []).includes('[Adaptive Planning Task]')).length, 1);
+
+    const runs = await engine.listRuns();
+    assert.ok(runs.length >= 1);
+    const checkpoint = runs[0];
+    assert.strictEqual(checkpoint.activePlanId, 'plan_test_adaptive');
+    assert.ok(checkpoint.taskPlan.adaptivePlan);
+    assert.ok(checkpoint.taskPlan.planArtifactPaths?.json);
+    assert.ok(checkpoint.taskPlan.steps.some((step) => step.status === 'pending'), 'pending goals should remain resumable');
+    const planJsonOnDisk = JSON.parse(await fs.readFile(checkpoint.taskPlan.planArtifactPaths!.json, 'utf8'));
+    assert.strictEqual(planJsonOnDisk.id, 'plan_test_adaptive');
+    const planMd = await fs.readFile(checkpoint.taskPlan.planArtifactPaths!.markdown, 'utf8');
+    assert.ok(planMd.includes('G2: Patch src index value'));
+
+    await engine.chat([{ role: 'user', content: 'continue' }]);
+    assert.strictEqual(chatRequests.filter((body) => JSON.stringify(body.messages || []).includes('[Adaptive Planning Task]')).length, 1);
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'adaptive_plan_resumed'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testAdaptiveGoalBlocksDisallowedTool() {
+  const originalFetch = globalThis.fetch;
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-adaptive-tool-scope-'));
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const value = 1;\n', 'utf8');
+  const planJson = {
+    id: 'plan_tool_scope',
+    task: 'Inspect before editing',
+    summary: 'Current goal allows only readFile before later patching.',
+    complexity: 'single_file',
+    mode: 'agent',
+    status: 'pending',
+    workspaceRoot,
+    createdAt: 1,
+    updatedAt: 1,
+    goals: [
+      {
+        id: 'G1',
+        title: 'Inspect source before patch',
+        type: 'inspect',
+        status: 'pending',
+        tools: ['readFile'],
+        files: ['src/index.ts'],
+        success_check: 'Source file is read before editing.',
+        budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 0 },
+      },
+      {
+        id: 'G2',
+        title: 'Patch source after inspection',
+        type: 'edit',
+        status: 'pending',
+        tools: ['patchFile'],
+        files: ['src/index.ts'],
+        success_check: 'Patch is applied only after inspection goal.',
+        budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 1 },
+      },
+      {
+        id: 'G3',
+        title: 'Verify focused diff',
+        type: 'verify',
+        status: 'pending',
+        tools: ['gitDiff'],
+        files: [],
+        success_check: 'Diff confirms any change is focused.',
+        budget: { maxModelCalls: 0, maxToolCalls: 1, maxFilesToRead: 0, maxFilesToWrite: 0 },
+      },
+      {
+        id: 'G4',
+        title: 'Report scoped execution result',
+        type: 'summarize',
+        status: 'pending',
+        tools: [],
+        files: [],
+        success_check: 'Report states whether disallowed tool use was blocked.',
+        budget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0 },
+      },
+    ],
+  };
+
+  globalThis.fetch = createMockFetch({
+    chatResponder(body) {
+      const payload = JSON.stringify(body.messages || []);
+      if (payload.includes('[Adaptive Planning Task]')) {
+        return {
+          ...MOCK_CHAT_RESPONSE,
+          choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(planJson) }, finish_reason: 'stop' }],
+        };
+      }
+      return {
+        ...MOCK_CHAT_RESPONSE,
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{
+              id: 'call_patch_too_soon',
+              type: 'function',
+              function: {
+                name: 'patchFile',
+                arguments: JSON.stringify({ filePath: 'src/index.ts', oldContent: 'value = 1', newContent: 'value = 2' }),
+              },
+            }],
+          },
+          finish_reason: 'tool_calls',
+        }],
+      };
+    },
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent', model: 'gemma4:e4b' });
+    await engine.chat([{ role: 'user', content: 'Patch src/index.ts after inspection' }]);
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'adaptive_goal_tool_blocked'));
+    const content = await fs.readFile(path.join(workspaceRoot, 'src', 'index.ts'), 'utf8');
+    assert.ok(content.includes('value = 1'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testAdaptiveGoalBlocksFileScopeAndBudget() {
+  const originalFetch = globalThis.fetch;
+
+  async function runGuardScenario(params: {
+    traceType: string;
+    planBudget: { maxModelCalls: number; maxToolCalls: number; maxFilesToRead: number; maxFilesToWrite: number };
+    filePath: string;
+  }) {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-adaptive-goal-guard-'));
+    await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+    await fs.writeFile(path.join(workspaceRoot, 'src', 'index.ts'), 'export const value = 1;\n', 'utf8');
+    await fs.writeFile(path.join(workspaceRoot, 'src', 'other.ts'), 'export const other = true;\n', 'utf8');
+    const planJson = {
+      id: `plan_${params.traceType}`,
+      task: 'Read scoped source file',
+      summary: 'The current goal may read only src/index.ts within its declared budget.',
+      complexity: 'single_file',
+      mode: 'agent',
+      status: 'pending',
+      workspaceRoot,
+      createdAt: 1,
+      updatedAt: 1,
+      goals: [
+        {
+          id: 'G1',
+          title: 'Inspect scoped source file',
+          type: 'inspect',
+          status: 'pending',
+          tools: ['readFile'],
+          files: ['src/index.ts'],
+          success_check: 'Only src/index.ts is read for this goal.',
+          budget: params.planBudget,
+        },
+        {
+          id: 'G2',
+          title: 'Report scoped guard result',
+          type: 'summarize',
+          status: 'pending',
+          tools: [],
+          files: [],
+          success_check: 'The final report states whether guardrails blocked execution.',
+          budget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0 },
+        },
+      ],
+    };
+
+    globalThis.fetch = createMockFetch({
+      chatResponder(body) {
+        const payload = JSON.stringify(body.messages || []);
+        if (payload.includes('[Adaptive Planning Task]')) {
+          return {
+            ...MOCK_CHAT_RESPONSE,
+            choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(planJson) }, finish_reason: 'stop' }],
+          };
+        }
+        return {
+          ...MOCK_CHAT_RESPONSE,
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{
+                id: 'call_read_guard',
+                type: 'function',
+                function: {
+                  name: 'readFile',
+                  arguments: JSON.stringify({ filePath: params.filePath }),
+                },
+              }],
+            },
+            finish_reason: 'tool_calls',
+          }],
+        };
+      },
+    }) as typeof fetch;
+
+    try {
+      const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent', model: 'gemma4:e4b' });
+      await engine.chat([{ role: 'user', content: 'Patch src/index.ts after scoped inspection' }]);
+      assert.ok(engine.getTraceLog().some((entry) => entry.type === params.traceType));
+    } finally {
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }
+
+  try {
+    await runGuardScenario({
+      traceType: 'adaptive_goal_file_scope_blocked',
+      planBudget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 0 },
+      filePath: 'src/other.ts',
+    });
+    await runGuardScenario({
+      traceType: 'adaptive_goal_budget_blocked',
+      planBudget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 1, maxFilesToWrite: 0 },
+      filePath: 'src/index.ts',
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function testRepoIndexerExcludesVendoredAndSessionDirs() {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-indexer-'));
   await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
@@ -1126,11 +1553,11 @@ async function testEnginePrefersNativeToolsForGemmaTargetedEdits() {
 
     assertAgentWorkResponse(response, 'export const ok = true;');
     assert.ok(chatRequests.length >= 1);
-    assert.ok(Array.isArray(chatRequests[0].tools));
-    assert.ok(chatRequests[0].tools.length > 0);
-    assert.ok(!JSON.stringify(chatRequests[0].messages).includes('Use this lightweight JSON tool protocol'));
-    assertLeanThinkingControl(chatRequests[0].think ?? chatRequests[0].reasoning_effort);
-    assert.strictEqual(chatRequests[0].options?.num_predict ?? chatRequests[0].max_tokens, 128);
+    const toolRequest = chatRequests.find((body) => Array.isArray(body.tools) && body.tools.length > 0);
+    assert.ok(toolRequest);
+    assert.ok(!JSON.stringify(toolRequest.messages).includes('Use this lightweight JSON tool protocol'));
+    assertLeanThinkingControl(toolRequest.think ?? toolRequest.reasoning_effort);
+    assert.strictEqual(toolRequest.options?.num_predict ?? toolRequest.max_tokens, 128);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1164,9 +1591,9 @@ async function testEngineKeepsNativeToolsWhenCapabilitiesOmitTools() {
 
     assertAgentWorkResponse(response, 'Native tool trial stayed active.');
     assert.ok(chatRequests.length >= 1);
-    assert.ok(Array.isArray(chatRequests[0].tools));
-    assert.ok(chatRequests[0].tools.length > 0);
-    assert.ok(!JSON.stringify(chatRequests[0].messages).includes('Use exactly one JSON tool action at a time.'));
+    const toolRequest = chatRequests.find((body) => Array.isArray(body.tools) && body.tools.length > 0);
+    assert.ok(toolRequest);
+    assert.ok(!JSON.stringify(toolRequest.messages).includes('Use exactly one JSON tool action at a time.'));
     assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'manual_tool_fallback'));
     const runSummary = getLatestAgentRunSummary(engine);
     assert.strictEqual(runSummary?.toolProtocol, 'native');
@@ -1190,6 +1617,45 @@ async function testEngineRecoversFromPlanningOnlyNativeReply() {
       chatRequests.push(body);
     },
     chatResponder(body) {
+      const payload = JSON.stringify(body.messages || []);
+      if (payload.includes('[Adaptive Planning Task]')) {
+        return {
+          ...MOCK_CHAT_RESPONSE,
+          choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify({
+            id: 'plan_read_index',
+            task: 'Read source index export',
+            summary: 'Read src/index.ts and report the exported value.',
+            complexity: 'single_file',
+            mode: 'agent',
+            status: 'pending',
+            workspaceRoot,
+            createdAt: 1,
+            updatedAt: 1,
+            goals: [
+              {
+                id: 'G1',
+                title: 'Read source index file',
+                type: 'inspect',
+                status: 'pending',
+                tools: ['readFile'],
+                files: ['src/index.ts'],
+                success_check: 'src/index.ts is read and export statement is known.',
+                budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 0 },
+              },
+              {
+                id: 'G2',
+                title: 'Report source export',
+                type: 'summarize',
+                status: 'pending',
+                tools: [],
+                files: [],
+                success_check: 'The export found in src/index.ts is summarized.',
+                budget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0 },
+              },
+            ],
+          }) }, finish_reason: 'stop' }],
+        };
+      }
       chatCalls += 1;
       if (body.messages?.some((message: { role?: string }) => message.role === 'tool')) {
         return {
@@ -1279,11 +1745,15 @@ async function testEngineUsesManualToolProtocolWhenModelLacksNativeTools() {
 
     assertAgentWorkResponse(response, 'export const ok = true;');
     assert.ok(chatRequests.length >= 2);
-    assert.strictEqual(chatRequests[0].tools, undefined);
-    assert.ok(
-      JSON.stringify(chatRequests[0].messages).includes('Use exactly one JSON tool action at a time.'),
+    const manualRequest = chatRequests.find((body) =>
+      JSON.stringify(body.messages || []).includes('Use exactly one JSON tool action at a time.'),
     );
-    assertLeanThinkingControl(chatRequests[0].think ?? chatRequests[0].reasoning_effort);
+    assert.ok(manualRequest);
+    assert.strictEqual(manualRequest.tools, undefined);
+    assert.ok(
+      JSON.stringify(manualRequest.messages).includes('Use exactly one JSON tool action at a time.'),
+    );
+    assertLeanThinkingControl(manualRequest.think ?? manualRequest.reasoning_effort);
     const runSummary = getLatestAgentRunSummary(engine);
     assert.strictEqual(runSummary?.toolProtocol, 'manual');
     assert.strictEqual(runSummary?.fallbackPath, 'manual_fallback');
@@ -1405,10 +1875,10 @@ async function testEnginePrefersNativeToolsForGemmaQuickInspect() {
 
     assertAgentWorkResponse(response, 'export const ok = true;');
     assert.ok(chatRequests.length >= 1);
-    assert.ok(Array.isArray(chatRequests[0].tools));
-    assert.ok(chatRequests[0].tools.length > 0);
-    assert.ok(!JSON.stringify(chatRequests[0].messages).includes('Use this lightweight JSON tool protocol'));
-    assertLeanThinkingControl(chatRequests[0].think ?? chatRequests[0].reasoning_effort);
+    const toolRequest = chatRequests.find((body) => Array.isArray(body.tools) && body.tools.length > 0);
+    assert.ok(toolRequest);
+    assert.ok(!JSON.stringify(toolRequest.messages).includes('Use this lightweight JSON tool protocol'));
+    assertLeanThinkingControl(toolRequest.think ?? toolRequest.reasoning_effort);
   } finally {
     globalThis.fetch = originalFetch;
     await fs.rm(workspaceRoot, { recursive: true, force: true });
@@ -1577,9 +2047,60 @@ async function testEngineModelSwitchUpdatesSession() {
 
 async function testEngineRejectsSimulatedToolTranscripts() {
   const originalFetch = globalThis.fetch;
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-simulated-tool-'));
   let chatCalls = 0;
   globalThis.fetch = createMockFetch({
-    chatResponder() {
+    chatResponder(body) {
+      const payload = JSON.stringify(body.messages || []);
+      if (payload.includes('[Adaptive Planning Task]')) {
+        chatCalls += 1;
+        return {
+          ...MOCK_CHAT_RESPONSE,
+          choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify({
+            id: 'plan_simulated_tool',
+            task: 'Create notes file',
+            summary: 'Create notes.txt, verify diff, then report.',
+            complexity: 'single_file',
+            mode: 'agent',
+            status: 'pending',
+            workspaceRoot,
+            createdAt: 1,
+            updatedAt: 1,
+            goals: [
+              {
+                id: 'G1',
+                title: 'Create notes text file',
+                type: 'edit',
+                status: 'pending',
+                tools: ['writeFile'],
+                files: ['notes.txt'],
+                success_check: 'notes.txt is created with requested hello content.',
+                budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 0, maxFilesToWrite: 1 },
+              },
+              {
+                id: 'G2',
+                title: 'Verify notes diff',
+                type: 'verify',
+                status: 'pending',
+                tools: ['gitDiff'],
+                files: [],
+                success_check: 'Git diff or equivalent evidence shows notes.txt only.',
+                budget: { maxModelCalls: 0, maxToolCalls: 1, maxFilesToRead: 0, maxFilesToWrite: 0 },
+              },
+              {
+                id: 'G3',
+                title: 'Report notes creation result',
+                type: 'summarize',
+                status: 'pending',
+                tools: [],
+                files: [],
+                success_check: 'Report states no fake tool transcript was trusted.',
+                budget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0 },
+              },
+            ],
+          }) }, finish_reason: 'stop' }],
+        };
+      }
       chatCalls += 1;
       return {
         id: `mock-simulated-${chatCalls}`,
@@ -1598,16 +2119,17 @@ async function testEngineRejectsSimulatedToolTranscripts() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ mode: 'full-agent' });
+    const engine = new CoreEngine({ workspaceRoot, mode: 'full-agent' });
     const response = await engine.chat([
       { role: 'user', content: 'Create notes.txt with hello' },
     ]);
 
     assert.ok(response.includes('No tools were executed'));
-    assert.strictEqual(chatCalls, 2);
+    assert.strictEqual(chatCalls, 3);
     assert.ok(engine.getTraceLog().some((entry) => entry.type === 'tool_simulation_detected'));
   } finally {
     globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
   }
 }
 
@@ -1665,6 +2187,55 @@ async function testEngineRequestsSelfCheckAfterWrite() {
     },
     chatResponder(body) {
       const messages = Array.isArray(body.messages) ? body.messages : [];
+      const payload = JSON.stringify(messages);
+      if (payload.includes('[Adaptive Planning Task]')) {
+        return {
+          ...MOCK_CHAT_RESPONSE,
+          choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify({
+            id: 'plan_self_check',
+            task: 'Create verified notes file',
+            summary: 'Write notes.txt, read it back for verification, then report.',
+            complexity: 'single_file',
+            mode: 'agent',
+            status: 'pending',
+            workspaceRoot,
+            createdAt: 1,
+            updatedAt: 1,
+            goals: [
+              {
+                id: 'G1',
+                title: 'Write verified notes file',
+                type: 'edit',
+                status: 'pending',
+                tools: ['writeFile'],
+                files: ['notes.txt'],
+                success_check: 'notes.txt is written with verified content.',
+                budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 0, maxFilesToWrite: 1 },
+              },
+              {
+                id: 'G2',
+                title: 'Verify notes readback',
+                type: 'verify',
+                status: 'pending',
+                tools: ['readFile'],
+                files: ['notes.txt'],
+                success_check: 'notes.txt is read back and contains verified content.',
+                budget: { maxModelCalls: 1, maxToolCalls: 1, maxFilesToRead: 1, maxFilesToWrite: 0 },
+              },
+              {
+                id: 'G3',
+                title: 'Report verified notes result',
+                type: 'summarize',
+                status: 'pending',
+                tools: [],
+                files: [],
+                success_check: 'Report confirms file content was verified.',
+                budget: { maxModelCalls: 1, maxToolCalls: 0, maxFilesToRead: 0, maxFilesToWrite: 0 },
+              },
+            ],
+          }) }, finish_reason: 'stop' }],
+        };
+      }
       const toolMessages = messages.filter((message: { role?: string }) => message.role === 'tool');
       const hasSelfCheckPrompt = messages.some((message: { role?: string; content?: string }) =>
         message.role === 'system' && typeof message.content === 'string' && message.content.includes('[Self Check]'),
@@ -2118,6 +2689,7 @@ async function run() {
   await testProjectMemoryIsStructuredEditableAndSelective();
   testTaskOrchestratorClassifiesIntent();
   testTaskOrchestratorPlanAndStepTransitions();
+  testAdaptivePlanValidationAndNormalization();
   await testModelAdapter();
   await testModelAdapterLegacyOllamaLifecycle();
   await testModelAdapterPrefersNativeOllamaChat();
@@ -2134,6 +2706,9 @@ async function run() {
   await testDirectChatDoesNotInspectProjectWithoutAgentMode();
   await testDirectChatStreamRetriesVisibleOnIdle();
   await testEngineCreatesTaskPlanTraceAndCheckpoint();
+  await testEngineCreatesAdaptivePlanArtifactsAndCanResume();
+  await testAdaptiveGoalBlocksDisallowedTool();
+  await testAdaptiveGoalBlocksFileScopeAndBudget();
   await testRepoIndexerExcludesVendoredAndSessionDirs();
   await testRepoIndexerBuildsWorkspaceInventory();
   await testDeterministicToolsBoundLargeAndBinaryFiles();

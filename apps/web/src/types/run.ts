@@ -73,6 +73,24 @@ export interface TaskPlan {
   revisedAt?: number;
   completedAt?: number;
   failedAt?: number;
+  adaptivePlan?: {
+    id: string;
+    task: string;
+    summary: string;
+    complexity: string;
+    mode: 'agent';
+    status: TaskPlanStatus;
+    workspaceRoot: string;
+    createdAt: number;
+    updatedAt: number;
+    goals: unknown[];
+    planner?: string;
+    validationErrors?: string[];
+  };
+  planArtifactPaths?: {
+    json: string;
+    markdown: string;
+  };
 }
 
 export interface StepProgress {
@@ -143,6 +161,13 @@ export interface RunCheckpoint {
   runId: string;
   sessionId: string;
   taskPlan: TaskPlan;
+  activePlanId?: string;
+  currentGoalId?: string;
+  completedGoals?: string[];
+  failedGoals?: string[];
+  blockedGoals?: string[];
+  adaptivePlan?: TaskPlan['adaptivePlan'];
+  planArtifactPaths?: TaskPlan['planArtifactPaths'];
   currentStepId?: string;
   completedSteps: string[];
   failedSteps: string[];
