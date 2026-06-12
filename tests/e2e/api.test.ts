@@ -653,6 +653,33 @@ async function testApiWorkflow() {
     assert.ok(!defaultChatEvents.some((event) => event.type === 'task_plan_created'));
     assert.strictEqual(mockModel.getChatRequests().length, chatRequestsBeforeDefaultChat + 1);
 
+    const unsafeChatEvents = await fetchNdjson(`${API_BASE}/api/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'chat',
+        agentic: false,
+        executionMode: 'direct',
+        workspaceRoot: pickedWorkspace,
+        allowTools: true,
+        messages: [{ role: 'user', content: 'List workspace files' }],
+      }),
+    });
+    assert.ok(unsafeChatEvents.some((event) => event.type === 'error' && String(event.message || '').includes('Chat Mode')));
+    assert.ok(!unsafeChatEvents.some((event) => event.type === 'tool' || event.type === 'task_plan_created' || event.type === 'run_started'));
+
+    const unsafeChatPost = await fetch(`${API_BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: 'chat',
+        executionMode: 'direct',
+        allowTools: true,
+        messages: [{ role: 'user', content: 'Run a command' }],
+      }),
+    });
+    assert.strictEqual(unsafeChatPost.status, 400);
+
     const invalidAdvancedTools = await fetch(`${API_BASE}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

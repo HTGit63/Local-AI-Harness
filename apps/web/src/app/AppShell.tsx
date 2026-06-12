@@ -5,5 +5,5 @@ interface AppShellProps {
 }
 
 export function AppShell({ children }: AppShellProps) {
-  return <div className="app-shell">{children}</div>;
+  return <div className="app-root">{children}</div>;
 }

@@ -3844,15 +3844,6 @@ export class CoreEngine extends EventEmitter {
     this.planner.setIntendedAction('Generating assistant response');
     this.emitChatStatus(handlers, 'mode', 'Chat Mode', 0);
 
-    const latestUserMessage = this.getLatestUserMessage(messages);
-    const projectInspectionAnswer = await this.tryAnswerFromLocalProjectInspection(latestUserMessage);
-    if (projectInspectionAnswer !== null) {
-      this.completeImmediateResponse(handlers, projectInspectionAnswer);
-      this.updateLatestChatTurnSummary(projectInspectionAnswer.content, projectInspectionAnswer.source);
-      await this.persistCurrentSession();
-      return projectInspectionAnswer.content;
-    }
-
     this.emitChatStatus(handlers, 'model_loading', 'Model loading or generating response', 0);
     let response = '';
     let continuationCount = 0;

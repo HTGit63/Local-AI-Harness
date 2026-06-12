@@ -70,8 +70,14 @@ function parseExecutionMode(body: Record<string, unknown>): ApiExecutionMode {
   if (body.mode === 'agent') {
     return 'agent';
   }
+  if (body.executionMode === 'agentic') {
+    return 'agent';
+  }
   if (body.mode === 'plan' || body.mode === 'trusted-edit' || body.mode === 'full-agent' || body.mode === 'danger-sandbox') {
     return 'agent';
+  }
+  if (body.executionMode === 'direct') {
+    return 'chat';
   }
   if (body.mode === 'chat' || body.mode === 'inspect') {
     return 'chat';
@@ -736,6 +742,14 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (executionMode === 'chat') {
+          if (body.workspaceRoot !== undefined && body.workspaceRoot !== null) {
+            sendBadRequest(req, res, 'Chat Mode cannot include workspaceRoot.');
+            return;
+          }
+          if (body.allowTools === true || advancedTools) {
+            sendBadRequest(req, res, 'Chat Mode cannot enable repo tools.');
+            return;
+          }
           const content = await engine.directChat(
             messages as { role: 'system' | 'user' | 'assistant' | 'tool'; content: string }[],
             { signal: abortController.signal, think: thinkingEnabled },
@@ -797,6 +811,16 @@ const server = http.createServer(async (req, res) => {
         startNdjson(req, res);
 
         if (executionMode === 'chat') {
+          if (body.workspaceRoot !== undefined && body.workspaceRoot !== null) {
+            writeNdjson(res, { type: 'error', message: 'Chat Mode cannot include workspaceRoot.' });
+            res.end();
+            return;
+          }
+          if (body.allowTools === true || advancedTools) {
+            writeNdjson(res, { type: 'error', message: 'Chat Mode cannot enable repo tools.' });
+            res.end();
+            return;
+          }
           if (thinkingWarning) {
             writeNdjson(res, { type: 'status', phase: 'warning', action: thinkingWarning, loop: 0 });
           }
@@ -806,13 +830,6 @@ const server = http.createServer(async (req, res) => {
             {
               onStatus: (event: { phase: string; action: string; loop: number }) => writeNdjson(res, { type: 'status', ...event }),
               onDelta: (delta: string) => writeNdjson(res, { type: 'delta', delta }),
-              onTool: (event) => writeNdjson(res, { type: 'tool', ...event }),
-              onApproval: (event) => writeNdjson(res, event),
-              onRunStarted: (event) => writeNdjson(res, event),
-              onRunStep: (event) => writeNdjson(res, event),
-              onRunMetric: (event) => writeNdjson(res, event),
-              onRunSummary: (event) => writeNdjson(res, event),
-              onTrace: (event) => writeTraceNdjson(res, event),
             },
             { signal: abortController.signal, think: thinkingEnabled }
           );

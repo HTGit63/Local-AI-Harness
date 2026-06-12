@@ -776,7 +776,7 @@ async function testDirectChatStreamRetriesVisibleOnIdle() {
   }
 }
 
-async function testProjectInspectionUsesDeterministicPathWithoutCheckpoint() {
+async function testDirectChatDoesNotInspectProjectWithoutAgentMode() {
   const originalFetch = globalThis.fetch;
   const chatRequests: any[] = [];
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'sample-vite-app-'));
@@ -812,10 +812,11 @@ async function testProjectInspectionUsesDeterministicPathWithoutCheckpoint() {
       { role: 'user', content: 'What kind of project is this app?' },
     ]);
 
-    assert.ok(response.includes('Project: sample-vite-app'));
-    assert.ok(response.includes('Type: Vite React frontend'));
-    assert.ok(response.includes('Package manager: pnpm'));
-    assert.strictEqual(chatRequests.length, 0);
+    assert.ok(response.includes('This is a mocked model response for testing.'));
+    assert.strictEqual(chatRequests.length, 1);
+    const payload = JSON.stringify(chatRequests[0].messages || []);
+    assert.ok(!payload.includes(workspaceRoot));
+    assert.ok(!payload.includes('sample-vite-app'));
     assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'task_plan_created'));
     const runs = await engine.listRuns();
     assert.strictEqual(runs.length, 0);
@@ -2130,7 +2131,7 @@ async function run() {
   await testEngineRecordsExecutionModes();
   await testEnginePrioritizesEditsWithoutAutoRepoContext();
   await testDirectChatDoesNotCreateTaskPlan();
-  await testProjectInspectionUsesDeterministicPathWithoutCheckpoint();
+  await testDirectChatDoesNotInspectProjectWithoutAgentMode();
   await testDirectChatStreamRetriesVisibleOnIdle();
   await testEngineCreatesTaskPlanTraceAndCheckpoint();
   await testRepoIndexerExcludesVendoredAndSessionDirs();
