@@ -4753,6 +4753,119 @@ body::after {
   font-size: 18px;
 }
 
+.minimal-run-summary {
+  background: #0d0d0d;
+}
+
+.minimal-run-summary-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.minimal-run-summary-block {
+  display: grid;
+  gap: 8px;
+}
+
+.minimal-run-summary-label {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.minimal-run-file-list,
+.minimal-run-check-list {
+  display: grid;
+  gap: 6px;
+}
+
+.minimal-run-file-row,
+.minimal-run-check-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 28px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #080808;
+}
+
+.minimal-run-file-row code,
+.minimal-run-check-row code {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.minimal-run-status {
+  min-width: 58px;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.minimal-run-status-passed {
+  border-color: rgba(61, 220, 132, 0.38);
+  color: var(--success);
+}
+
+.minimal-run-status-failed {
+  border-color: rgba(255, 95, 87, 0.38);
+  color: var(--danger);
+}
+
+.minimal-run-status-running {
+  border-color: rgba(47, 155, 255, 0.4);
+  color: var(--accent-hover);
+}
+
+.minimal-run-status-skipped,
+.minimal-run-status-not_run,
+.minimal-run-status-unknown {
+  color: var(--text-tertiary);
+}
+
+.minimal-run-more,
+.minimal-run-diff-unavailable {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.minimal-run-summary-actions {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.minimal-run-diff-preview {
+  max-height: 260px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #070707;
+  color: #c9c9c9;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.minimal-run-diff-preview span {
+  display: block;
+  min-height: 15px;
+  white-space: pre;
+}
+
 @media (max-width: 1240px) {
   .agent-status-ledger {
     display: flex;
