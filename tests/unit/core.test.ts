@@ -551,6 +551,45 @@ async function testModelAdapterReportsLlamaCppOffline() {
   }
 }
 
+async function testModelAdapterUsesVisibleOllamaFallback() {
+  const originalFetch = globalThis.fetch;
+  const mockFetch = createMockFetch();
+  const requests: string[] = [];
+
+  globalThis.fetch = (async (url: any, opts?: any) => {
+    const requestUrl = String(url);
+    requests.push(requestUrl);
+    if (requestUrl === 'http://127.0.0.1:8080/v1/models') {
+      throw new Error('llama.cpp down');
+    }
+    return mockFetch(requestUrl, opts);
+  }) as typeof fetch;
+
+  try {
+    const adapter = new ModelAdapter({
+      provider: 'llamacpp',
+      baseUrl: 'http://127.0.0.1:8080/v1',
+      fallbackProvider: 'ollama-legacy',
+      fallbackBaseUrl: 'http://127.0.0.1:11434/v1',
+      fallbackModel: 'gemma4:e4b',
+      healthCheckTimeoutMs: 1000,
+    });
+
+    const runtime = await adapter.getRuntimeState(0);
+    assert.strictEqual(runtime.activeProvider, 'ollama-legacy');
+    assert.strictEqual(runtime.primaryRuntime.provider, 'llamacpp');
+    assert.strictEqual(runtime.primaryRuntime.status, 'offline');
+    assert.strictEqual(runtime.fallbackRuntime?.provider, 'ollama-legacy');
+    assert.strictEqual(runtime.fallbackRuntime?.status, 'connected');
+    assert.ok(runtime.fallbackWarning?.includes('Using Ollama fallback'));
+    assert.strictEqual(runtime.fallbackRuntime?.warning, runtime.fallbackWarning);
+    assert.ok(requests.some((entry) => entry === 'http://127.0.0.1:8080/v1/models'));
+    assert.ok(requests.some((entry) => entry === 'http://127.0.0.1:11434/v1/models'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function testModelAdapterCapsLocalOutputTokens() {
   const originalFetch = globalThis.fetch;
   const chatRequests: any[] = [];
@@ -2694,6 +2733,7 @@ async function run() {
   await testModelAdapterLegacyOllamaLifecycle();
   await testModelAdapterPrefersNativeOllamaChat();
   await testModelAdapterReportsLlamaCppOffline();
+  await testModelAdapterUsesVisibleOllamaFallback();
   await testModelAdapterCapsLocalOutputTokens();
   await testEnginePromptRecipeSelection();
   await testEngineSanitizesDisabledSkills();

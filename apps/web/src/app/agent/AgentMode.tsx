@@ -304,10 +304,40 @@ interface ModelLifecyclePolicy {
 interface ModelRuntimeState {
   provider: RuntimeProvider;
   baseUrl: string;
+  activeProvider?: RuntimeProvider;
+  activeBaseUrl?: string;
   configuredModel: string;
   activeModel: string | null;
   runtimeStatus?: 'ready' | 'idle' | 'configured_not_loaded' | 'unavailable';
   statusMessage?: string;
+  primaryRuntime?: {
+    provider: RuntimeProvider;
+    baseUrl: string;
+    model: string;
+    modelPath?: string;
+    modelAlias?: string;
+    status: 'connected' | 'unavailable' | 'offline';
+    isPrimary: boolean;
+    isFallback: boolean;
+    warning?: string;
+    error?: string;
+    checkedAt: number;
+  };
+  fallbackRuntime?: {
+    provider: RuntimeProvider;
+    baseUrl: string;
+    model: string;
+    status: 'connected' | 'unavailable' | 'offline';
+    isPrimary: boolean;
+    isFallback: boolean;
+    warning?: string;
+    error?: string;
+    checkedAt: number;
+  };
+  fallbackEnabled?: boolean;
+  fallbackWarning?: string;
+  modelPath?: string;
+  modelAlias?: string;
   runningModels: RunningModel[];
   installedModels: string[];
   availableModels: AvailableModel[];
@@ -1427,6 +1457,13 @@ export function AgentMode() {
   }, [browserFilter, sidebarSelection]);
 
   const activeModelLabel = modelRuntime?.activeModel || config?.model || 'No model';
+  const activeRuntimeProvider = modelRuntime?.activeProvider || modelRuntime?.provider || config?.provider;
+  const activeRuntimeLabel = activeRuntimeProvider === 'ollama-legacy'
+    ? 'Ollama fallback'
+    : activeRuntimeProvider === 'llamacpp'
+      ? 'llama.cpp'
+      : activeRuntimeProvider || 'Runtime';
+  const runtimeFallbackWarning = modelRuntime?.fallbackWarning || modelRuntime?.fallbackRuntime?.warning || '';
   const modelRuntimeStatusLabel = modelRuntime?.runtimeStatus
     ? modelRuntime.runtimeStatus.replace(/_/g, ' ')
     : backendStatus;
@@ -2459,10 +2496,20 @@ export function AgentMode() {
             <span className={`status-dot status-dot-${backendStatus}`} />
             <span>{backendStatus === 'ok' ? 'Ready' : backendStatus === 'degraded' ? 'Degraded' : 'Offline'}</span>
           </div>
+          <div className={runtimeFallbackWarning ? 'topbar-badge topbar-badge-warning' : 'topbar-badge'} title={runtimeFallbackWarning || undefined}>
+            <span>Runtime</span>
+            <strong>{activeRuntimeLabel}</strong>
+          </div>
           <div className="topbar-badge">
             <span>Model</span>
             <strong>{shortenText(activeModelLabel, 28)}</strong>
           </div>
+          {runtimeFallbackWarning && (
+            <div className="topbar-badge topbar-badge-warning">
+              <span>Warning</span>
+              <strong>Fallback active</strong>
+            </div>
+          )}
           <div className="topbar-badge">
             <span>Workspace</span>
             <strong>{config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 18) : 'None'}</strong>
@@ -3116,17 +3163,31 @@ export function AgentMode() {
                     <div className="settings-section-title">Runtime Status</div>
                     <div className="settings-info">
                       <div className="settings-info-row">
-                        <span>Provider</span>
-                        <span>{modelRuntime?.provider || config?.provider || 'llamacpp'}</span>
+                        <span>Active Runtime</span>
+                        <span>{activeRuntimeLabel}</span>
                       </div>
                       <div className="settings-info-row">
-                        <span>Endpoint</span>
-                        <span>{modelRuntime?.baseUrl || config?.baseUrl || 'N/A'}</span>
+                        <span>Active Endpoint</span>
+                        <span>{modelRuntime?.activeBaseUrl || modelRuntime?.baseUrl || config?.baseUrl || 'N/A'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Primary</span>
+                        <span>{modelRuntime?.primaryRuntime ? `${modelRuntime.primaryRuntime.provider} · ${modelRuntime.primaryRuntime.status} · ${modelRuntime.primaryRuntime.baseUrl}` : 'llamacpp'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>Fallback</span>
+                        <span>{modelRuntime?.fallbackRuntime ? `${modelRuntime.fallbackRuntime.provider} · ${modelRuntime.fallbackRuntime.status} · ${modelRuntime.fallbackRuntime.baseUrl}` : modelRuntime?.fallbackEnabled === false ? 'Disabled' : 'Ollama fallback'}</span>
                       </div>
                       <div className="settings-info-row">
                         <span>Status</span>
                         <span>{modelRuntimeStatusLabel}</span>
                       </div>
+                      {runtimeFallbackWarning && (
+                        <div className="settings-info-row">
+                          <span>Runtime Warning</span>
+                          <span>{runtimeFallbackWarning}</span>
+                        </div>
+                      )}
                       <div className="settings-info-row">
                         <span>Model State</span>
                         <span>{modelRuntime?.statusMessage || backendStatus}</span>
@@ -3138,6 +3199,14 @@ export function AgentMode() {
                       <div className="settings-info-row">
                         <span>Active</span>
                         <span>{modelRuntime?.activeModel || 'None loaded'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>GGUF Path</span>
+                        <span>{modelRuntime?.modelPath || modelRuntime?.primaryRuntime?.modelPath || 'Configured outside harness'}</span>
+                      </div>
+                      <div className="settings-info-row">
+                        <span>GGUF Alias</span>
+                        <span>{modelRuntime?.modelAlias || modelRuntime?.primaryRuntime?.modelAlias || modelRuntime?.configuredModel || 'N/A'}</span>
                       </div>
                       <div className="settings-info-row">
                         <span>Lifecycle</span>

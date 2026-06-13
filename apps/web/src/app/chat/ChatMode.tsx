@@ -6,7 +6,7 @@ import { ChatHistory } from './ChatHistory';
 import { ChatMessageList } from './ChatMessageList';
 import {
   createChatSession,
-  fetchActiveModel,
+  fetchActiveRuntime,
   fetchChatHealth,
   fetchChatSessions,
   makeChatId,
@@ -24,6 +24,8 @@ export function ChatMode({
 }) {
   const [backendStatus, setBackendStatus] = useState<BackendStatus>('offline');
   const [activeModel, setActiveModel] = useState<string | null>(null);
+  const [activeProvider, setActiveProvider] = useState<string | null>(null);
+  const [runtimeWarning, setRuntimeWarning] = useState('');
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [session, setSession] = useState<ChatSession | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -38,13 +40,15 @@ export function ChatMode({
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const refreshChatState = useCallback(async () => {
-    const [health, model, sessionList] = await Promise.all([
+    const [health, runtime, sessionList] = await Promise.all([
       fetchChatHealth().catch(() => ({ status: 'offline' as const })),
-      fetchActiveModel().catch(() => null),
+      fetchActiveRuntime().catch(() => ({ model: null, provider: null, fallbackWarning: undefined })),
       fetchChatSessions().catch(() => []),
     ]);
     setBackendStatus(health.status);
-    setActiveModel(model || ('model' in health ? health.model || null : null));
+    setActiveModel(runtime.model || ('model' in health ? health.model || null : null));
+    setActiveProvider(runtime.provider || ('provider' in health ? health.provider || null : null));
+    setRuntimeWarning(runtime.fallbackWarning || ('fallbackWarning' in health ? health.fallbackWarning || '' : ''));
     setSessions(sessionList);
   }, []);
 
@@ -222,7 +226,7 @@ export function ChatMode({
             <span className="topbar-title">Normal conversation</span>
           </div>
         </div>
-        <RuntimeStatusBadge status={backendStatus} model={activeModel} />
+        <RuntimeStatusBadge status={backendStatus} model={activeModel} provider={activeProvider} warning={runtimeWarning} />
         <div className="topbar-right">
           <button className="sidebar-action" onClick={onOpenAgent} type="button">Open Agent</button>
         </div>

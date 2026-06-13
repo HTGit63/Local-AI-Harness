@@ -14,11 +14,12 @@
 Start `llama.cpp`:
 
 ```bash
-./llama-server \
-  -m /path/to/gemma-4-e4b.gguf \
+llama-server \
+  -m models/<local-model-file>.gguf \
   --host 127.0.0.1 \
   --port 8080 \
-  --ctx-size 8192
+  --ctx-size 8192 \
+  --alias gemma4:e4b
 ```
 
 Check health:
@@ -31,7 +32,10 @@ curl http://127.0.0.1:8080/v1/models
 
 ```bash
 export HARNESS_RUNTIME_PROVIDER=llamacpp
-export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export HARNESS_PRIMARY_RUNTIME=llamacpp
+export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
+export LLAMACPP_MODEL_PATH=models/<local-model-file>.gguf
+export LLAMACPP_MODEL_ALIAS=gemma4:e4b
 export OPENAI_API_KEY=no-key
 export HARNESS_MODEL=gemma4:e4b
 ```
@@ -42,16 +46,41 @@ Supported provider values:
 |---|---|
 | `llamacpp` | Stable local path for Gemma 4 E4B GGUF. |
 | `openai-compatible` | Custom OpenAI-compatible local server. |
-| `ollama-legacy` | Optional legacy path with Ollama lifecycle support. |
+| `ollama-legacy` | Optional fallback path with Ollama lifecycle support. |
 
-Ollama legacy:
+Ollama fallback:
 
 ```bash
-export HARNESS_RUNTIME_PROVIDER=ollama-legacy
-export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-export OPENAI_API_KEY=ollama
+export HARNESS_ENABLE_OLLAMA_FALLBACK=1
+export HARNESS_FALLBACK_RUNTIME=ollama-legacy
+export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+export OLLAMA_MODEL=gemma4:e4b
 ollama pull gemma4:e4b
 ```
+
+Runtime selection order:
+
+```text
+llama.cpp primary at LLAMACPP_BASE_URL
+↓
+if unavailable and fallback enabled
+↓
+Ollama fallback at OLLAMA_BASE_URL with visible warning
+```
+
+The harness reports primary and fallback endpoint status in `/api/model/runtime`. Fallback is never silent.
+
+## Local GGUF Files
+
+Keep GGUF model files local:
+
+```text
+models/
+*.gguf
+*.gguf.*
+```
+
+These paths are ignored by git. Do not commit local model files.
 
 ## Runtime Budgets
 
@@ -76,4 +105,4 @@ Defaults are conservative for local CPU-first use:
 
 `gemma4:e4b` is the stable default. Gemma 4 26B quantized is a future advanced mode only after the E4B harness passes the milestone gate.
 
-If the runtime server is offline, the UI and CLI report the endpoint and provider that failed. They do not silently fall back to another provider.
+If llama.cpp is offline, the UI and CLI report the failed primary endpoint. If Ollama fallback is reachable, the active runtime is shown as `Ollama fallback` with a warning.

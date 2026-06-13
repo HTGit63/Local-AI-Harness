@@ -1,4 +1,5 @@
 import { ModelProfile, AdapterOptions } from './types';
+import { buildRuntimeSelectionConfig } from './runtime-config';
 
 export const PROFILES: Record<string, ModelProfile> = {
   fast: {
@@ -18,11 +19,13 @@ export const PROFILES: Record<string, ModelProfile> = {
   }
 };
 
-export const DEFAULT_CONFIG: Required<Omit<AdapterOptions, 'profile'>> & { profile: 'fast' | 'balanced' | 'deep' } = {
-  provider: (process.env.HARNESS_RUNTIME_PROVIDER as AdapterOptions['provider']) || 'llamacpp',
-  baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:8080/v1',
-  apiKey: process.env.OPENAI_API_KEY || 'no-key',
-  model: process.env.HARNESS_MODEL || 'gemma4:e4b',
+const defaultRuntimeSelection = buildRuntimeSelectionConfig();
+
+export const DEFAULT_CONFIG: Required<Pick<AdapterOptions, 'provider' | 'baseUrl' | 'apiKey' | 'model' | 'timeoutMs' | 'retries'>> & { profile: 'fast' | 'balanced' | 'deep' } = {
+  provider: defaultRuntimeSelection.primary.provider,
+  baseUrl: defaultRuntimeSelection.primary.baseUrl,
+  apiKey: defaultRuntimeSelection.primary.apiKey,
+  model: defaultRuntimeSelection.primary.model,
   profile: 'balanced',
   timeoutMs: 60000,
   retries: 1

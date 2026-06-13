@@ -13,10 +13,11 @@ Run `llama.cpp` with an OpenAI-compatible endpoint:
 
 ```bash
 ./llama-server \
-  -m /path/to/gemma-4-e4b.gguf \
+  -m models/<local-model-file>.gguf \
   --host 127.0.0.1 \
   --port 8080 \
-  --ctx-size 8192
+  --ctx-size 8192 \
+  --alias gemma4:e4b
 ```
 
 Verify the server:
@@ -29,9 +30,14 @@ Expected harness defaults:
 
 ```bash
 export HARNESS_RUNTIME_PROVIDER=llamacpp
-export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
-export OPENAI_API_KEY=no-key
-export HARNESS_MODEL=gemma4:e4b
+export HARNESS_PRIMARY_RUNTIME=llamacpp
+export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
+export LLAMACPP_MODEL_PATH=models/<local-model-file>.gguf
+export LLAMACPP_MODEL_ALIAS=gemma4:e4b
+export HARNESS_ENABLE_OLLAMA_FALLBACK=true
+export HARNESS_FALLBACK_RUNTIME=ollama-legacy
+export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+export OLLAMA_MODEL=gemma4:e4b
 ```
 
 ## 2. Install The Harness
@@ -49,7 +55,7 @@ npm run build
 node apps/cli/dist/cli.js doctor
 ```
 
-Doctor checks local config, workspace access, provider setup, and runtime reachability. If the server is offline, the runtime check reports it clearly instead of requiring Ollama.
+Doctor checks local config, workspace access, provider setup, and runtime reachability. If the llama.cpp primary server is offline, the runtime status reports it clearly and only uses Ollama as a visible fallback when enabled.
 
 ## 4. Launch The Web UI
 
@@ -83,8 +89,9 @@ The CLI exists for scripting. The Web UI is the primary product surface.
 Ollama can still be used for older local setups:
 
 ```bash
-export HARNESS_RUNTIME_PROVIDER=ollama-legacy
-export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-export OPENAI_API_KEY=ollama
+export HARNESS_ENABLE_OLLAMA_FALLBACK=true
+export HARNESS_FALLBACK_RUNTIME=ollama-legacy
+export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+export OLLAMA_MODEL=gemma4:e4b
 ollama pull gemma4:e4b
 ```

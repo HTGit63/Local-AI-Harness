@@ -502,10 +502,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (requestUrl.pathname === '/api/health' && method === 'GET') {
-      const healthy = await engine.isHealthy();
+      const runtime = await getCachedModelRuntime();
+      const healthy = runtime.runtimeStatus !== 'unavailable';
       sendJson(req, res, 200, {
         status: healthy ? 'ok' : 'degraded',
-        model: engine.getPublicConfig().model,
+        model: runtime.activeModel || runtime.configuredModel,
+        provider: runtime.activeProvider || runtime.provider,
+        baseUrl: runtime.activeBaseUrl || runtime.baseUrl,
+        fallbackWarning: runtime.fallbackWarning,
       });
       return;
     }

@@ -226,6 +226,20 @@ a {
   white-space: nowrap;
 }
 
+.runtime-status-badge-warning,
+.topbar-badge-warning {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.runtime-warning-pill {
+  padding: 2px 6px;
+  border-radius: var(--radius-full);
+  background: rgba(245, 158, 11, 0.16);
+  color: var(--warning);
+  font-weight: 800;
+}
+
 .chat-mode-shell {
   height: 100vh;
   display: grid;

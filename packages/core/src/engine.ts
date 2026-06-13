@@ -4,7 +4,7 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { ApprovalQueueManager, ApprovalRequestPayload } from '@local-harness/approval-workflow';
-import { ModelAdapter, type ModelRuntimeState, type RuntimeProvider } from '@local-harness/model-adapter';
+import { ModelAdapter, buildRuntimeSelectionConfig, type ModelRuntimeState, type RuntimeProvider } from '@local-harness/model-adapter';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
 import { RepoIndexer, ProjectContext, ProjectInspection, TaskContext } from '@local-harness/repo-indexer';
@@ -292,11 +292,13 @@ export interface UpdateConfigOptions {
   activateModel?: boolean;
 }
 
+const DEFAULT_RUNTIME_SELECTION = buildRuntimeSelectionConfig();
+
 const DEFAULT_ENGINE_CONFIG: EngineConfig = {
-  provider: (process.env.HARNESS_RUNTIME_PROVIDER as RuntimeProvider) || 'llamacpp',
-  baseUrl: process.env.OPENAI_BASE_URL || 'http://127.0.0.1:8080/v1',
-  apiKey: process.env.OPENAI_API_KEY || 'no-key',
-  model: 'gemma4:e4b',
+  provider: DEFAULT_RUNTIME_SELECTION.primary.provider,
+  baseUrl: DEFAULT_RUNTIME_SELECTION.primary.baseUrl,
+  apiKey: DEFAULT_RUNTIME_SELECTION.primary.apiKey,
+  model: DEFAULT_RUNTIME_SELECTION.primary.model,
   profile: 'balanced',
   workspaceRoot: process.cwd(),
   mode: 'chat',

@@ -32,13 +32,31 @@ export async function resumeChatSession(id: string): Promise<ChatSession> {
   return fetchJson<ChatSession>(`${API}/session/${id}/resume`, { method: 'POST' });
 }
 
-export async function fetchChatHealth(): Promise<{ status: 'ok' | 'degraded' | 'offline'; model?: string }> {
-  return fetchJson<{ status: 'ok' | 'degraded' | 'offline'; model?: string }>(`${API}/health`);
+export interface ChatRuntimeHealth {
+  status: 'ok' | 'degraded' | 'offline';
+  model?: string;
+  provider?: string;
+  baseUrl?: string;
+  fallbackWarning?: string;
 }
 
-export async function fetchActiveModel(): Promise<string | null> {
-  const runtime = await fetchJson<{ activeModel: string | null; configuredModel: string }>(`${API}/model/runtime`);
-  return runtime.activeModel || runtime.configuredModel || null;
+export async function fetchChatHealth(): Promise<ChatRuntimeHealth> {
+  return fetchJson<ChatRuntimeHealth>(`${API}/health`);
+}
+
+export async function fetchActiveRuntime(): Promise<{ model: string | null; provider: string | null; fallbackWarning?: string }> {
+  const runtime = await fetchJson<{
+    activeModel: string | null;
+    configuredModel: string;
+    activeProvider?: string;
+    provider: string;
+    fallbackWarning?: string;
+  }>(`${API}/model/runtime`);
+  return {
+    model: runtime.activeModel || runtime.configuredModel || null,
+    provider: runtime.activeProvider || runtime.provider || null,
+    fallbackWarning: runtime.fallbackWarning,
+  };
 }
 
 function buildChatSystemPrompt(mode: ConversationMode): string {
