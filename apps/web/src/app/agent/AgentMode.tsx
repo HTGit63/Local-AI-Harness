@@ -26,11 +26,17 @@ const WORKSPACE_CONFIRMED_KEY = 'gamma-harness.confirmed-workspace-root';
 const LIVE_REFRESH_MS = 6000;
 const ACTIVE_RUN_REFRESH_MS = 1500;
 const FULL_REFRESH_MS = 45000;
-const RUNTIME_PROVIDER_PRESETS: Record<RuntimeProvider, { baseUrl: string; model: string }> = {
-  llamacpp: { baseUrl: 'http://127.0.0.1:8080/v1', model: 'gemma-4-gguf' },
-  'ollama-legacy': { baseUrl: 'http://127.0.0.1:11434/v1', model: 'gemma4:e4b' },
-  'openai-compatible': { baseUrl: 'http://127.0.0.1:8080/v1', model: 'local-model' },
-};
+function isDockerUiHost(): boolean {
+  return typeof window !== 'undefined' && window.location.port === '8080';
+}
+
+function runtimeProviderPreset(provider: RuntimeProvider): { baseUrl: string; model: string } {
+  const ollamaBaseUrl = isDockerUiHost() ? 'http://host.docker.internal:11434/v1' : 'http://127.0.0.1:11434/v1';
+  const llamaBaseUrl = isDockerUiHost() ? 'http://host.docker.internal:8081/v1' : 'http://127.0.0.1:8080/v1';
+  if (provider === 'ollama-legacy') return { baseUrl: ollamaBaseUrl, model: 'gemma4:e4b-it-qat' };
+  if (provider === 'llamacpp') return { baseUrl: llamaBaseUrl, model: 'gemma-4-gguf' };
+  return { baseUrl: llamaBaseUrl, model: 'local-model' };
+}
 
 function isDefaultApiWorkspace(root: string): boolean {
   const normalized = root.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -325,6 +331,7 @@ interface ModelRuntimeState {
     provider: RuntimeProvider;
     baseUrl: string;
     model: string;
+    availableModels?: AvailableModel[];
     modelPath?: string;
     modelAlias?: string;
     status: 'connected' | 'unavailable' | 'offline';
@@ -338,6 +345,9 @@ interface ModelRuntimeState {
     provider: RuntimeProvider;
     baseUrl: string;
     model: string;
+    availableModels?: AvailableModel[];
+    modelPath?: string;
+    modelAlias?: string;
     status: 'connected' | 'unavailable' | 'offline';
     isPrimary: boolean;
     isFallback: boolean;
@@ -1428,7 +1438,7 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
 
   // Settings drafts
   const [baseUrlDraft, setBaseUrlDraft] = useState('');
-  const [providerDraft, setProviderDraft] = useState<RuntimeProvider>('llamacpp');
+  const [providerDraft, setProviderDraft] = useState<RuntimeProvider>('ollama-legacy');
   const [modelDraft, setModelDraft] = useState('');
   const [profileDraft, setProfileDraft] = useState('balanced');
   const [modeDraft, setModeDraft] = useState('chat');
@@ -1467,21 +1477,22 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
 
     if (providerDraft === 'ollama-legacy') {
       add(modelRuntime?.fallbackRuntime?.model);
-      add(RUNTIME_PROVIDER_PRESETS['ollama-legacy'].model);
-      if (modelRuntime?.activeProvider === 'ollama-legacy') {
-        modelRuntime.installedModels.forEach(add);
-        modelRuntime.availableModels.forEach((model) => add(model.id));
-      }
+      add(modelRuntime?.primaryRuntime?.provider === 'ollama-legacy' ? modelRuntime.primaryRuntime.model : undefined);
+      add(runtimeProviderPreset('ollama-legacy').model);
+      modelRuntime?.installedModels.forEach(add);
+      modelRuntime?.availableModels.forEach((model) => add(model.id));
+      modelRuntime?.fallbackRuntime?.availableModels?.forEach((model) => add(model.id));
+      modelRuntime?.primaryRuntime?.availableModels?.forEach((model) => add(model.id));
     } else if (providerDraft === 'llamacpp') {
       add(modelRuntime?.primaryRuntime?.modelAlias);
       add(modelRuntime?.primaryRuntime?.model);
-      add(RUNTIME_PROVIDER_PRESETS.llamacpp.model);
+      add(runtimeProviderPreset('llamacpp').model);
       if (modelRuntime?.activeProvider === 'llamacpp') {
         modelRuntime.availableModels.forEach((model) => add(model.id));
       }
     } else {
       modelRuntime?.availableModels.forEach((model) => add(model.id));
-      add(RUNTIME_PROVIDER_PRESETS['openai-compatible'].model);
+      add(runtimeProviderPreset('openai-compatible').model);
     }
 
     if (modelDraft.trim()) opts.add(modelDraft.trim());
@@ -1973,7 +1984,7 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
 
   function selectRuntimeProvider(nextProvider: RuntimeProvider) {
     setProviderDraft(nextProvider);
-    const preset = RUNTIME_PROVIDER_PRESETS[nextProvider];
+    const preset = runtimeProviderPreset(nextProvider);
     if (preset) {
       setBaseUrlDraft(preset.baseUrl);
       setModelDraft(preset.model);
@@ -1981,7 +1992,7 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
         nextProvider === 'ollama-legacy'
           ? 'Ollama preset loaded. Save to use Ollama directly.'
           : nextProvider === 'llamacpp'
-            ? 'llama.cpp GGUF preset loaded. Save to use primary runtime.'
+            ? 'llama.cpp GGUF preset loaded. Save to use GGUF runtime.'
             : 'Custom OpenAI-compatible preset loaded. Review URL and model, then save.',
       );
     }
@@ -3285,14 +3296,14 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
                     <div className="settings-field">
                       <label>Provider</label>
                       <select className="settings-select" value={providerDraft} onChange={e => selectRuntimeProvider(e.target.value as RuntimeProvider)}>
-                        <option value="llamacpp">llama.cpp (default)</option>
+                        <option value="ollama-legacy">Ollama (default)</option>
+                        <option value="llamacpp">llama.cpp / GGUF</option>
                         <option value="openai-compatible">OpenAI-compatible custom</option>
-                        <option value="ollama-legacy">Ollama</option>
                       </select>
                     </div>
                     <div className="settings-field">
                       <label>Base URL</label>
-                      <input className="settings-input" value={baseUrlDraft} onChange={e => setBaseUrlDraft(e.target.value)} placeholder="http://127.0.0.1:8080/v1" />
+                      <input className="settings-input" value={baseUrlDraft} onChange={e => setBaseUrlDraft(e.target.value)} placeholder={runtimeProviderPreset(providerDraft).baseUrl} />
                     </div>
                     <div className="settings-field">
                       <label>Model</label>
@@ -3301,7 +3312,7 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
                           {modelOptions.map(id => <option key={id} value={id}>{id}</option>)}
                         </select>
                       ) : (
-                        <input className="settings-input" value={modelDraft} onChange={e => setModelDraft(e.target.value)} placeholder="gemma4:e4b" />
+                        <input className="settings-input" value={modelDraft} onChange={e => setModelDraft(e.target.value)} placeholder="gemma4:e4b-it-qat" />
                       )}
                     </div>
                     <div className="settings-row">
@@ -3342,11 +3353,11 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
                       </div>
                       <div className="settings-info-row">
                         <span>Primary</span>
-                        <span>{modelRuntime?.primaryRuntime ? `${modelRuntime.primaryRuntime.provider} · ${modelRuntime.primaryRuntime.status} · ${modelRuntime.primaryRuntime.baseUrl}` : 'llamacpp'}</span>
+                        <span>{modelRuntime?.primaryRuntime ? `${modelRuntime.primaryRuntime.provider} · ${modelRuntime.primaryRuntime.status} · ${modelRuntime.primaryRuntime.baseUrl}` : 'ollama-legacy'}</span>
                       </div>
                       <div className="settings-info-row">
                         <span>Fallback</span>
-                        <span>{modelRuntime?.fallbackRuntime ? `${modelRuntime.fallbackRuntime.provider} · ${modelRuntime.fallbackRuntime.status} · ${modelRuntime.fallbackRuntime.baseUrl}` : modelRuntime?.fallbackEnabled === false ? 'Disabled' : 'Ollama fallback'}</span>
+                        <span>{modelRuntime?.fallbackRuntime ? `${modelRuntime.fallbackRuntime.provider} · ${modelRuntime.fallbackRuntime.status} · ${modelRuntime.fallbackRuntime.baseUrl}` : modelRuntime?.fallbackEnabled === false ? 'Disabled' : 'Configured fallback'}</span>
                       </div>
                       <div className="settings-info-row">
                         <span>Status</span>

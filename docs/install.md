@@ -3,42 +3,33 @@
 ## Prerequisites
 
 - Node.js >= 18
-- A local `llama.cpp` server binary
-- A Gemma 4 E4B GGUF model file
+- Ollama with at least one local model installed
+- Optional: a local `llama.cpp` server binary and Gemma 4 E4B GGUF model file
 - 16 GB RAM target, CPU-first, no GPU required
 
 ## 1. Start The Model Server
 
-Run `llama.cpp` with an OpenAI-compatible endpoint:
+Run Ollama:
 
 ```bash
-./llama-server \
-  -m models/<local-model-file>.gguf \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --ctx-size 8192 \
-  --alias gemma-4-gguf
+ollama serve
+ollama ls
 ```
 
 Verify the server:
 
 ```bash
-curl http://127.0.0.1:8080/v1/models
+curl http://127.0.0.1:11434/v1/models
 ```
 
 Expected harness defaults:
 
 ```bash
-export HARNESS_RUNTIME_PROVIDER=llamacpp
-export HARNESS_PRIMARY_RUNTIME=llamacpp
-export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
-export LLAMACPP_MODEL_PATH=models/<local-model-file>.gguf
-export LLAMACPP_MODEL_ALIAS=gemma-4-gguf
-export HARNESS_MODEL=gemma-4-gguf
-export HARNESS_ENABLE_OLLAMA_FALLBACK=true
-export HARNESS_FALLBACK_RUNTIME=ollama-legacy
+export HARNESS_RUNTIME_PROVIDER=ollama-legacy
+export HARNESS_PRIMARY_RUNTIME=ollama-legacy
 export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
-export OLLAMA_MODEL=gemma4:e4b
+export OLLAMA_MODEL=gemma4:e4b-it-qat
+export HARNESS_MODEL=gemma4:e4b-it-qat
 ```
 
 ## 2. Install The Harness
@@ -56,7 +47,7 @@ npm run build
 node apps/cli/dist/cli.js doctor
 ```
 
-Doctor checks local config, workspace access, provider setup, and runtime reachability. If the llama.cpp primary server is offline, the runtime status reports it clearly and only uses Ollama as a visible fallback when enabled.
+Doctor checks local config, workspace access, provider setup, and runtime reachability.
 
 ## 4. Launch The Web UI
 
@@ -85,14 +76,28 @@ node apps/cli/dist/cli.js prompt --agent "inspect this repo"
 
 The CLI exists for scripting. The Web UI is the primary product surface.
 
-## Optional Ollama Legacy Provider
+## Optional llama.cpp / GGUF Provider
 
-Ollama can still be used for older local setups:
+Use GGUF when `llama-server` is ready:
 
 ```bash
-export HARNESS_ENABLE_OLLAMA_FALLBACK=true
-export HARNESS_FALLBACK_RUNTIME=ollama-legacy
-export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
-export OLLAMA_MODEL=gemma4:e4b
-ollama pull gemma4:e4b
+./llama-server \
+  -m models/<local-model-file>.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --ctx-size 8192 \
+  --alias gemma-4-gguf
+
+export HARNESS_RUNTIME_PROVIDER=llamacpp
+export HARNESS_PRIMARY_RUNTIME=llamacpp
+export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
+export LLAMACPP_MODEL_ALIAS=gemma-4-gguf
+export HARNESS_MODEL=gemma-4-gguf
+```
+
+When running the harness through Docker Compose, the Web UI already uses host
+port `8080`. Start llama.cpp on `8081` instead and set:
+
+```bash
+export DOCKER_HARNESS_LLAMACPP_BASE_URL=http://host.docker.internal:8081/v1
 ```

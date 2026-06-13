@@ -36,9 +36,9 @@ async function testConfigDefaults() {
   const engine = new CoreEngine();
   const config = engine.getPublicConfig();
 
-  assert.strictEqual(config.provider, 'llamacpp');
-  assert.ok(config.baseUrl.includes('8080'));
-  assert.strictEqual(config.model, 'gemma-4-gguf');
+  assert.strictEqual(config.provider, 'ollama-legacy');
+  assert.ok(config.baseUrl.includes('11434'));
+  assert.strictEqual(config.model, 'gemma4:e4b-it-qat');
   assert.strictEqual(config.mode, 'chat');
   assert.strictEqual(config.profile, 'balanced');
   assert.strictEqual(config.contextBudget, 16000);
@@ -440,20 +440,20 @@ async function testModelAdapter() {
     }) as typeof MOCK_CHAT_RESPONSE;
     assert.strictEqual(response.choices[0].message.content, MOCK_CHAT_RESPONSE.choices[0].message.content);
     const runtimeBefore = await adapter.getRuntimeState();
-    assert.strictEqual(runtimeBefore.provider, 'llamacpp');
-    assert.strictEqual(runtimeBefore.activeModel, 'gemma-4-gguf');
-    assert.strictEqual(runtimeBefore.runtimeStatus, 'ready');
+    assert.strictEqual(runtimeBefore.provider, 'ollama-legacy');
+    assert.strictEqual(runtimeBefore.activeModel, null);
+    assert.strictEqual(runtimeBefore.runtimeStatus, 'idle');
     assert.ok(runtimeBefore.installedModels.includes('qwen3.5:9b-q4_K_M'));
-    assert.deepStrictEqual(runtimeBefore.configuredModelCapabilities, ['tools']);
-    assert.strictEqual(runtimeBefore.reasoningSupported, false);
+    assert.deepStrictEqual(runtimeBefore.configuredModelCapabilities, MOCK_MODEL_CAPABILITIES['gemma4:e4b']);
+    assert.strictEqual(runtimeBefore.reasoningSupported, true);
     assert.strictEqual(runtimeBefore.nativeToolCallingSupported, true);
     assert.strictEqual(runtimeBefore.lifecyclePolicy.preloadKeepAlive, '2m');
     assert.strictEqual(runtimeBefore.lifecyclePolicy.unloadKeepAlive, 0);
 
-    const switchResult = await adapter.activateModel('qwen3.5:9b-q4_K_M', 'gemma-4-gguf');
+    const switchResult = await adapter.activateModel('qwen3.5:9b-q4_K_M', 'gemma4:e4b');
     assert.strictEqual(switchResult.activeModel, 'qwen3.5:9b-q4_K_M');
-    assert.strictEqual(switchResult.supportsLifecycle, false);
-    assert.deepStrictEqual(switchResult.runningModels.map((entry) => entry.model), []);
+    assert.strictEqual(switchResult.supportsLifecycle, true);
+    assert.deepStrictEqual(switchResult.runningModels.map((entry) => entry.model), ['qwen3.5:9b-q4_K_M']);
     assert.deepStrictEqual(switchResult.unloadedModels, []);
 
     const runtimeAfter = await adapter.getRuntimeState();
@@ -465,7 +465,7 @@ async function testModelAdapter() {
 
     const secondSwitch = await adapter.activateModel('gemma4:e4b', 'qwen3.5:9b-q4_K_M');
     assert.deepStrictEqual(secondSwitch.unloadedModels, []);
-    assert.deepStrictEqual(secondSwitch.runningModels.map((entry) => entry.model), []);
+    assert.ok(secondSwitch.runningModels.map((entry) => entry.model).includes('gemma4:e4b'));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -581,7 +581,7 @@ async function testModelAdapterUsesVisibleOllamaFallback() {
     assert.strictEqual(runtime.primaryRuntime.status, 'offline');
     assert.strictEqual(runtime.fallbackRuntime?.provider, 'ollama-legacy');
     assert.strictEqual(runtime.fallbackRuntime?.status, 'connected');
-    assert.ok(runtime.fallbackWarning?.includes('Using Ollama fallback'));
+    assert.ok(runtime.fallbackWarning?.includes('Using ollama-legacy fallback'));
     assert.strictEqual(runtime.fallbackRuntime?.warning, runtime.fallbackWarning);
     assert.ok(requests.some((entry) => entry === 'http://127.0.0.1:8080/v1/models'));
     assert.ok(requests.some((entry) => entry === 'http://127.0.0.1:11434/v1/models'));
@@ -613,7 +613,7 @@ async function testModelAdapterCapsLocalOutputTokens() {
         max_tokens: 50000,
       });
       const latestRequest = chatRequests[chatRequests.length - 1];
-      assert.strictEqual(latestRequest.max_tokens, expectedCap);
+      assert.strictEqual(latestRequest.max_tokens ?? latestRequest.options?.num_predict, expectedCap);
     }
   } finally {
     globalThis.fetch = originalFetch;
@@ -905,7 +905,12 @@ async function testDirectChatStreamRetriesVisibleOnIdle() {
   }) as typeof fetch;
 
   try {
-    const engine = new CoreEngine({ streamIdleTimeoutMs: 1 });
+    const engine = new CoreEngine({
+      provider: 'llamacpp',
+      baseUrl: 'http://127.0.0.1:8080/v1',
+      model: 'gemma-4-gguf',
+      streamIdleTimeoutMs: 1,
+    });
     const statuses: string[] = [];
     const deltas: string[] = [];
     const response = await engine.directChatStream(

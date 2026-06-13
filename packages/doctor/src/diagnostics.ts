@@ -15,9 +15,9 @@ export interface DiagnosticsOptions {
 
 export async function runDiagnostics(options: DiagnosticsOptions = {}) {
   const repoRoot = path.resolve(options.repoRoot || path.join(__dirname, '../../..'));
-  const provider = process.env.HARNESS_RUNTIME_PROVIDER || 'llamacpp';
-  const baseUrl = options.baseUrl || process.env.OPENAI_BASE_URL || 'http://127.0.0.1:8080/v1';
-  const model = options.model || 'gemma4:e4b';
+  const provider = process.env.HARNESS_RUNTIME_PROVIDER || 'ollama-legacy';
+  const baseUrl = options.baseUrl || process.env.OLLAMA_BASE_URL || process.env.OPENAI_BASE_URL || 'http://127.0.0.1:11434/v1';
+  const model = options.model || 'gemma4:e4b-it-qat';
   const workspaceRoot = path.resolve(options.workspaceRoot || process.cwd());
   const results: Record<string, 'pass' | 'fail' | 'warn'> = {};
 

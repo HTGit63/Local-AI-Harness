@@ -4,14 +4,46 @@
 
 | Setting | Value |
 |---|---|
-| Provider | `llamacpp` |
+| Provider | `ollama-legacy` |
 | Protocol | OpenAI-compatible `/v1` |
-| Base URL | `http://127.0.0.1:8080/v1` |
-| API Key | `no-key` |
-| Default Model | `gemma-4-gguf` |
+| Base URL | `http://127.0.0.1:11434/v1` |
+| API Key | `ollama` |
+| Default Model | `gemma4:e4b-it-qat` |
 | Hardware target | 16 GB RAM, CPU-first, no GPU assumption |
 
-Start `llama.cpp`:
+Check Ollama:
+
+```bash
+ollama serve
+ollama ls
+```
+
+Check health:
+
+```bash
+curl http://127.0.0.1:11434/v1/models
+```
+
+## Provider Configuration
+
+```bash
+export HARNESS_RUNTIME_PROVIDER=ollama-legacy
+export HARNESS_PRIMARY_RUNTIME=ollama-legacy
+export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+export OLLAMA_MODEL=gemma4:e4b-it-qat
+export OPENAI_API_KEY=ollama
+export HARNESS_MODEL=gemma4:e4b-it-qat
+```
+
+Supported provider values:
+
+| Provider | Use |
+|---|---|
+| `ollama-legacy` | Stable default path with local installed models and lifecycle support. |
+| `llamacpp` | Optional local path for Gemma 4 E4B GGUF. |
+| `openai-compatible` | Custom OpenAI-compatible local server. |
+
+Optional GGUF provider:
 
 ```bash
 llama-server \
@@ -20,55 +52,26 @@ llama-server \
   --port 8080 \
   --ctx-size 8192 \
   --alias gemma-4-gguf
-```
 
-Check health:
-
-```bash
-curl http://127.0.0.1:8080/v1/models
-```
-
-## Provider Configuration
-
-```bash
 export HARNESS_RUNTIME_PROVIDER=llamacpp
 export HARNESS_PRIMARY_RUNTIME=llamacpp
 export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
 export LLAMACPP_MODEL_PATH=models/<local-model-file>.gguf
 export LLAMACPP_MODEL_ALIAS=gemma-4-gguf
-export OPENAI_API_KEY=no-key
 export HARNESS_MODEL=gemma-4-gguf
-```
-
-Supported provider values:
-
-| Provider | Use |
-|---|---|
-| `llamacpp` | Stable local path for Gemma 4 E4B GGUF. |
-| `openai-compatible` | Custom OpenAI-compatible local server. |
-| `ollama-legacy` | Optional fallback path with Ollama lifecycle support. |
-
-Ollama fallback:
-
-```bash
-export HARNESS_ENABLE_OLLAMA_FALLBACK=1
-export HARNESS_FALLBACK_RUNTIME=ollama-legacy
-export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
-export OLLAMA_MODEL=gemma4:e4b
-ollama pull gemma4:e4b
 ```
 
 Runtime selection order:
 
 ```text
-llama.cpp primary at LLAMACPP_BASE_URL
+Ollama default at OLLAMA_BASE_URL
 ↓
-if unavailable and fallback enabled
+optional manual switch
 ↓
-Ollama fallback at OLLAMA_BASE_URL with visible warning
+llama.cpp GGUF at LLAMACPP_BASE_URL
 ```
 
-The harness reports primary and fallback endpoint status in `/api/model/runtime`. Fallback is never silent.
+The harness reports endpoint status and installed models in `/api/model/runtime`.
 
 ## Local GGUF Files
 
@@ -103,6 +106,6 @@ Defaults are conservative for local CPU-first use:
 
 ## Model Scope
 
-`gemma4:e4b` is the stable default. Gemma 4 26B quantized is a future advanced mode only after the E4B harness passes the milestone gate.
+`gemma4:e4b-it-qat` is the stable default. Gemma 4 26B quantized is a future advanced mode only after the E4B harness passes the milestone gate.
 
-If llama.cpp is offline, the UI and CLI report the failed primary endpoint. If Ollama fallback is reachable, the active runtime is shown as `Ollama fallback` with a warning.
+If llama.cpp is offline, switch back to Ollama in Settings. Docker uses `host.docker.internal:11434` for host Ollama. Docker maps the Web UI to host port `8080`, so use `http://host.docker.internal:8081/v1` for optional host llama.cpp while Docker is running.

@@ -16,6 +16,7 @@ export const MOCK_MODEL_LIST = {
     { id: 'deepseek-coder-v2:latest', object: 'model', owned_by: 'local' },
     { id: 'qwen3.5:9b-q4_K_M', object: 'model', owned_by: 'local' },
     { id: 'gemma-4-gguf', object: 'model', owned_by: 'local' },
+    { id: 'gemma4:e4b-it-qat', object: 'model', owned_by: 'local' },
     { id: 'gemma4:e4b', object: 'model', owned_by: 'local' },
   ]
 };
@@ -23,6 +24,7 @@ export const MOCK_MODEL_LIST = {
 export const MOCK_HEALTH = { status: 'ok' };
 export const MOCK_MODEL_CAPABILITIES: Record<string, string[]> = {
   'gemma-4-gguf': ['completion', 'vision', 'tools'],
+  'gemma4:e4b-it-qat': ['completion', 'vision', 'audio', 'tools', 'thinking'],
   'gemma4:e4b': ['completion', 'vision', 'audio', 'tools', 'thinking'],
   'qwen3.5:9b-q4_K_M': ['completion', 'vision', 'tools', 'thinking'],
   'deepseek-coder-v2:latest': ['completion', 'insert'],

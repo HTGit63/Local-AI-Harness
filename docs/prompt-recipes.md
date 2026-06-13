@@ -1,6 +1,6 @@
 # Prompt Recipe Library
 
-This library curates specific, localized, and contextually-narrow prompts tuned for the `gemma4:e4b` local model. Based on patterns from the `Prompt-Engineering-Guide`, these instructions avoid verbose abstractions to maintain low-latency inference on CPUs. 
+This library curates specific, localized, and contextually-narrow prompts tuned for the `gemma4:e4b-it-qat` local model. Based on patterns from the `Prompt-Engineering-Guide`, these instructions avoid verbose abstractions to maintain low-latency inference on CPUs.
 
 ## 1. Zero-Shot Instruction
 **Use**: General commands where context is passed inline.

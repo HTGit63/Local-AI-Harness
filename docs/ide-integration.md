@@ -34,10 +34,10 @@ The exported skills are the native bundled harness skills. No external reference
 
 ## OpenAI-Compatible IDEs
 
-Any IDE extension that supports a custom OpenAI-compatible endpoint can point at the same local `llama.cpp` server:
+Any IDE extension that supports a custom OpenAI-compatible endpoint can point at the same local Ollama server:
 
-- Base URL: `http://127.0.0.1:8080/v1`
-- API key: `no-key`
-- Model: `gemma4:e4b`
+- Base URL: `http://127.0.0.1:11434/v1`
+- API key: `ollama`
+- Model: `gemma4:e4b-it-qat`
 
-Ollama can still be used by IDEs separately, but it is not the stable harness default.
+Optional GGUF users can point IDEs at a separate `llama.cpp` server, for example `http://127.0.0.1:8080/v1` outside Docker or `http://127.0.0.1:8081/v1` when Docker owns host port `8080`.

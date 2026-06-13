@@ -20,18 +20,18 @@ This order matters. Simple file, search, git, and runtime status work must not r
 
 | Field | Stable value |
 |---|---|
-| Primary provider | `llamacpp` |
+| Primary provider | `ollama-legacy` |
 | Transport | OpenAI-compatible `/v1` |
-| Primary base URL | `http://127.0.0.1:8080/v1` |
-| API key | `no-key` |
-| Model | `gemma4:e4b` |
-| Fallback provider | `ollama-legacy` |
-| Fallback base URL | `http://127.0.0.1:11434/v1` |
+| Primary base URL | `http://127.0.0.1:11434/v1` |
+| API key | `ollama` |
+| Model | `gemma4:e4b-it-qat` |
+| Optional GGUF provider | `llamacpp` |
+| GGUF base URL | `http://127.0.0.1:8080/v1` |
 
 Optional providers:
 
 - `openai-compatible` for custom local servers.
-- `ollama-legacy` for existing Ollama setups and lifecycle calls. It is a visible fallback, not the primary runtime.
+- `llamacpp` for GGUF once local `llama-server` is running.
 
 Provider-specific behavior, bounded health checks, and fallback routing are isolated inside `packages/model-adapter`.
 

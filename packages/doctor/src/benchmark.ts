@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 const DEFAULT_API_BASE_URL = 'http://127.0.0.1:3001/api';
-const DEFAULT_MODEL = 'gemma4:e4b';
+const DEFAULT_MODEL = 'gemma4:e4b-it-qat';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const ONE_PIXEL_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/w8AAgMBApV6X9kAAAAASUVORK5CYII=';
 

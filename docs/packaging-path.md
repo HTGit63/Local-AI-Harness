@@ -4,7 +4,7 @@
 
 ```text
 apps/web  <->  apps/api  <->  local OpenAI-compatible model server
-  5173          3001          default: llama.cpp on 127.0.0.1:8080/v1
+  5173          3001          default: Ollama on 127.0.0.1:11434/v1
 ```
 
 All data stays local. No cloud service is required.
@@ -15,7 +15,7 @@ All data stays local. No cloud service is required.
 |---|---|
 | Web UI | Vite React SPA |
 | API | Local Node process on `localhost:3001` |
-| Model server | Separate local process, default `llama.cpp` |
+| Model server | Separate local process, default `Ollama` |
 | Storage | File-based workspace/session/project memory data |
 | Config | Environment variables plus local config files |
 

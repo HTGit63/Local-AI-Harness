@@ -672,7 +672,7 @@ async function testApiWorkflow() {
       localModelBudget?: { maxModelCallsPerRun: number; maxToolCallsPerRun: number };
     }>(`${API_BASE}/api/config`);
     assert.strictEqual(initialConfig.workspaceRoot, workspaceRoot);
-    assert.strictEqual(initialConfig.provider, 'llamacpp');
+    assert.strictEqual(initialConfig.provider, 'ollama-legacy');
     assert.strictEqual(initialConfig.baseUrl, mockModel.baseUrl);
     assert.strictEqual(initialConfig.profile, 'balanced');
     assert.strictEqual(initialConfig.contextBudget, 16000);

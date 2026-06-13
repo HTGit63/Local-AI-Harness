@@ -404,14 +404,16 @@ export class ModelAdapter {
         signal: controller.signal as any,
       });
       if (response.ok) {
-        let availableModels: AvailableModel[] = [];
+        let payload: { data?: AvailableModel[] };
         try {
-          const payload = await response.json() as { data?: AvailableModel[] };
-          availableModels = Array.isArray(payload.data) ? payload.data : [];
+          payload = await response.json() as { data?: AvailableModel[] };
         } catch {
-          availableModels = [];
+          return this.makeEndpointStatus(endpoint, 'unavailable', 'Invalid /models JSON response');
         }
-        return this.makeEndpointStatus(endpoint, 'connected', undefined, undefined, availableModels);
+        if (!Array.isArray(payload.data)) {
+          return this.makeEndpointStatus(endpoint, 'unavailable', 'Invalid /models response: missing data[]');
+        }
+        return this.makeEndpointStatus(endpoint, 'connected', undefined, undefined, payload.data);
       }
       return this.makeEndpointStatus(endpoint, 'unavailable', `HTTP ${response.status}`);
     } catch (error: any) {
@@ -487,8 +489,8 @@ export class ModelAdapter {
         model: this.model,
         modelPath: this.provider === 'llamacpp' ? this.runtimeSelection.primary.modelPath : undefined,
         modelAlias: this.provider === 'llamacpp' ? this.runtimeSelection.primary.modelAlias : undefined,
-        isPrimary: this.provider === 'llamacpp',
-        isFallback: this.provider === 'ollama-legacy',
+        isPrimary: this.provider === this.runtimeSelection.primary.provider,
+        isFallback: false,
       };
       const activeStatus = await this.checkRuntimeEndpoint(active);
       const selectedActive = this.selectListedEndpointModel(active, activeStatus);
@@ -498,14 +500,9 @@ export class ModelAdapter {
       const selectedPrimary = this.provider === 'llamacpp'
         ? selectedActive
         : this.selectListedEndpointModel(primary, primaryStatusRaw);
-      const fallbackStatus = this.provider === 'ollama-legacy'
-        ? this.makeEndpointStatus(
-            selectedActive.endpoint,
-            selectedActive.status.status,
-            selectedActive.status.error,
-            selectedActive.status.warning,
-            selectedActive.status.availableModels,
-          )
+      const configuredFallback = this.runtimeSelection.fallback;
+      const fallbackStatus = this.provider === 'ollama-legacy' && configuredFallback && configuredFallback.provider !== this.provider
+        ? this.selectListedEndpointModel(configuredFallback, await this.checkRuntimeEndpoint(configuredFallback)).status
         : undefined;
       const route: RuntimeRoute = {
         active: selectedActive.endpoint,
@@ -537,7 +534,7 @@ export class ModelAdapter {
     const fallbackStatusRaw = await this.checkRuntimeEndpoint(fallback);
     const selectedFallback = this.selectListedEndpointModel(fallback, fallbackStatusRaw);
     const primaryFallbackWarning = selectedFallback.status.status === 'connected'
-      ? `Using Ollama fallback because llama.cpp primary is unavailable at ${primary.baseUrl}.`
+      ? `Using ${selectedFallback.endpoint.provider} fallback because ${primary.provider} primary is unavailable at ${primary.baseUrl}.`
       : undefined;
     const fallbackWarning = joinWarnings(primaryFallbackWarning, selectedFallback.warning);
     const fallbackStatus = this.makeEndpointStatus(
@@ -1156,7 +1153,7 @@ export class ModelAdapter {
         message: primaryHealthy
           ? `${this.provider} is reachable. Configured ${targetModel}; lifecycle warmup is not managed by the harness.`
           : fallbackHealthy
-            ? `${this.provider} is unavailable at ${this.baseUrl}. Ollama fallback is active with ${route.active.model}.`
+            ? `${this.provider} is unavailable at ${this.baseUrl}. ${route.active.provider} fallback is active with ${route.active.model}.`
             : `${this.provider} is not reachable at ${this.baseUrl}. Configured ${targetModel}, but no runtime is active.`,
       };
       this.lastSwitchResult = result;

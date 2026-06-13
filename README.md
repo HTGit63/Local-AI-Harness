@@ -1,6 +1,6 @@
 # Gemma 4 Harness
 
-Web-first local AI coding harness for **Gemma 4 E4B** on a CPU-first Linux machine. The stable runtime target is a local `llama.cpp` server exposing an OpenAI-compatible `/v1` API.
+Web-first local AI coding harness for **Gemma 4 E4B** on a CPU-first Linux machine. Current stable default is local Ollama, with optional `llama.cpp`/GGUF through the same provider adapter.
 
 The harness stays useful when no model is loaded. File browsing, file reads, search, git status, git diff, package-script detection, runtime status, and verification command buttons are deterministic backend operations.
 
@@ -9,28 +9,24 @@ The harness stays useful when no model is loaded. File browsing, file reads, sea
 - A localhost Web UI for inspecting, planning, editing, verifying, and reviewing code.
 - A local API and CLI sharing the same workspace policy, model adapter, tools, sessions, and traces.
 - A deterministic tool layer that handles workspace basics without model calls.
-- A provider-based runtime adapter. Default: `llamacpp`; optional: `ollama-legacy` and `openai-compatible`.
+- A provider-based runtime adapter. Default: `ollama-legacy`; optional: `llamacpp` and `openai-compatible`.
 - A small native skill pack bundled in `packages/skills`, with no required external reference repos.
 
 ## What This Is Not
 
 - Not a cloud service.
-- Not Ollama-dependent. Ollama is optional legacy support.
+- Not cloud-dependent. Ollama is the local default until the GGUF path is fully proven on the target machine.
 - Not a VS Code extension.
 - Not a RAG system or full-repo memory system.
 - Not a Gemma 4 26B product yet. 26B is future advanced mode after E4B stability.
 
 ## Quick Start
 
-Start a local `llama.cpp` server with your Gemma 4 E4B GGUF model:
+Start Ollama and confirm at least one local model is installed:
 
 ```bash
-llama-server \
-  -m models/<local-model-file>.gguf \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --ctx-size 8192 \
-  --alias gemma-4-gguf
+ollama serve
+ollama ls
 ```
 
 Install and run the harness:
@@ -74,37 +70,40 @@ Use the Web UI as the control center:
 
 | Setting | Default |
 |---|---|
-| Primary provider | `llamacpp` |
-| Primary base URL | `http://127.0.0.1:8080/v1` |
-| Fallback provider | `ollama-legacy` |
-| Fallback base URL | `http://127.0.0.1:11434/v1` |
-| API key | `no-key` |
-| Model alias | `gemma-4-gguf` |
+| Primary provider | `ollama-legacy` |
+| Primary base URL | `http://127.0.0.1:11434/v1` |
+| Optional GGUF provider | `llamacpp` |
+| GGUF base URL | `http://127.0.0.1:8080/v1` |
+| API key | `ollama` |
+| Default model | `gemma4:e4b-it-qat` |
 | Stable hardware target | 16 GB RAM, CPU-first, no GPU assumption |
 
 Override with:
 
 ```bash
+export HARNESS_RUNTIME_PROVIDER=ollama-legacy
+export HARNESS_PRIMARY_RUNTIME=ollama-legacy
+export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+export OLLAMA_MODEL=gemma4:e4b-it-qat
+export OPENAI_API_KEY=ollama
+export HARNESS_MODEL=gemma4:e4b-it-qat
+```
+
+Optional GGUF path:
+
+```bash
+llama-server \
+  -m models/<local-model-file>.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --ctx-size 8192 \
+  --alias gemma-4-gguf
+
 export HARNESS_RUNTIME_PROVIDER=llamacpp
 export HARNESS_PRIMARY_RUNTIME=llamacpp
 export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
-export LLAMACPP_MODEL_PATH=models/<local-model-file>.gguf
 export LLAMACPP_MODEL_ALIAS=gemma-4-gguf
-export OPENAI_API_KEY=no-key
 export HARNESS_MODEL=gemma-4-gguf
-export HARNESS_ENABLE_OLLAMA_FALLBACK=1
-export HARNESS_FALLBACK_RUNTIME=ollama-legacy
-export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
-export OLLAMA_MODEL=gemma4:e4b
-```
-
-Ollama remains available as visible fallback. If llama.cpp is offline and Ollama is reachable, UI shows `Ollama fallback` plus warning. It is not silent.
-
-```bash
-export HARNESS_RUNTIME_PROVIDER=ollama-legacy
-export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-export OPENAI_API_KEY=ollama
-export HARNESS_MODEL=gemma4:e4b
 ```
 
 ## Modes
@@ -132,21 +131,39 @@ Defaults:
 - API through Web UI proxy: `http://localhost:8080/api`
 - Internal API service: `api:3001`
 - Workspace mount: `${HARNESS_WORKSPACE_SOURCE:-.}` to `/workspace`
-- Runtime provider: `${DOCKER_HARNESS_RUNTIME_PROVIDER:-llamacpp}`
-- llama.cpp base URL: `${DOCKER_HARNESS_LLAMACPP_BASE_URL:-http://host.docker.internal:8080/v1}`
-- Ollama fallback URL: `${DOCKER_HARNESS_OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}`
-- Runtime model: `${DOCKER_HARNESS_MODEL:-gemma-4-gguf}`
+- Runtime provider: `${DOCKER_HARNESS_RUNTIME_PROVIDER:-ollama-legacy}`
+- Ollama URL: `${DOCKER_HARNESS_OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}`
+- Optional llama.cpp URL: `${DOCKER_HARNESS_LLAMACPP_BASE_URL:-http://host.docker.internal:8081/v1}`
+- Runtime model: `${DOCKER_HARNESS_MODEL:-gemma4:e4b-it-qat}`
 
 Docker uses `host.docker.internal` for host model runtimes. Keep `127.0.0.1`
 for non-Docker local runs only; inside a container it points back at the
-container itself.
+container itself. The compose web UI owns host port `8080`, so run optional
+host llama.cpp on `8081` when using Docker.
 
 Example:
 
 ```bash
 HARNESS_WORKSPACE_SOURCE=/absolute/path/to/project \
+DOCKER_HARNESS_RUNTIME_PROVIDER=ollama-legacy \
+DOCKER_HARNESS_OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 \
+DOCKER_HARNESS_MODEL=gemma4:e4b-it-qat \
+docker compose up --build
+```
+
+Optional Docker GGUF example:
+
+```bash
+llama-server \
+  -m models/<local-model-file>.gguf \
+  --host 127.0.0.1 \
+  --port 8081 \
+  --ctx-size 8192 \
+  --alias gemma-4-gguf
+
 DOCKER_HARNESS_RUNTIME_PROVIDER=llamacpp \
-DOCKER_HARNESS_LLAMACPP_BASE_URL=http://host.docker.internal:8080/v1 \
+DOCKER_HARNESS_PRIMARY_RUNTIME=llamacpp \
+DOCKER_HARNESS_LLAMACPP_BASE_URL=http://host.docker.internal:8081/v1 \
 DOCKER_HARNESS_MODEL=gemma-4-gguf \
 docker compose up --build
 ```

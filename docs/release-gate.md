@@ -8,7 +8,7 @@
 | 2 | Deterministic tool operations include timing metadata and make zero model calls. |
 | 3 | Web UI clearly separates Chat, Inspect, Plan, Trusted Edit, Full Agent, and Danger Sandbox. |
 | 4 | Permission rules block outside-workspace paths and protected files. |
-| 5 | `llama.cpp` works as the default provider through OpenAI-compatible `/v1`. |
+| 5 | Ollama works as the default provider through OpenAI-compatible `/v1`; optional `llama.cpp` remains selectable. |
 | 6 | Runtime status, endpoint errors, and first-token latency are visible when available. |
 | 7 | Plan and Inspect modes do not edit or create hidden checkpoints. |
 | 8 | Agent editing shows exact changed files, diffs, and verification results. |
@@ -27,7 +27,7 @@ The project is not stable if any of these happen:
 - Trusted Edit touches protected files casually.
 - Full Agent runs without bounded loops.
 - The UI hides current action, diffs, verification state, or command output.
-- Runtime config assumes Ollama only.
+- Runtime config assumes Ollama only and removes selectable `llama.cpp`.
 - Defaults assume GPU or 26B availability.
 - External reference repos appear in normal context.
 
