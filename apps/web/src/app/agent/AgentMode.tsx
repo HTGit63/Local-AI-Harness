@@ -22,9 +22,20 @@ const MAX_IMAGE_ATTACHMENTS = 2;
 const MAX_IMAGE_BYTES = 1024 * 1024;
 const MODE_STORAGE_KEY = 'gamma-harness.execution-mode';
 const LEGACY_AGENTIC_STORAGE_KEY = 'gamma-harness.agentic-mode';
+const WORKSPACE_CONFIRMED_KEY = 'gamma-harness.confirmed-workspace-root';
 const LIVE_REFRESH_MS = 6000;
 const ACTIVE_RUN_REFRESH_MS = 1500;
 const FULL_REFRESH_MS = 45000;
+const RUNTIME_PROVIDER_PRESETS: Record<RuntimeProvider, { baseUrl: string; model: string }> = {
+  llamacpp: { baseUrl: 'http://127.0.0.1:8080/v1', model: 'gemma-4-gguf' },
+  'ollama-legacy': { baseUrl: 'http://127.0.0.1:11434/v1', model: 'gemma4:e4b' },
+  'openai-compatible': { baseUrl: 'http://127.0.0.1:8080/v1', model: 'local-model' },
+};
+
+function isDefaultApiWorkspace(root: string): boolean {
+  const normalized = root.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalized.endsWith('/apps/api');
+}
 
 /* ─────────── Types ─────────── */
 type ChatRole = 'user' | 'assistant';
@@ -1402,6 +1413,10 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
   const [attachedImages, setAttachedImages] = useState<ComposerImageAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState('');
   const [streamStatus, setStreamStatus] = useState('');
+  const [confirmedWorkspaceRoot, setConfirmedWorkspaceRoot] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    return window.localStorage.getItem(WORKSPACE_CONFIRMED_KEY) || '';
+  });
 
   // Browser file state
   const [browserSelection, setBrowserSelection] = useState<BrowserSelection | null>(null);
@@ -1445,10 +1460,33 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
 
   // Derived
   const modelOptions = useMemo(() => {
-    const opts = new Set((modelRuntime?.availableModels || []).map(m => m.id));
+    const opts = new Set<string>();
+    const add = (value: string | undefined | null) => {
+      if (value?.trim()) opts.add(value.trim());
+    };
+
+    if (providerDraft === 'ollama-legacy') {
+      add(modelRuntime?.fallbackRuntime?.model);
+      add(RUNTIME_PROVIDER_PRESETS['ollama-legacy'].model);
+      if (modelRuntime?.activeProvider === 'ollama-legacy') {
+        modelRuntime.installedModels.forEach(add);
+        modelRuntime.availableModels.forEach((model) => add(model.id));
+      }
+    } else if (providerDraft === 'llamacpp') {
+      add(modelRuntime?.primaryRuntime?.modelAlias);
+      add(modelRuntime?.primaryRuntime?.model);
+      add(RUNTIME_PROVIDER_PRESETS.llamacpp.model);
+      if (modelRuntime?.activeProvider === 'llamacpp') {
+        modelRuntime.availableModels.forEach((model) => add(model.id));
+      }
+    } else {
+      modelRuntime?.availableModels.forEach((model) => add(model.id));
+      add(RUNTIME_PROVIDER_PRESETS['openai-compatible'].model);
+    }
+
     if (modelDraft.trim()) opts.add(modelDraft.trim());
     return Array.from(opts);
-  }, [modelDraft, modelRuntime]);
+  }, [modelDraft, modelRuntime, providerDraft]);
   const thinkingSupported = useMemo(() => modelRuntime?.configuredModelCapabilities?.includes('thinking') ?? false, [modelRuntime]);
   const thinkingWarning = thinkingEnabled && modelRuntime && !thinkingSupported
     ? 'Thinking unavailable on current model; toggle may be ignored.'
@@ -1456,6 +1494,12 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
 
   const workspaceSelection = useMemo(() => buildWorkspaceSelection(config?.workspaceRoot, repoContext?.files), [config?.workspaceRoot, repoContext?.files]);
   const sidebarSelection = workspaceSelection || browserSelection;
+  const configuredWorkspaceRoot = config?.workspaceRoot?.trim() || '';
+  const workspaceReady = Boolean(
+    configuredWorkspaceRoot &&
+    (!isDefaultApiWorkspace(configuredWorkspaceRoot) || confirmedWorkspaceRoot === configuredWorkspaceRoot),
+  );
+  const workspaceRequired = !workspaceReady;
 
   const filteredTree = useMemo(() => {
     if (!sidebarSelection) return null;
@@ -1465,7 +1509,9 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
   const activeModelLabel = modelRuntime?.activeModel || config?.model || 'No model';
   const activeRuntimeProvider = modelRuntime?.activeProvider || modelRuntime?.provider || config?.provider;
   const activeRuntimeLabel = activeRuntimeProvider === 'ollama-legacy'
-    ? 'Ollama fallback'
+    ? config?.provider === 'ollama-legacy' && !modelRuntime?.fallbackWarning
+      ? 'Ollama'
+      : 'Ollama fallback'
     : activeRuntimeProvider === 'llamacpp'
       ? 'llama.cpp'
       : activeRuntimeProvider || 'Runtime';
@@ -1820,14 +1866,12 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
   }
 
   async function startNewSession() {
-    const created = await fetchJson<SessionState>(`${API}/session`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ skills: selectedSkills }),
-    });
-    setSession(created);
-    setSelectedSkills(created.skillsActive);
+    setSession(null);
     setMessages([]);
+    setDraft('');
+    setAttachedImages([]);
+    setAttachmentNotice('');
+    setStreamStatus('');
     await refreshDashboard('full', { includeHeavy: true });
   }
 
@@ -1839,8 +1883,20 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
     await refreshDashboard('full', { includeHeavy: true });
   }
 
+  function rememberWorkspaceRoot(root: string) {
+    const trimmed = root.trim();
+    if (!trimmed) return;
+    setConfirmedWorkspaceRoot(trimmed);
+    try {
+      window.localStorage.setItem(WORKSPACE_CONFIRMED_KEY, trimmed);
+    } catch {
+      // ignore storage errors
+    }
+  }
+
   async function bindWorkspaceSelection(selection: BrowserSelection, nativeWorkspaceRoot?: string | null): Promise<boolean> {
     try {
+      let resolvedWorkspaceRoot = nativeWorkspaceRoot?.trim() || '';
       if (nativeWorkspaceRoot?.trim()) {
         await fetchJson<ConfigState>(`${API}/config`, {
           method: 'POST',
@@ -1848,7 +1904,7 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
           body: JSON.stringify({ workspaceRoot: nativeWorkspaceRoot.trim() }),
         });
       } else {
-        await fetchJson<WorkspaceResolveResponse>(`${API}/workspace/resolve`, {
+        const response = await fetchJson<WorkspaceResolveResponse>(`${API}/workspace/resolve`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1856,8 +1912,10 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
             relativeFiles: collectSelectionRelativeFiles(selection),
           }),
         });
+        resolvedWorkspaceRoot = response.workspaceRoot;
       }
 
+      rememberWorkspaceRoot(resolvedWorkspaceRoot);
       await refreshDashboard('full', { includeHeavy: true });
       setBrowserSelection(null);
       setBrowserPreview(null);
@@ -1910,6 +1968,22 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
       await refreshDashboard('live');
     } catch (error) {
       setSettingsStatus(`Mode switch failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  function selectRuntimeProvider(nextProvider: RuntimeProvider) {
+    setProviderDraft(nextProvider);
+    const preset = RUNTIME_PROVIDER_PRESETS[nextProvider];
+    if (preset) {
+      setBaseUrlDraft(preset.baseUrl);
+      setModelDraft(preset.model);
+      setSettingsStatus(
+        nextProvider === 'ollama-legacy'
+          ? 'Ollama preset loaded. Save to use Ollama directly.'
+          : nextProvider === 'llamacpp'
+            ? 'llama.cpp GGUF preset loaded. Save to use primary runtime.'
+            : 'Custom OpenAI-compatible preset loaded. Review URL and model, then save.',
+      );
     }
   }
 
@@ -1971,6 +2045,12 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
     const content = draft.trim();
     if (isSending) return;
     if (!content && attachedImages.length === 0) return;
+    if (workspaceRequired) {
+      setAttachmentNotice('Select a workspace before sending Agent tasks.');
+      setSettingsOpen(true);
+      setSettingsTab('workspace');
+      return;
+    }
     setIsSending(true);
     setStreamStatus('Preparing request');
     let placeholderId = '';
@@ -2342,6 +2422,7 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
         }),
       });
       
+      rememberWorkspaceRoot(workspaceRootDraft.trim());
       if (changingWorkspace) {
         setMessages([]);
       }
@@ -2579,7 +2660,7 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
           </div>
           <div className="topbar-badge">
             <span>Workspace</span>
-            <strong>{config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 18) : 'None'}</strong>
+            <strong>{workspaceReady ? shortenText(getPathBasename(configuredWorkspaceRoot), 18) : 'Select'}</strong>
           </div>
           <div className="topbar-badge">
             <span>Write</span>
@@ -2933,9 +3014,14 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
             {messages.length === 0 ? (
               <div className="chat-welcome">
                 <div className="chat-welcome-logo">G4</div>
-                <h2>Let's build</h2>
-                <p>{config?.workspaceRoot ? getPathBasename(config.workspaceRoot) : 'Pick a workspace or start a thread.'}</p>
+                <h2>{workspaceReady ? "Let's build" : 'Select a workspace'}</h2>
+                <p>{workspaceReady ? getPathBasename(configuredWorkspaceRoot) : 'Agent Mode needs a bound repo before it can run tools, edit files, or verify work.'}</p>
                 <div className="chat-welcome-hints">
+                  {!workspaceReady && (
+                    <button className="hint-chip" onClick={() => folderInputRef.current?.click()} type="button">
+                      Open workspace
+                    </button>
+                  )}
                   <button className="hint-chip" onClick={() => { setDraft('What kind of project is this?'); }} type="button">
                     Explain project
                   </button>
@@ -2977,11 +3063,34 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
               <ApprovalQueue approvals={approvals} onResolve={resolveApproval} />
             </div>
           )}
+          {workspaceRequired && (
+            <div className="workspace-required-card">
+              <div>
+                <strong>Select workspace first</strong>
+                <span>Agent tasks are blocked until a repo is bound. This prevents tool runs in the wrong folder.</span>
+              </div>
+              <div className="workspace-required-actions">
+                <button className="btn-sm btn-sm-primary" onClick={() => folderInputRef.current?.click()} type="button">
+                  Open workspace
+                </button>
+                <button
+                  className="btn-sm"
+                  onClick={() => {
+                    setSettingsOpen(true);
+                    setSettingsTab('workspace');
+                  }}
+                  type="button"
+                >
+                  Manual path
+                </button>
+              </div>
+            </div>
+          )}
           <div className="composer-wrapper">
             <div className="composer">
               <div className="composer-meta">
                 <span className="composer-meta-pill" title={config?.workspaceRoot || ''}>
-                  Workspace {config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 24) : 'none'}
+                  Workspace {workspaceReady ? shortenText(getPathBasename(configuredWorkspaceRoot), 24) : 'required'}
                 </span>
                 <span className="composer-meta-pill" title={activeModelLabel}>
                   Model {shortenText(activeModelLabel, 20)}
@@ -2993,13 +3102,13 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
               </div>
               <textarea
                 className="composer-input"
-                placeholder={isSending ? 'Working...' : 'Describe the repo task...'}
+                placeholder={workspaceRequired ? 'Select a workspace before sending Agent tasks.' : isSending ? 'Working...' : 'Describe the repo task...'}
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendChat(); }
                 }}
-                disabled={isSending}
+                disabled={isSending || workspaceRequired}
               />
               {attachedImages.length > 0 && (
                 <div className="composer-attachments">
@@ -3091,13 +3200,15 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
                     className="visually-hidden"
                     onChange={e => { void handleImageInput(e); }}
                   />
-                  <button className="send-btn" disabled={isSending || (!draft.trim() && attachedImages.length === 0)} onClick={() => void sendChat()} type="button">
+                  <button className="send-btn" disabled={workspaceRequired || isSending || (!draft.trim() && attachedImages.length === 0)} onClick={() => void sendChat()} type="button">
                     {isSending ? '…' : 'Send'}
                   </button>
                 </div>
               </div>
               <div className="composer-footer">
-                {thinkingWarning ? (
+                {workspaceRequired ? (
+                  <span className="composer-note composer-note-warning">Select a workspace to enable Agent Mode.</span>
+                ) : thinkingWarning ? (
                   <span className="composer-note composer-note-warning">{thinkingWarning}</span>
                 ) : attachmentNotice ? (
                   <span className="composer-note composer-note-warning">{attachmentNotice}</span>
@@ -3173,14 +3284,14 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
                     <div className="settings-section-title">Model Provider</div>
                     <div className="settings-field">
                       <label>Provider</label>
-                      <select className="settings-select" value={providerDraft} onChange={e => setProviderDraft(e.target.value as RuntimeProvider)}>
+                      <select className="settings-select" value={providerDraft} onChange={e => selectRuntimeProvider(e.target.value as RuntimeProvider)}>
                         <option value="llamacpp">llama.cpp (default)</option>
                         <option value="openai-compatible">OpenAI-compatible custom</option>
-                        <option value="ollama-legacy">Ollama legacy</option>
+                        <option value="ollama-legacy">Ollama</option>
                       </select>
                     </div>
                     <div className="settings-field">
-                      <label>Base URL (llama.cpp / OpenAI-compatible)</label>
+                      <label>Base URL</label>
                       <input className="settings-input" value={baseUrlDraft} onChange={e => setBaseUrlDraft(e.target.value)} placeholder="http://127.0.0.1:8080/v1" />
                     </div>
                     <div className="settings-field">

@@ -101,6 +101,7 @@ export interface RuntimeEndpointStatus {
   provider: RuntimeProvider;
   baseUrl: string;
   model: string;
+  availableModels?: AvailableModel[];
   modelPath?: string;
   modelAlias?: string;
   status: RuntimeEndpointHealth;

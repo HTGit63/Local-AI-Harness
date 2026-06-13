@@ -225,6 +225,7 @@ function sanitizeTurn(turn: SessionTurnMetadata): SessionTurnMetadata {
   const sanitized: SessionTurnMetadata = {
     timestamp: asNumber(turn.timestamp, Date.now()),
     executionMode,
+    title: clipText(turn.title, 160),
     promptMode: clipText(turn.promptMode, 80),
     messageCount: Math.max(0, Math.floor(asNumber(turn.messageCount, 0))),
     thinkingEnabled: Boolean(turn.thinkingEnabled),

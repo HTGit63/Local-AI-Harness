@@ -37,7 +37,7 @@ async function testConfigShow() {
   const output = await runCli(['config', 'show', '--json']);
   const config = JSON.parse(output);
   assert.strictEqual(config.provider, 'llamacpp');
-  assert.strictEqual(config.model, 'gemma4:e4b');
+  assert.strictEqual(config.model, 'gemma-4-gguf');
   assert.ok(config.baseUrl.includes('8080'));
 }
 

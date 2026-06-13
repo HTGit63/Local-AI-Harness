@@ -71,9 +71,12 @@ export function ChatMode({
   }
 
   async function startNewThread() {
-    const created = await createChatSession();
-    setSession(created);
+    setSession(null);
     setMessages([]);
+    setDraft('');
+    setAttachedImages([]);
+    setAttachmentNotice('');
+    setStreamStatus('Ready');
     await refreshChatState();
   }
 

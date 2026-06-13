@@ -17,7 +17,7 @@ Run `llama.cpp` with an OpenAI-compatible endpoint:
   --host 127.0.0.1 \
   --port 8080 \
   --ctx-size 8192 \
-  --alias gemma4:e4b
+  --alias gemma-4-gguf
 ```
 
 Verify the server:
@@ -33,7 +33,8 @@ export HARNESS_RUNTIME_PROVIDER=llamacpp
 export HARNESS_PRIMARY_RUNTIME=llamacpp
 export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
 export LLAMACPP_MODEL_PATH=models/<local-model-file>.gguf
-export LLAMACPP_MODEL_ALIAS=gemma4:e4b
+export LLAMACPP_MODEL_ALIAS=gemma-4-gguf
+export HARNESS_MODEL=gemma-4-gguf
 export HARNESS_ENABLE_OLLAMA_FALLBACK=true
 export HARNESS_FALLBACK_RUNTIME=ollama-legacy
 export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1

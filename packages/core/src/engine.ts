@@ -1282,6 +1282,7 @@ export class CoreEngine extends EventEmitter {
   async recordTurnExecution(
     executionMode: TurnExecutionMode,
     details: {
+      title?: string;
       promptMode?: string;
       messageCount: number;
       thinkingEnabled?: boolean;
@@ -1295,6 +1296,7 @@ export class CoreEngine extends EventEmitter {
     const record: SessionTurnMetadata = {
       timestamp: Date.now(),
       executionMode,
+      title: details.title,
       promptMode: details.promptMode,
       messageCount: details.messageCount,
       thinkingEnabled: details.thinkingEnabled,
@@ -1550,6 +1552,19 @@ export class CoreEngine extends EventEmitter {
 
   private getLatestUserMessage(messages: ChatMessage[]): string {
     return [...messages].reverse().find((message) => message.role === 'user')?.content || '';
+  }
+
+  private makeTurnTitleFromPrompt(prompt: string): string | undefined {
+    const normalized = prompt
+      .replace(/<think>[\s\S]*?<\/think>/gi, ' ')
+      .replace(/[`*_#[\]()>~-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!normalized) {
+      return undefined;
+    }
+    const title = normalized.split(' ').slice(0, 7).join(' ');
+    return title.length > 58 ? `${title.slice(0, 55)}...` : title;
   }
 
   private hasBrowserFolderContext(messages: ChatMessage[]): boolean {
@@ -4000,6 +4015,7 @@ export class CoreEngine extends EventEmitter {
       'chat',
     );
     await this.recordTurnExecution('chat', {
+      title: this.makeTurnTitleFromPrompt(this.getLatestUserMessage(messages)),
       promptMode: 'general',
       messageCount: messages.length,
       thinkingEnabled: options?.think === true,

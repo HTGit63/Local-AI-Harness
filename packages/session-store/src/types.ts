@@ -196,6 +196,7 @@ export interface CompactRunSummary {
 export interface SessionTurnMetadata {
   timestamp: number;
   executionMode: AgentRunExecutionMode;
+  title?: string;
   promptMode?: string;
   messageCount: number;
   thinkingEnabled?: boolean;

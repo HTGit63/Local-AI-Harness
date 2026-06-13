@@ -30,7 +30,7 @@ llama-server \
   --host 127.0.0.1 \
   --port 8080 \
   --ctx-size 8192 \
-  --alias gemma4:e4b
+  --alias gemma-4-gguf
 ```
 
 Install and run the harness:
@@ -79,7 +79,7 @@ Use the Web UI as the control center:
 | Fallback provider | `ollama-legacy` |
 | Fallback base URL | `http://127.0.0.1:11434/v1` |
 | API key | `no-key` |
-| Model alias | `gemma4:e4b` |
+| Model alias | `gemma-4-gguf` |
 | Stable hardware target | 16 GB RAM, CPU-first, no GPU assumption |
 
 Override with:
@@ -89,9 +89,9 @@ export HARNESS_RUNTIME_PROVIDER=llamacpp
 export HARNESS_PRIMARY_RUNTIME=llamacpp
 export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
 export LLAMACPP_MODEL_PATH=models/<local-model-file>.gguf
-export LLAMACPP_MODEL_ALIAS=gemma4:e4b
+export LLAMACPP_MODEL_ALIAS=gemma-4-gguf
 export OPENAI_API_KEY=no-key
-export HARNESS_MODEL=gemma4:e4b
+export HARNESS_MODEL=gemma-4-gguf
 export HARNESS_ENABLE_OLLAMA_FALLBACK=1
 export HARNESS_FALLBACK_RUNTIME=ollama-legacy
 export OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
@@ -104,6 +104,7 @@ Ollama remains available as visible fallback. If llama.cpp is offline and Ollama
 export HARNESS_RUNTIME_PROVIDER=ollama-legacy
 export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
 export OPENAI_API_KEY=ollama
+export HARNESS_MODEL=gemma4:e4b
 ```
 
 ## Modes
@@ -134,7 +135,7 @@ Defaults:
 - Runtime provider: `${DOCKER_HARNESS_RUNTIME_PROVIDER:-llamacpp}`
 - llama.cpp base URL: `${DOCKER_HARNESS_LLAMACPP_BASE_URL:-http://host.docker.internal:8080/v1}`
 - Ollama fallback URL: `${DOCKER_HARNESS_OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}`
-- Runtime model: `${DOCKER_HARNESS_MODEL:-gemma4:e4b}`
+- Runtime model: `${DOCKER_HARNESS_MODEL:-gemma-4-gguf}`
 
 Docker uses `host.docker.internal` for host model runtimes. Keep `127.0.0.1`
 for non-Docker local runs only; inside a container it points back at the
@@ -146,7 +147,7 @@ Example:
 HARNESS_WORKSPACE_SOURCE=/absolute/path/to/project \
 DOCKER_HARNESS_RUNTIME_PROVIDER=llamacpp \
 DOCKER_HARNESS_LLAMACPP_BASE_URL=http://host.docker.internal:8080/v1 \
-DOCKER_HARNESS_MODEL=gemma4:e4b \
+DOCKER_HARNESS_MODEL=gemma-4-gguf \
 docker compose up --build
 ```
 

@@ -20,7 +20,7 @@ export interface RuntimeSelectionConfig {
 
 export const DEFAULT_LLAMA_CPP_BASE_URL = 'http://127.0.0.1:8080/v1';
 export const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434/v1';
-export const DEFAULT_LLAMA_CPP_MODEL = 'gemma4:e4b';
+export const DEFAULT_LLAMA_CPP_MODEL = 'gemma-4-gguf';
 export const DEFAULT_OLLAMA_MODEL = 'gemma4:e4b';
 
 function envFlag(name: string, fallback: boolean): boolean {

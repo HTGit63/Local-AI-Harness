@@ -31,6 +31,7 @@ export interface ChatSession {
   turnHistory?: Array<{
     timestamp: number;
     executionMode: 'chat' | 'agent';
+    title?: string;
     promptMode?: string;
     intent?: string;
     summary?: string;

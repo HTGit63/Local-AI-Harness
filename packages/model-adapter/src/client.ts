@@ -10,7 +10,13 @@ import {
   RuntimeProvider,
 } from './types';
 import { DEFAULT_CONFIG, PROFILES } from './config';
-import { buildRuntimeSelectionConfig, RuntimeEndpointConfig, RuntimeSelectionConfig } from './runtime-config';
+import {
+  buildRuntimeSelectionConfig,
+  DEFAULT_OLLAMA_BASE_URL,
+  DEFAULT_OLLAMA_MODEL,
+  RuntimeEndpointConfig,
+  RuntimeSelectionConfig,
+} from './runtime-config';
 
 type ReasoningEffort = ChatCompletionRequest['reasoning_effort'];
 
@@ -31,6 +37,11 @@ interface RuntimeRoute {
   primaryStatus: RuntimeEndpointStatus;
   fallbackStatus?: RuntimeEndpointStatus;
   fallbackWarning?: string;
+}
+
+function joinWarnings(...warnings: Array<string | undefined>): string | undefined {
+  const compact = warnings.map((warning) => warning?.trim()).filter((warning): warning is string => Boolean(warning));
+  return compact.length > 0 ? compact.join(' ') : undefined;
 }
 
 function extractText(value: unknown): string {
@@ -264,10 +275,14 @@ export class ModelAdapter {
   private runtimeRouteCache: { value: RuntimeRoute; expiresAt: number } | null = null;
 
   constructor(options: Partial<AdapterOptions> = {}) {
-    this.provider = options.provider ?? DEFAULT_CONFIG.provider;
-    this.baseUrl = options.baseUrl ?? DEFAULT_CONFIG.baseUrl;
-    this.apiKey = options.apiKey ?? DEFAULT_CONFIG.apiKey;
-    this.model = options.model ?? DEFAULT_CONFIG.model;
+    const requestedProvider = options.provider ?? DEFAULT_CONFIG.provider;
+    this.provider = requestedProvider;
+    this.baseUrl = options.baseUrl
+      ?? (requestedProvider === 'ollama-legacy' ? process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL : DEFAULT_CONFIG.baseUrl);
+    this.apiKey = options.apiKey
+      ?? (requestedProvider === 'ollama-legacy' ? process.env.OLLAMA_API_KEY || 'ollama' : DEFAULT_CONFIG.apiKey);
+    this.model = options.model
+      ?? (requestedProvider === 'ollama-legacy' ? process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL : DEFAULT_CONFIG.model);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_CONFIG.timeoutMs;
     this.retries = options.retries ?? DEFAULT_CONFIG.retries;
     this.profileName = options.profile ?? DEFAULT_CONFIG.profile;
@@ -361,11 +376,13 @@ export class ModelAdapter {
     status: RuntimeEndpointStatus['status'],
     error?: string,
     warning?: string,
+    availableModels?: AvailableModel[],
   ): RuntimeEndpointStatus {
     return {
       provider: endpoint.provider,
       baseUrl: endpoint.baseUrl,
       model: endpoint.model,
+      availableModels,
       modelPath: endpoint.modelPath,
       modelAlias: endpoint.modelAlias,
       status,
@@ -387,7 +404,14 @@ export class ModelAdapter {
         signal: controller.signal as any,
       });
       if (response.ok) {
-        return this.makeEndpointStatus(endpoint, 'connected');
+        let availableModels: AvailableModel[] = [];
+        try {
+          const payload = await response.json() as { data?: AvailableModel[] };
+          availableModels = Array.isArray(payload.data) ? payload.data : [];
+        } catch {
+          availableModels = [];
+        }
+        return this.makeEndpointStatus(endpoint, 'connected', undefined, undefined, availableModels);
       }
       return this.makeEndpointStatus(endpoint, 'unavailable', `HTTP ${response.status}`);
     } catch (error: any) {
@@ -400,6 +424,43 @@ export class ModelAdapter {
 
   private shouldAutoFallback(): boolean {
     return this.provider === 'llamacpp' && this.runtimeSelection.fallbackEnabled && Boolean(this.runtimeSelection.fallback);
+  }
+
+  private selectListedEndpointModel(
+    endpoint: RuntimeEndpointConfig,
+    status: RuntimeEndpointStatus,
+  ): { endpoint: RuntimeEndpointConfig; status: RuntimeEndpointStatus; warning?: string } {
+    if (status.status !== 'connected' || !Array.isArray(status.availableModels) || status.availableModels.length === 0) {
+      return { endpoint, status };
+    }
+
+    const ids = status.availableModels
+      .map((model) => model.id)
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0);
+    if (ids.length === 0 || ids.includes(endpoint.model)) {
+      return { endpoint, status };
+    }
+
+    const preferred = [
+      /(^|\/)gemma4:e4b($|[-:])/i,
+      /(^|\/)gemma4:e2b($|[-:])/i,
+      /(^|\/)gemma4:12b($|[-:])/i,
+      /gemma/i,
+    ].reduce<string | undefined>((match, pattern) => match ?? ids.find((id) => pattern.test(id)), undefined) ?? ids[0];
+    if (!preferred) {
+      return { endpoint, status };
+    }
+
+    const warning = `Configured model ${endpoint.model} was not listed at ${endpoint.baseUrl}; using ${preferred}.`;
+    return {
+      endpoint: { ...endpoint, model: preferred },
+      status: {
+        ...status,
+        model: preferred,
+        warning: joinWarnings(status.warning, warning),
+      },
+      warning,
+    };
   }
 
   private async resolveRuntimeRoute(cacheTtlMs = 10_000): Promise<RuntimeRoute> {
@@ -430,22 +491,27 @@ export class ModelAdapter {
         isFallback: this.provider === 'ollama-legacy',
       };
       const activeStatus = await this.checkRuntimeEndpoint(active);
-      const primaryStatus = this.provider === 'llamacpp'
-        ? activeStatus
+      const selectedActive = this.selectListedEndpointModel(active, activeStatus);
+      const primaryStatusRaw = this.provider === 'llamacpp'
+        ? selectedActive.status
         : await this.checkRuntimeEndpoint(primary);
+      const selectedPrimary = this.provider === 'llamacpp'
+        ? selectedActive
+        : this.selectListedEndpointModel(primary, primaryStatusRaw);
       const fallbackStatus = this.provider === 'ollama-legacy'
         ? this.makeEndpointStatus(
-            active,
-            activeStatus.status,
-            activeStatus.error,
-            'Ollama legacy selected. llama.cpp GGUF primary is bypassed by current config.',
+            selectedActive.endpoint,
+            selectedActive.status.status,
+            selectedActive.status.error,
+            selectedActive.status.warning,
+            selectedActive.status.availableModels,
           )
         : undefined;
       const route: RuntimeRoute = {
-        active,
-        primaryStatus,
+        active: selectedActive.endpoint,
+        primaryStatus: selectedPrimary.status,
         fallbackStatus,
-        fallbackWarning: fallbackStatus?.warning,
+        fallbackWarning: selectedActive.warning,
       };
       if (cacheTtlMs > 0) {
         this.runtimeRouteCache = { value: route, expiresAt: Date.now() + cacheTtlMs };
@@ -454,8 +520,13 @@ export class ModelAdapter {
     }
 
     const primaryStatus = await this.checkRuntimeEndpoint(primary);
-    if (primaryStatus.status === 'connected') {
-      const route: RuntimeRoute = { active: primary, primaryStatus };
+    const selectedPrimary = this.selectListedEndpointModel(primary, primaryStatus);
+    if (selectedPrimary.status.status === 'connected') {
+      const route: RuntimeRoute = {
+        active: selectedPrimary.endpoint,
+        primaryStatus: selectedPrimary.status,
+        fallbackWarning: selectedPrimary.warning,
+      };
       if (cacheTtlMs > 0) {
         this.runtimeRouteCache = { value: route, expiresAt: Date.now() + cacheTtlMs };
       }
@@ -464,18 +535,21 @@ export class ModelAdapter {
 
     const fallback = this.runtimeSelection.fallback!;
     const fallbackStatusRaw = await this.checkRuntimeEndpoint(fallback);
-    const fallbackWarning = fallbackStatusRaw.status === 'connected'
+    const selectedFallback = this.selectListedEndpointModel(fallback, fallbackStatusRaw);
+    const primaryFallbackWarning = selectedFallback.status.status === 'connected'
       ? `Using Ollama fallback because llama.cpp primary is unavailable at ${primary.baseUrl}.`
       : undefined;
+    const fallbackWarning = joinWarnings(primaryFallbackWarning, selectedFallback.warning);
     const fallbackStatus = this.makeEndpointStatus(
-      fallback,
-      fallbackStatusRaw.status,
-      fallbackStatusRaw.error,
+      selectedFallback.endpoint,
+      selectedFallback.status.status,
+      selectedFallback.status.error,
       fallbackWarning,
+      selectedFallback.status.availableModels,
     );
     const route: RuntimeRoute = {
-      active: fallbackStatus.status === 'connected' ? fallback : primary,
-      primaryStatus,
+      active: fallbackStatus.status === 'connected' ? selectedFallback.endpoint : selectedPrimary.endpoint,
+      primaryStatus: selectedPrimary.status,
       fallbackStatus,
       fallbackWarning,
     };
@@ -1068,18 +1142,22 @@ export class ModelAdapter {
       this.runtimeStateCache = null;
       this.runtimeRouteCache = null;
       this.runtimeSelection = this.buildRuntimeSelection({});
-      const healthy = await this.isHealthy();
+      const route = await this.resolveRuntimeRoute(0);
+      const primaryHealthy = route.primaryStatus.status === 'connected';
+      const fallbackHealthy = route.active.isFallback && route.fallbackStatus?.status === 'connected';
       const result: ModelSwitchResult = {
         previousModel,
         requestedModel: targetModel,
-        activeModel: healthy ? targetModel : null,
+        activeModel: primaryHealthy ? targetModel : fallbackHealthy ? route.active.model : null,
         runningModels: [],
         unloadedModels: [],
-        loadedModel: healthy ? targetModel : null,
+        loadedModel: primaryHealthy ? targetModel : fallbackHealthy ? route.active.model : null,
         supportsLifecycle: false,
-        message: healthy
+        message: primaryHealthy
           ? `${this.provider} is reachable. Configured ${targetModel}; lifecycle warmup is not managed by the harness.`
-          : `${this.provider} is not reachable at ${this.baseUrl}. Configured ${targetModel}, but no runtime is active.`,
+          : fallbackHealthy
+            ? `${this.provider} is unavailable at ${this.baseUrl}. Ollama fallback is active with ${route.active.model}.`
+            : `${this.provider} is not reachable at ${this.baseUrl}. Configured ${targetModel}, but no runtime is active.`,
       };
       this.lastSwitchResult = result;
       this.capabilityCache.clear();
@@ -1206,7 +1284,11 @@ export class ModelAdapter {
 
   async createChatCompletion(request: ChatCompletionRequest) {
     const route = await this.resolveRuntimeRoute();
-    return this.withRuntimeEndpoint(route.active, () => this.createChatCompletionOnConfiguredEndpoint(request));
+    const shouldUseActiveEndpointModel = request.model === undefined || request.model === this.model;
+    const routedRequest = shouldUseActiveEndpointModel
+      ? { ...request, model: route.active.model }
+      : request;
+    return this.withRuntimeEndpoint(route.active, () => this.createChatCompletionOnConfiguredEndpoint(routedRequest));
   }
 
   private async createChatCompletionOnConfiguredEndpoint(request: ChatCompletionRequest) {

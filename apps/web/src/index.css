@@ -433,6 +433,17 @@ a {
   border-color: var(--border-strong);
 }
 
+.btn-sm-primary {
+  background: #f4f4f4;
+  border-color: #f4f4f4;
+  color: #050505;
+}
+
+.btn-sm-primary:hover {
+  background: #fff;
+  color: #050505;
+}
+
 .sidebar-search {
   padding: 4px 12px 8px;
   flex-shrink: 0;
@@ -3969,6 +3980,38 @@ body::after {
 .tool-tracker-header {
   background: #151515;
   border-color: var(--border);
+}
+
+.workspace-required-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  max-width: 760px;
+  margin: 0 auto 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(244, 244, 244, 0.16);
+  border-radius: 10px;
+  background: #121212;
+}
+
+.workspace-required-card strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 3px;
+}
+
+.workspace-required-card span {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.workspace-required-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .tool-call-card,

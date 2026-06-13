@@ -38,7 +38,7 @@ async function testConfigDefaults() {
 
   assert.strictEqual(config.provider, 'llamacpp');
   assert.ok(config.baseUrl.includes('8080'));
-  assert.strictEqual(config.model, 'gemma4:e4b');
+  assert.strictEqual(config.model, 'gemma-4-gguf');
   assert.strictEqual(config.mode, 'chat');
   assert.strictEqual(config.profile, 'balanced');
   assert.strictEqual(config.contextBudget, 16000);
@@ -441,7 +441,7 @@ async function testModelAdapter() {
     assert.strictEqual(response.choices[0].message.content, MOCK_CHAT_RESPONSE.choices[0].message.content);
     const runtimeBefore = await adapter.getRuntimeState();
     assert.strictEqual(runtimeBefore.provider, 'llamacpp');
-    assert.strictEqual(runtimeBefore.activeModel, 'gemma4:e4b');
+    assert.strictEqual(runtimeBefore.activeModel, 'gemma-4-gguf');
     assert.strictEqual(runtimeBefore.runtimeStatus, 'ready');
     assert.ok(runtimeBefore.installedModels.includes('qwen3.5:9b-q4_K_M'));
     assert.deepStrictEqual(runtimeBefore.configuredModelCapabilities, ['tools']);
@@ -450,7 +450,7 @@ async function testModelAdapter() {
     assert.strictEqual(runtimeBefore.lifecyclePolicy.preloadKeepAlive, '2m');
     assert.strictEqual(runtimeBefore.lifecyclePolicy.unloadKeepAlive, 0);
 
-    const switchResult = await adapter.activateModel('qwen3.5:9b-q4_K_M', 'gemma4:e4b');
+    const switchResult = await adapter.activateModel('qwen3.5:9b-q4_K_M', 'gemma-4-gguf');
     assert.strictEqual(switchResult.activeModel, 'qwen3.5:9b-q4_K_M');
     assert.strictEqual(switchResult.supportsLifecycle, false);
     assert.deepStrictEqual(switchResult.runningModels.map((entry) => entry.model), []);

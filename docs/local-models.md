@@ -8,7 +8,7 @@
 | Protocol | OpenAI-compatible `/v1` |
 | Base URL | `http://127.0.0.1:8080/v1` |
 | API Key | `no-key` |
-| Default Model | `gemma4:e4b` |
+| Default Model | `gemma-4-gguf` |
 | Hardware target | 16 GB RAM, CPU-first, no GPU assumption |
 
 Start `llama.cpp`:
@@ -19,7 +19,7 @@ llama-server \
   --host 127.0.0.1 \
   --port 8080 \
   --ctx-size 8192 \
-  --alias gemma4:e4b
+  --alias gemma-4-gguf
 ```
 
 Check health:
@@ -35,9 +35,9 @@ export HARNESS_RUNTIME_PROVIDER=llamacpp
 export HARNESS_PRIMARY_RUNTIME=llamacpp
 export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
 export LLAMACPP_MODEL_PATH=models/<local-model-file>.gguf
-export LLAMACPP_MODEL_ALIAS=gemma4:e4b
+export LLAMACPP_MODEL_ALIAS=gemma-4-gguf
 export OPENAI_API_KEY=no-key
-export HARNESS_MODEL=gemma4:e4b
+export HARNESS_MODEL=gemma-4-gguf
 ```
 
 Supported provider values:

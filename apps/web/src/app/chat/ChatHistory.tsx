@@ -18,7 +18,7 @@ function shortenText(value: string, max = 42): string {
 
 function formatSessionTitle(session: ChatSession): string {
   const latest = session.turnHistory?.[session.turnHistory.length - 1];
-  return shortenText(latest?.summary || latest?.intent || latest?.promptMode || session.id, 42);
+  return shortenText(latest?.title || latest?.summary || latest?.intent || latest?.promptMode || session.id, 42);
 }
 
 export function ChatHistory({
