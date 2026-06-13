@@ -223,12 +223,12 @@ export function ChatMode({
           <div className="topbar-logo">G4</div>
           <div className="topbar-brand">
             <span className="topbar-kicker">Chat Mode</span>
-            <span className="topbar-title">Normal conversation</span>
+            <span className="topbar-title">Chat</span>
           </div>
         </div>
         <RuntimeStatusBadge status={backendStatus} model={activeModel} provider={activeProvider} warning={runtimeWarning} />
         <div className="topbar-right">
-          <button className="sidebar-action" onClick={onOpenAgent} type="button">Open Agent</button>
+          <button className="sidebar-action" onClick={onOpenAgent} type="button">Agent</button>
         </div>
       </header>
 
@@ -240,11 +240,7 @@ export function ChatMode({
           onResume={(sessionId) => { void resumeThread(sessionId); }}
         />
         <main className="chat-mode-main">
-          <div className="chat-mode-strip">
-            <span>Workspace none</span>
-            <span>Repo tools off</span>
-            <span>{streamStatus}</span>
-          </div>
+          <div className="visually-hidden" aria-live="polite">{streamStatus}</div>
           <div className="chat-messages chat-mode-messages" ref={scrollRef}>
             <ChatMessageList messages={messages} isSending={isSending} onPrompt={setDraft} />
           </div>

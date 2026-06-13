@@ -33,38 +33,41 @@ export function ToolCallList({ traces, currentTool }: ToolCallListProps) {
     <section className="run-console-section">
       <div className="run-console-section-head">
         <span>Tools</span>
-        <span>{currentTool || 'none'}</span>
+        <span>{currentTool || `${toolEvents.length}`}</span>
       </div>
       {toolEvents.length === 0 ? (
         <div className="empty-note">No tool events yet</div>
       ) : (
-        <div className="tool-call-list">
-          {toolEvents.map((trace, index) => {
-            const data = getTraceData(trace);
-            const ok = data.success === true;
-            const failed = data.success === false || data.status === 'denied' || data.status === 'rejected' || data.status === 'failed';
-            const title = asText(data.tool) || asText(data.command) || 'verification';
-            const body = asText(data.inputSummary) || asText(data.reason) || asText(data.status) || 'Running.';
-            const duration = asDuration(data.durationMs);
-            return (
-              <div key={`${trace.timestamp}-${trace.type}-${index}`} className={`tool-call-row ${ok ? 'tool-call-row-ok' : failed ? 'tool-call-row-failed' : ''}`}>
-                <div className="tool-call-meta">
-                  <span>{formatTime(trace.timestamp)}</span>
-                  <span>{trace.type.replace(/_/g, ' ')}</span>
-                  {duration && <span>{duration}</span>}
+        <details className="run-console-advanced-details tool-events-details" open={Boolean(currentTool)}>
+          <summary>Advanced Details · Tool events</summary>
+          <div className="tool-call-list">
+            {toolEvents.map((trace, index) => {
+              const data = getTraceData(trace);
+              const ok = data.success === true;
+              const failed = data.success === false || data.status === 'denied' || data.status === 'rejected' || data.status === 'failed';
+              const title = asText(data.tool) || asText(data.command) || 'verification';
+              const body = asText(data.inputSummary) || asText(data.reason) || asText(data.status) || 'Running.';
+              const duration = asDuration(data.durationMs);
+              return (
+                <div key={`${trace.timestamp}-${trace.type}-${index}`} className={`tool-call-row ${ok ? 'tool-call-row-ok' : failed ? 'tool-call-row-failed' : ''}`}>
+                  <div className="tool-call-meta">
+                    <span>{formatTime(trace.timestamp)}</span>
+                    <span>{trace.type.replace(/_/g, ' ')}</span>
+                    {duration && <span>{duration}</span>}
+                  </div>
+                  <strong>{title}</strong>
+                  <p>{body}</p>
+                  {asText(data.outputPreview) && (
+                    <details className="run-console-advanced-details tool-call-output-details">
+                      <summary>Advanced Details · Tool output</summary>
+                      <p className="tool-call-output">{asText(data.outputPreview)}</p>
+                    </details>
+                  )}
                 </div>
-                <strong>{title}</strong>
-                <p>{body}</p>
-                {asText(data.outputPreview) && (
-                  <details className="run-console-advanced-details tool-call-output-details">
-                    <summary>Advanced Details · Tool output</summary>
-                    <p className="tool-call-output">{asText(data.outputPreview)}</p>
-                  </details>
-                )}
-              </div>
-            );
-          })}
-        </div>
+              );
+            })}
+          </div>
+        </details>
       )}
     </section>
   );

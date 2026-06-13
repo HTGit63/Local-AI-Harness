@@ -43,29 +43,10 @@ function HarnessApp() {
         <ModeLanding onSelectMode={openMode} />
       ) : (
         <>
-          <nav className="mode-switch-rail" aria-label="Mode switcher">
-            <button className="mode-switch-rail-button" onClick={openLanding} type="button">
-              Modes
-            </button>
-            <button
-              className={`mode-switch-rail-button ${activeMode === 'chat' ? 'mode-switch-rail-button-active' : ''}`}
-              onClick={() => openMode('chat')}
-              type="button"
-            >
-              Chat
-            </button>
-            <button
-              className={`mode-switch-rail-button ${activeMode === 'agent' ? 'mode-switch-rail-button-active' : ''}`}
-              onClick={() => openMode('agent')}
-              type="button"
-            >
-              Agent
-            </button>
-          </nav>
           {activeMode === 'chat' ? (
             <ChatMode onBack={openLanding} onOpenAgent={() => openMode('agent')} />
           ) : (
-            <AgentMode />
+            <AgentMode onBack={openLanding} onOpenChat={() => openMode('chat')} />
           )}
         </>
       )}

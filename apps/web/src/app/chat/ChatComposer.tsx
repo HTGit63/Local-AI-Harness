@@ -44,14 +44,9 @@ export function ChatComposer({
   return (
     <div className="composer-wrapper chat-mode-composer">
       <div className="composer">
-        <div className="composer-meta">
-          <span className="composer-meta-pill">Mode Chat</span>
-          <span className="composer-meta-pill">Tools off</span>
-          <span className="composer-meta-pill">Workspace none</span>
-        </div>
         <textarea
           className="composer-input"
-          placeholder={isSending ? 'Generating response...' : 'Message Chat Mode...'}
+          placeholder={isSending ? 'Generating response...' : 'Ask, paste notes, or attach an image...'}
           value={draft}
           onChange={(event) => onDraftChange(event.target.value)}
           onKeyDown={handleKeyDown}
@@ -110,7 +105,7 @@ export function ChatComposer({
               title={`Attach images (max ${MAX_CHAT_IMAGE_ATTACHMENTS}, ${formatBytes(MAX_CHAT_IMAGE_BYTES)} each)`}
               aria-label="Attach images"
             >
-              Attach
+              +
             </button>
             <input
               ref={imageInputRef}

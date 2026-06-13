@@ -1346,10 +1346,16 @@ function TreeView({ node, depth, expanded, onToggle, onSelect, selected }: {
 }
 
 /* ═══════════ AGENT MODE ═══════════ */
-export function AgentMode() {
+interface AgentModeProps {
+  onBack: () => void;
+  onOpenChat: () => void;
+}
+
+export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
   // UI state
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('connection');
+  const settingsDialogRef = useRef<HTMLElement | null>(null);
   const [filePreviewOpen, setFilePreviewOpen] = useState(false);
 
   // Backend state
@@ -1464,6 +1470,19 @@ export function AgentMode() {
       ? 'llama.cpp'
       : activeRuntimeProvider || 'Runtime';
   const runtimeFallbackWarning = modelRuntime?.fallbackWarning || modelRuntime?.fallbackRuntime?.warning || '';
+  const currentGoalLabel = plan?.taskPlan?.steps.find((step) => step.id === plan.currentStepId)?.title
+    || plan?.taskPlan?.steps.find((step) => step.status === 'running')?.title
+    || plan?.taskPlan?.steps.find((step) => step.status === 'pending')?.title
+    || plan?.taskPlan?.goal
+    || plan?.taskSummary
+    || 'No active goal';
+  const writeAccessLabel = config?.mode === 'trusted-edit'
+    ? 'workspace write'
+    : config?.mode === 'danger-sandbox' || config?.mode === 'danger'
+      ? 'sandbox write'
+      : config?.mode === 'full-agent' || config?.mode === 'workspace-write'
+        ? 'approval aware'
+        : 'read only';
   const modelRuntimeStatusLabel = modelRuntime?.runtimeStatus
     ? modelRuntime.runtimeStatus.replace(/_/g, ' ')
     : backendStatus;
@@ -1674,6 +1693,60 @@ export function AgentMode() {
       }
     } catch { setBackendStatus('offline'); }
   }, [repoContext, settingsOpen, settingsTab]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const dialog = settingsDialogRef.current;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    const focusableSelector = [
+      'button:not([disabled])',
+      'input:not([disabled])',
+      'select:not([disabled])',
+      'textarea:not([disabled])',
+      'a[href]',
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(',');
+
+    const focusFirst = () => {
+      const focusable = Array.from(dialog?.querySelectorAll<HTMLElement>(focusableSelector) || []);
+      (focusable[0] || dialog)?.focus();
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setSettingsOpen(false);
+        return;
+      }
+      if (event.key !== 'Tab' || !dialog) return;
+
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.setTimeout(focusFirst, 0);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, [settingsOpen]);
 
   useEffect(() => {
     void refreshDashboard(isSending ? 'live' : 'full', { includeHeavy: !isSending });
@@ -2486,12 +2559,12 @@ export function AgentMode() {
         <div className="topbar-left">
           <div className="topbar-logo">G4</div>
           <div className="topbar-brand">
-            <span className="topbar-kicker">Local workspace</span>
-            <span className="topbar-title">Gamma 4 Harness</span>
+            <span className="topbar-kicker">Agent Mode</span>
+            <span className="topbar-title">Agent</span>
           </div>
         </div>
 
-        <div className="topbar-center">
+        <div className="topbar-center agent-status-ledger">
           <div className="topbar-badge">
             <span className={`status-dot status-dot-${backendStatus}`} />
             <span>{backendStatus === 'ok' ? 'Ready' : backendStatus === 'degraded' ? 'Degraded' : 'Offline'}</span>
@@ -2504,50 +2577,23 @@ export function AgentMode() {
             <span>Model</span>
             <strong>{shortenText(activeModelLabel, 28)}</strong>
           </div>
-          {runtimeFallbackWarning && (
-            <div className="topbar-badge topbar-badge-warning">
-              <span>Warning</span>
-              <strong>Fallback active</strong>
-            </div>
-          )}
           <div className="topbar-badge">
             <span>Workspace</span>
             <strong>{config?.workspaceRoot ? shortenText(getPathBasename(config.workspaceRoot), 18) : 'None'}</strong>
           </div>
           <div className="topbar-badge">
-            <span>Policy</span>
-            <strong>{config?.mode || 'unknown'}</strong>
+            <span>Write</span>
+            <strong>{writeAccessLabel}</strong>
           </div>
-          <div className="topbar-badge">
-            <span>Net</span>
-            <strong>{config?.internetAccessEnabled ? 'On' : 'Off'}</strong>
+          <div className="topbar-badge topbar-badge-wide" title={currentGoalLabel}>
+            <span>Goal</span>
+            <strong>{shortenText(currentGoalLabel, 36)}</strong>
           </div>
-          <div className="topbar-badge">
-            <span>{userModeLabel}</span>
-          </div>
-          <div className="topbar-mode-switch" aria-label="Execution mode">
-            {AGENT_USER_MODES.map((mode) => (
-              <button
-                key={mode.id}
-                className={userMode === mode.id ? 'topbar-mode-option topbar-mode-option-active' : 'topbar-mode-option'}
-                type="button"
-                onClick={() => void selectUserMode(mode.id)}
-                aria-pressed={userMode === mode.id}
-                title={mode.note}
-              >
-                {mode.label}
-              </button>
-            ))}
-          </div>
-          {session && (
-            <div className="topbar-badge">
-              <span>Thread</span>
-              <strong>{shortenText(session.id, 12)}</strong>
-            </div>
-          )}
         </div>
 
         <div className="topbar-right">
+          <button className="topbar-nav-button" onClick={onBack} type="button">Modes</button>
+          <button className="topbar-nav-button" onClick={onOpenChat} type="button">Chat</button>
           <button className="icon-btn" onClick={() => void startNewSession()} type="button" title="New thread">＋</button>
           <button className="icon-btn" onClick={() => void refreshDashboard('full', { includeHeavy: true })} type="button" title="Refresh">↻</button>
           <button
@@ -2562,7 +2608,7 @@ export function AgentMode() {
       </header>
 
       {/* ── Main Layout ── */}
-      <div className={`main-layout ${settingsOpen ? 'settings-open' : ''}`}>
+      <div className="main-layout">
 
         {/* ── Sidebar: thread history + workspace ── */}
         <aside className="sidebar">
@@ -2940,17 +2986,14 @@ export function AgentMode() {
                 <span className="composer-meta-pill" title={activeModelLabel}>
                   Model {shortenText(activeModelLabel, 20)}
                 </span>
-                <span className="composer-meta-pill">
-                  Memory {config?.sessionMemoryEnabled ? `${config.sessionMemoryTurns}` : 'off'}
-                </span>
-                <span className="composer-meta-pill">
-                  Retry {config?.toolRetryMax ?? 0}
+                <span className="composer-meta-pill" title={getPermissionModeSummary(config?.mode)}>
+                  Write {writeAccessLabel}
                 </span>
                 <span className="composer-meta-status">{streamStatus || plan?.currentPhase || 'Ready'}</span>
               </div>
               <textarea
                 className="composer-input"
-                placeholder={isSending ? 'Generating response...' : 'Ask anything... (Enter to send, Shift+Enter for new line)'}
+                placeholder={isSending ? 'Working...' : 'Describe the repo task...'}
                 value={draft}
                 onChange={e => setDraft(e.target.value)}
                 onKeyDown={e => {
@@ -3027,7 +3070,7 @@ export function AgentMode() {
                     type="button"
                     title="Open agent controls"
                   >
-                    Agent controls
+                    Controls
                   </button>
                 </div>
                 <div className="composer-actions-right">
@@ -3038,7 +3081,7 @@ export function AgentMode() {
                     title={`Attach images (max ${MAX_IMAGE_ATTACHMENTS}, ${formatBytes(MAX_IMAGE_BYTES)} each)`}
                     aria-label="Attach images"
                   >
-                    Attach
+                    +
                   </button>
                   <input
                     ref={imageInputRef}
@@ -3085,12 +3128,28 @@ export function AgentMode() {
           />
         )}
 
-        {/* ── Settings Drawer ── */}
+        {/* ── Settings Modal ── */}
         {settingsOpen && (
-          <aside className="settings-drawer">
+          <div
+            className="settings-modal-backdrop"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) {
+                setSettingsOpen(false);
+              }
+            }}
+          >
+          <aside
+            className="settings-modal"
+            ref={settingsDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="agent-settings-title"
+            tabIndex={-1}
+          >
             <div className="settings-header">
-              <span className="settings-header-title">Settings</span>
-              <button className="icon-btn" onClick={() => setSettingsOpen(false)} type="button">✕</button>
+              <span className="settings-header-title" id="agent-settings-title">Settings</span>
+              <button className="icon-btn" onClick={() => setSettingsOpen(false)} type="button" aria-label="Close settings">✕</button>
             </div>
 
             <div className="settings-tabs">
@@ -3652,6 +3711,7 @@ export function AgentMode() {
               )}
             </div>
           </aside>
+          </div>
         )}
       </div>
 

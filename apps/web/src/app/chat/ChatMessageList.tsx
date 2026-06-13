@@ -14,8 +14,8 @@ export function ChatMessageList({
     return (
       <div className="chat-welcome">
         <div className="chat-welcome-logo">G4</div>
-        <h2>Chat Mode</h2>
-        <p>Normal conversation with markdown, image context, and no repo tools.</p>
+        <h2>Start a chat</h2>
+        <p>Ask a question, paste notes, or attach an image for context.</p>
         <div className="chat-welcome-hints">
           <button className="hint-chip" onClick={() => onPrompt('Explain this concept simply.')} type="button">
             Explain concept
