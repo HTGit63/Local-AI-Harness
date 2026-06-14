@@ -848,7 +848,23 @@ async function testApiWorkflow() {
     assert.ok(String(agentDone?.response || '').includes('Direct stream works.'));
     assert.ok(String(agentDone?.response || '').includes('What I did:'));
     assert.strictEqual(agentDone?.executionMode, 'agent');
-    assert.ok(agentEvents.some((event) => event.type === 'task_plan_created'));
+    const agentEventTypes = agentEvents.map((event) => String(event.type || ''));
+    const requiredAgentOrder = [
+      'intent_classified',
+      'workspace_doc_inventory',
+      'agent_skill_selection',
+      'workspace_context_collected',
+      'adaptive_plan_requested',
+      'adaptive_plan_validated',
+      'task_plan_created',
+      'current_goal_selected',
+    ];
+    let previousAgentIndex = -1;
+    for (const type of requiredAgentOrder) {
+      const index = agentEventTypes.indexOf(type);
+      assert.ok(index > previousAgentIndex, `${type} should stream after ${requiredAgentOrder[Math.max(0, requiredAgentOrder.indexOf(type) - 1)]}`);
+      previousAgentIndex = index;
+    }
     assert.ok(agentEvents.some((event) => event.type === 'task_step_started'));
     assert.ok(agentEvents.some((event) => event.type === 'task_step_completed'));
     assert.ok(agentEvents.some((event) => event.type === 'task_checkpoint_saved'));
@@ -857,6 +873,17 @@ async function testApiWorkflow() {
     assert.strictEqual(agentRunSummary?.summary?.workspaceSource, 'backend');
     assert.strictEqual(agentRunSummary?.summary?.workspaceBound, true);
     assert.ok(mockModel.getChatRequests().length > chatRequestsBeforeAgent);
+
+    const logRuns = await fetchJson<Array<{ runId: string; status?: string; eventCount?: number }>>(`${API_BASE}/api/logs/runs`);
+    assert.ok(logRuns.some((run) => run.runId === agentRunSummary.runId));
+    const agentLog = await fetchJson<{ runId: string; events: Array<{ eventType: string }> }>(`${API_BASE}/api/logs/runs/${agentRunSummary.runId}`);
+    assert.ok(agentLog.events.some((event) => event.eventType === 'request_received'));
+    assert.ok(agentLog.events.some((event) => event.eventType === 'task_plan_created'));
+    const agentLogSummary = await fetchJson<{ runId: string; status: string; eventCount: number }>(`${API_BASE}/api/logs/runs/${agentRunSummary.runId}/summary`);
+    assert.strictEqual(agentLogSummary.status, 'done');
+    assert.ok(agentLogSummary.eventCount > 0);
+    const traversalLog = await fetch(`${API_BASE}/api/logs/runs/bad%25id`);
+    assert.strictEqual(traversalLog.status, 400);
 
     const planState = await fetchJson<{ taskPlan?: { intent?: string; sizeEstimate?: string; complexity?: string; steps?: unknown[] } }>(`${API_BASE}/api/plan`);
     assert.ok(planState.taskPlan);

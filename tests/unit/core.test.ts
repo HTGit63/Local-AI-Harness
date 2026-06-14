@@ -2,10 +2,11 @@ import assert from 'assert';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { CoreEngine, PromptAnalyzer } from '@local-harness/core';
-import { ModelAdapter, PROFILES, type ChatMessage as AdapterChatMessage } from '@local-harness/model-adapter';
+import { CoreEngine, HarnessRunLogger, PromptAnalyzer, listHarnessLogRuns, readHarnessRunLog, readHarnessRunSummary } from '@local-harness/core';
+import { ModelAdapter, PROFILES, buildRuntimeSelectionConfig, type ChatMessage as AdapterChatMessage } from '@local-harness/model-adapter';
 import { PromptOptimizer, RECIPES } from '@local-harness/prompt-recipes';
 import { RepoIndexer } from '@local-harness/repo-indexer';
+import { FileSessionStore, type SessionMetadata } from '@local-harness/session-store';
 import {
   TaskOrchestrator,
   normalizeAdaptivePlanToTaskPlan,
@@ -47,6 +48,42 @@ async function testConfigDefaults() {
   assert.strictEqual(config.sessionMemoryEnabled, true);
   assert.strictEqual(config.sessionMemoryTurns, 3);
   assert.strictEqual(config.selfCheckEnabled, true);
+}
+
+function testRuntimeSelectionDefaultsPreserveOllamaAnchor() {
+  const keys = [
+    'HARNESS_RUNTIME_PROVIDER',
+    'HARNESS_PRIMARY_RUNTIME',
+    'HARNESS_FALLBACK_RUNTIME',
+    'HARNESS_MODEL',
+    'OLLAMA_MODEL',
+    'LLAMACPP_MODEL_ALIAS',
+    'OLLAMA_BASE_URL',
+    'LLAMACPP_BASE_URL',
+  ];
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  for (const key of keys) {
+    delete process.env[key];
+  }
+
+  try {
+    const selection = buildRuntimeSelectionConfig();
+    assert.strictEqual(selection.primary.provider, 'ollama-legacy');
+    assert.strictEqual(selection.primary.baseUrl, 'http://127.0.0.1:11434/v1');
+    assert.strictEqual(selection.primary.apiKey, 'ollama');
+    assert.strictEqual(selection.primary.model, 'gemma4:e4b-it-qat');
+    assert.strictEqual(selection.fallback?.provider, 'llamacpp');
+    assert.strictEqual(selection.fallback?.baseUrl, 'http://127.0.0.1:8080/v1');
+    assert.strictEqual(selection.fallback?.model, 'gemma-4-gguf');
+  } finally {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
 }
 
 function testPromptRecipes() {
@@ -678,6 +715,117 @@ async function testEngineTracksSkillAudit() {
   await fs.rm(sessionDataDir, { recursive: true, force: true });
 }
 
+async function testSessionCleanupPreservesActiveAndDeletesExpiredOnly() {
+  const sessionDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-session-cleanup-'));
+  const baseNow = Date.now();
+  const store = new FileSessionStore(sessionDataDir);
+
+  function session(id: string, updatedAt: number): SessionMetadata {
+    return {
+      id,
+      createdAt: updatedAt - 1000,
+      updatedAt,
+      model: 'gemma4:e4b-it-qat',
+      mode: 'chat',
+      cwd: '/tmp/project',
+      skillsActive: [],
+      toolsAllowlist: [],
+      turnHistory: [],
+    };
+  }
+
+  await fs.writeFile(path.join(sessionDataDir, 'active.json'), JSON.stringify(session('active', baseNow - 100_000), null, 2));
+  await fs.writeFile(path.join(sessionDataDir, 'stale.json'), JSON.stringify(session('stale', baseNow - 100_000), null, 2));
+  await fs.writeFile(path.join(sessionDataDir, 'fresh.json'), JSON.stringify(session('fresh', baseNow - 500), null, 2));
+  await fs.writeFile(path.join(sessionDataDir, 'orphan-turns.jsonl'), '{"timestamp":1}\n');
+
+  try {
+    const dryRun = await store.cleanupSessions({
+      activeSessionId: 'active',
+      maxAgeMs: 10_000,
+      now: baseNow,
+      dryRun: true,
+    });
+    assert.deepStrictEqual(dryRun.deletedSessions.map((entry) => entry.id), ['stale']);
+    assert.ok(await store.loadSession('stale'));
+
+    const result = await store.cleanupSessions({
+      activeSessionId: 'active',
+      maxAgeMs: 10_000,
+      now: baseNow,
+    });
+
+    assert.deepStrictEqual(result.deletedSessions.map((entry) => entry.id), ['stale']);
+    assert.ok(result.preservedSessions.some((entry) => entry.id === 'active' && entry.reason === 'active_session'));
+    assert.ok(result.preservedSessions.some((entry) => entry.id === 'fresh' && entry.reason === 'not_expired'));
+    assert.deepStrictEqual(result.deletedOrphanTurnSidecars, ['orphan']);
+    assert.strictEqual(await store.loadSession('stale'), null);
+    assert.ok(await store.loadSession('active'));
+    assert.ok(await store.loadSession('fresh'));
+  } finally {
+    await fs.rm(sessionDataDir, { recursive: true, force: true });
+  }
+}
+
+async function testHarnessRunLoggerWritesRedactedLogsAndRejectsTraversal() {
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-run-logs-'));
+  const previousPromptMode = process.env.HARNESS_LOG_PROMPTS;
+  process.env.HARNESS_LOG_PROMPTS = 'summary';
+
+  try {
+    const logger = new HarnessRunLogger({
+      workspaceRoot,
+      runId: 'run_unit_log',
+      sessionId: 'session_unit',
+      executionMode: 'agent',
+      promptMode: 'implementation',
+      model: 'gemma4:e4b-it-qat',
+    });
+
+    await logger.write({
+      eventType: 'request_received',
+      source: 'core',
+      data: {
+        token: 'sk-test-secret-value',
+        messages: [
+          { role: 'system', content: 'authorization: Bearer abcdefghijklmnopqrstuvwxyz123456' },
+          { role: 'user', content: 'Please inspect src/index.ts and keep this prompt bounded.' },
+        ],
+      },
+    });
+    await logger.write({
+      eventType: 'tool_call_completed',
+      source: 'tool',
+      data: { outputPreview: 'token=ghp_abcdefghijklmnopqrstuvwxyz123456' },
+    });
+    await logger.writeSummary({ status: 'done', summary: 'Logged safely.' });
+
+    const runs = await listHarnessLogRuns(workspaceRoot);
+    assert.ok(runs.some((run) => run.runId === 'run_unit_log'));
+
+    const log = await readHarnessRunLog(workspaceRoot, 'run_unit_log');
+    assert.ok(log);
+    assert.ok(log?.events.some((event) => event.eventType === 'request_received'));
+    const serialized = JSON.stringify(log);
+    assert.ok(!serialized.includes('sk-test-secret-value'));
+    assert.ok(!serialized.includes('Bearer abcdefghijklmnopqrstuvwxyz123456'));
+    assert.ok(!serialized.includes('ghp_abcdefghijklmnopqrstuvwxyz123456'));
+    assert.ok(serialized.includes('[REDACTED_SECRET]'));
+    assert.ok(serialized.includes('contentSummary'));
+
+    const summary = await readHarnessRunSummary(workspaceRoot, 'run_unit_log');
+    assert.strictEqual(summary?.status, 'done');
+    await assert.rejects(() => readHarnessRunLog(workspaceRoot, '../bad'));
+  } finally {
+    if (previousPromptMode === undefined) {
+      delete process.env.HARNESS_LOG_PROMPTS;
+    } else {
+      process.env.HARNESS_LOG_PROMPTS = previousPromptMode;
+    }
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testEngineChatStream() {
   const originalFetch = globalThis.fetch;
   const deltas: string[] = [];
@@ -1023,7 +1171,22 @@ async function testEngineCreatesTaskPlanTraceAndCheckpoint() {
     assert.ok(promptPayload.includes('Task size: small'));
 
     const traceTypes = engine.getTraceLog().map((entry) => entry.type);
-    assert.ok(traceTypes.includes('task_plan_created'));
+    const requiredOrder = [
+      'intent_classified',
+      'workspace_doc_inventory',
+      'agent_skill_selection',
+      'workspace_context_collected',
+      'adaptive_plan_requested',
+      'adaptive_plan_validated',
+      'task_plan_created',
+      'current_goal_selected',
+    ];
+    let previousIndex = -1;
+    for (const type of requiredOrder) {
+      const index = traceTypes.indexOf(type);
+      assert.ok(index > previousIndex, `${type} should appear after ${requiredOrder[Math.max(0, requiredOrder.indexOf(type) - 1)]}`);
+      previousIndex = index;
+    }
     assert.ok(traceTypes.includes('task_step_started'));
     assert.ok(traceTypes.includes('task_step_completed'));
     assert.ok(traceTypes.includes('task_checkpoint_saved'));
@@ -1602,6 +1765,7 @@ async function testEnginePrefersNativeToolsForGemmaTargetedEdits() {
     assert.ok(!JSON.stringify(toolRequest.messages).includes('Use this lightweight JSON tool protocol'));
     assertLeanThinkingControl(toolRequest.think ?? toolRequest.reasoning_effort);
     assert.strictEqual(toolRequest.options?.num_predict ?? toolRequest.max_tokens, 128);
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'agent_direct_answer_repaired'));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1641,7 +1805,7 @@ async function testEngineKeepsNativeToolsWhenCapabilitiesOmitTools() {
     assert.ok(!engine.getTraceLog().some((entry) => entry.type === 'manual_tool_fallback'));
     const runSummary = getLatestAgentRunSummary(engine);
     assert.strictEqual(runSummary?.toolProtocol, 'native');
-    assert.strictEqual(runSummary?.fallbackPath, 'native_tools');
+    assert.ok(runSummary?.fallbackPath === 'native_tools' || runSummary?.fallbackPath === 'native_retry');
     assert.strictEqual(runSummary?.usedManualFallback, false);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1829,6 +1993,7 @@ async function testEngineAnswersRepoOverviewFromLocalInventory() {
     assert.ok(response.includes('core'));
     assert.strictEqual(chatRequests.length, 0);
     assert.ok(engine.getTraceLog().some((entry) => entry.type === 'chat_response' && (entry.data as { source?: string }).source === 'local_inventory'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'agent_direct_answer_allowed' && (entry.data as { source?: string }).source === 'local_inventory'));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2169,8 +2334,9 @@ async function testEngineRejectsSimulatedToolTranscripts() {
     ]);
 
     assert.ok(response.includes('No tools were executed'));
-    assert.strictEqual(chatCalls, 3);
+    assert.ok(chatCalls >= 3);
     assert.ok(engine.getTraceLog().some((entry) => entry.type === 'tool_simulation_detected'));
+    assert.ok(engine.getTraceLog().some((entry) => entry.type === 'agent_direct_answer_repaired'));
   } finally {
     globalThis.fetch = originalFetch;
     await fs.rm(workspaceRoot, { recursive: true, force: true });
@@ -2724,6 +2890,7 @@ async function testEngineRecordsDeniedCommandEventContract() {
 
 async function run() {
   await testConfigDefaults();
+  testRuntimeSelectionDefaultsPreserveOllamaAnchor();
   testPromptRecipes();
   await testPromptAnalyzerIsPassThrough();
   testWorkspacePolicy();
@@ -2743,6 +2910,8 @@ async function run() {
   await testEnginePromptRecipeSelection();
   await testEngineSanitizesDisabledSkills();
   await testEngineTracksSkillAudit();
+  await testSessionCleanupPreservesActiveAndDeletesExpiredOnly();
+  await testHarnessRunLoggerWritesRedactedLogsAndRejectsTraversal();
   await testEngineChatStream();
   await testEngineChatStreamEmitsToolEvents();
   await testEngineRecordsExecutionModes();

@@ -7,8 +7,8 @@ import { ApprovalQueueManager, ApprovalRequestPayload } from '@local-harness/app
 import { ModelAdapter, buildRuntimeSelectionConfig, type ModelRuntimeState, type RuntimeProvider } from '@local-harness/model-adapter';
 import { Planner } from '@local-harness/planner';
 import { PromptOptimizer, RECIPES, RunMode } from '@local-harness/prompt-recipes';
-import { RepoIndexer, ProjectContext, ProjectInspection, TaskContext } from '@local-harness/repo-indexer';
-import { AgentFallbackPath, AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
+import { RepoIndexer, ProjectContext, ProjectInspection, TaskContext, WorkspaceDocumentInventory } from '@local-harness/repo-indexer';
+import { AgentFallbackPath, AgentRun, AgentRunLineStats, AgentRunMetrics, AgentRunStep, FileSessionStore, SessionCleanupOptions, SessionCleanupResult, SessionMetadata, SessionTurnMetadata } from '@local-harness/session-store';
 import {
   AdaptivePlan,
   AdaptivePlanArtifactPaths,
@@ -38,6 +38,7 @@ import { TraceBus, TraceEvent } from '@local-harness/trace-bus';
 import { ActionType, PolicyCheckResult, PolicyMode, WorkspacePolicy } from '@local-harness/workspace-policy';
 import { AgentRunBuilder, buildFinalAnswer, compactRunSummary, summarizeRun } from './agent-run';
 import { classifyIntent, IntentDecision, TaskIntent } from './intent-classifier';
+import { HarnessRunLogger, listHarnessLogRuns, readHarnessRunLog, readHarnessRunSummary } from './harness-log';
 // PromptAnalyzer removed — passes messages straight through for lower latency
 
 const SUPPORTED_TOOLS = [
@@ -692,7 +693,16 @@ const LOOP_CONTEXT_COMPACTION_TAIL = 12;
 const MESSAGE_COMPACTION_LINE_CHARS = 220;
 const MAX_RESPONSE_CONTINUATIONS = 2;
 const STREAM_TASK_TRACE_TYPES = new Set([
+  'intent_classified',
+  'workspace_doc_inventory',
+  'agent_skill_selection',
+  'workspace_context_collected',
+  'adaptive_plan_requested',
+  'adaptive_plan_validated',
+  'agent_direct_answer_allowed',
+  'agent_direct_answer_repaired',
   'task_plan_created',
+  'current_goal_selected',
   'task_step_started',
   'task_step_completed',
   'task_step_failed',
@@ -1266,6 +1276,18 @@ export class CoreEngine extends EventEmitter {
     return this.readRunCheckpointFile(runId);
   }
 
+  async listLogRuns(limit = 50) {
+    return listHarnessLogRuns(this.config.workspaceRoot, limit);
+  }
+
+  async getLogRun(runId: string) {
+    return readHarnessRunLog(this.config.workspaceRoot, runId);
+  }
+
+  async getLogRunSummary(runId: string) {
+    return readHarnessRunSummary(this.config.workspaceRoot, runId);
+  }
+
   async resumeRun(runId: string): Promise<RunCheckpoint | null> {
     const checkpoint = await this.readRunCheckpointFile(runId);
     if (!checkpoint) {
@@ -1402,6 +1424,13 @@ export class CoreEngine extends EventEmitter {
 
   async listSessions(): Promise<SessionMetadata[]> {
     return this.sessionStore.listSessions();
+  }
+
+  async cleanupSessions(options: SessionCleanupOptions = {}): Promise<SessionCleanupResult> {
+    return this.sessionStore.cleanupSessions({
+      ...options,
+      activeSessionId: options.activeSessionId ?? this.currentSession?.id,
+    });
   }
 
   async deleteSession(id: string): Promise<boolean> {
@@ -4020,6 +4049,33 @@ export class CoreEngine extends EventEmitter {
       messageCount: messages.length,
       thinkingEnabled: options?.think === true,
     });
+    const runLogger = new HarnessRunLogger({
+      workspaceRoot: this.config.workspaceRoot,
+      runId: createRunId(),
+      sessionId: this.currentSession?.id,
+      executionMode: 'chat',
+      promptMode: 'general',
+      model: this.config.model,
+    });
+    await runLogger.write({
+      eventType: 'request_received',
+      source: 'core',
+      data: {
+        executionMode: 'chat',
+        messageCount: messages.length,
+        messages: currentMessages,
+      },
+    });
+    await runLogger.write({
+      eventType: 'runtime_selected',
+      source: 'runtime',
+      data: {
+        provider: this.config.provider,
+        baseUrl: this.config.baseUrl,
+        model: this.config.model,
+        profile: this.config.profile,
+      },
+    });
     this.planner.setTaskSummary('Intent: chat');
     this.planner.setPhase('chat');
     this.planner.setRuntimeContext({
@@ -4043,8 +4099,18 @@ export class CoreEngine extends EventEmitter {
       let message: EngineChatMessage | undefined;
       let finishReason: string | undefined;
 
-      if (handlers) {
-        message = await this.streamAssistantMessage(
+	      if (handlers) {
+	        await runLogger.write({
+	          eventType: 'model_request',
+	          source: 'model',
+	          data: {
+	            messageCount: currentMessages.length,
+	            stream: true,
+	            maxTokens: directOutputBudget,
+	            messages: currentMessages,
+	          },
+	        });
+	        message = await this.streamAssistantMessage(
           currentMessages,
           handlers,
           undefined,
@@ -4054,8 +4120,18 @@ export class CoreEngine extends EventEmitter {
           options?.think,
         ) as EngineChatMessage | undefined;
         finishReason = typeof message?.finish_reason === 'string' ? message.finish_reason : undefined;
-      } else {
-        const result = await this.modelAdapter.createChatCompletion({
+	      } else {
+	        await runLogger.write({
+	          eventType: 'model_request',
+	          source: 'model',
+	          data: {
+	            messageCount: currentMessages.length,
+	            stream: false,
+	            maxTokens: directOutputBudget,
+	            messages: currentMessages,
+	          },
+	        });
+	        const result = await this.modelAdapter.createChatCompletion({
           model: routedDirectModel,
           messages: currentMessages,
           stream: false,
@@ -4070,8 +4146,17 @@ export class CoreEngine extends EventEmitter {
         finishReason = typeof result?.choices?.[0]?.finish_reason === 'string' ? result.choices[0].finish_reason : undefined;
       }
 
-      const content = composeAssistantContent((message ?? {}) as Record<string, unknown>);
-      response += content;
+	      const content = composeAssistantContent((message ?? {}) as Record<string, unknown>);
+	      response += content;
+	      await runLogger.write({
+	        eventType: 'model_response',
+	        source: 'model',
+	        data: {
+	          finishReason,
+	          contentLength: content.length,
+	          content,
+	        },
+	      });
 
       if (!content) {
         break;
@@ -4106,6 +4191,10 @@ export class CoreEngine extends EventEmitter {
     this.emitChatStatus(handlers, 'ready', 'Awaiting user input', continuationCount);
     this.updateLatestChatTurnSummary(response || 'No assistant response generated.');
     await this.persistCurrentSession();
+    await runLogger.writeSummary({
+      status: 'done',
+      summary: response || 'No assistant response generated.',
+    });
     return response;
   }
 
@@ -4451,9 +4540,40 @@ export class CoreEngine extends EventEmitter {
         fallbackReason: reason,
         fallbackCount: runBuilder.snapshot().metrics?.fallbackCount ?? 0,
       });
-    };
-    const runId = runBuilder.snapshot().id;
-    this.planner.startRun(runId);
+	    };
+	    const runId = runBuilder.snapshot().id;
+	    const runLogger = new HarnessRunLogger({
+	      workspaceRoot: this.config.workspaceRoot,
+	      runId,
+	      sessionId: this.currentSession!.id,
+	      executionMode: 'agent',
+	      promptMode,
+	      model: initialRouteModel,
+	    });
+	    await runLogger.write({
+	      eventType: 'request_received',
+	      source: 'core',
+	      data: {
+	        executionMode: 'agent',
+	        messageCount: messages.length,
+	        latestUserMessage,
+	        messages: requestMessages,
+	        workspaceBound,
+	        workspaceSource,
+	      },
+	    });
+	    await runLogger.write({
+	      eventType: 'runtime_selected',
+	      source: 'runtime',
+	      data: {
+	        provider: this.config.provider,
+	        baseUrl: this.config.baseUrl,
+	        model: this.config.model,
+	        profile: this.config.profile,
+	        toolProtocol: toolProtocol.manualToolProtocol ? 'manual' : 'native',
+	      },
+	    });
+	    this.planner.startRun(runId);
     this.planner.setTaskSummary(`Intent: ${intentDecision.intent}`);
     this.planner.setPhase('planning');
     this.planner.setRuntimeContext({
@@ -4465,7 +4585,9 @@ export class CoreEngine extends EventEmitter {
       fallbackReason: toolProtocol.mode === 'manual_fallback' ? toolProtocol.reason : undefined,
       fallbackCount: 0,
     });
-    this.planner.setActiveSkills(mergeSkills(this.currentSession?.skillsActive ?? [], this.selectOperationalSkills(intentDecision.intent, promptMode)));
+    const operationalSkillNames = this.selectOperationalSkills(intentDecision.intent, promptMode);
+    const activeAgentSkills = mergeSkills(this.currentSession?.skillsActive ?? [], operationalSkillNames);
+    this.planner.setActiveSkills(activeAgentSkills);
     this.planner.setIntendedAction('Classifying request');
 
     this.emitChatStatus(
@@ -4535,9 +4657,10 @@ export class CoreEngine extends EventEmitter {
       return buildFinalAnswer(answer, completedRun);
     }
 
-    let loopCount = 0;
-    const traceListener = (event: TraceEvent) => {
-      if (event.type === 'approval_enqueued') {
+	    let loopCount = 0;
+	    const traceListener = (event: TraceEvent) => {
+	      void runLogger.writeTrace(event);
+	      if (event.type === 'approval_enqueued') {
         const approval = event.data as ApprovalRequestPayload;
         runBuilder.recordApprovalRequested({
           id: approval.id,
@@ -4676,11 +4799,21 @@ export class CoreEngine extends EventEmitter {
 	      }
 	      taskPlan = this.taskOrchestrator.markStepRunning(taskPlan, nextStep.id);
 	      currentTaskStep = taskPlan.steps.find((entry) => entry.id === nextStep.id) ?? null;
-	      if (currentTaskStep) {
-	        this.planner.markTaskStepStarted(runId, taskPlan, currentTaskStep);
-	        this.emitChatStatus(streamHandlers, currentTaskStep.type, currentTaskStep.title, loopCount);
-	        await persistCheckpoint();
-	      }
+		      if (currentTaskStep) {
+		        this.traceBus.emitEvent({
+		          type: 'current_goal_selected',
+		          data: {
+		            runId,
+		            goalId: currentTaskStep.id,
+		            title: currentTaskStep.title,
+		            goalType: currentTaskStep.type,
+		            toolsAllowed: currentTaskStep.toolsAllowed,
+		          },
+		        });
+		        this.planner.markTaskStepStarted(runId, taskPlan, currentTaskStep);
+		        this.emitChatStatus(streamHandlers, currentTaskStep.type, currentTaskStep.title, loopCount);
+		        await persistCheckpoint();
+		      }
 	      return currentTaskStep;
 	    };
 
@@ -4823,6 +4956,51 @@ export class CoreEngine extends EventEmitter {
 	      return this.executeToolCall(toolName, args, toolRunId);
 	    };
 
+    this.traceBus.emitEvent({
+      type: 'intent_classified',
+      data: {
+        runId,
+        intent: intentDecision.intent,
+        confidence: intentDecision.confidence,
+        reasons: intentDecision.reasons,
+        classificationMs,
+      },
+    });
+    this.emitChatStatus(streamHandlers, 'analyzing_request', 'Intent classified', loopCount);
+
+    const workspaceDocInventory: WorkspaceDocumentInventory | null = workspaceBound
+      ? await this.repoIndexer.buildWorkspaceDocumentInventory().catch(() => null)
+      : null;
+    this.traceBus.emitEvent({
+      type: 'workspace_doc_inventory',
+      data: workspaceDocInventory
+        ? { runId, ...workspaceDocInventory }
+        : {
+            runId,
+            workspaceRoot: this.config.workspaceRoot,
+            controlDocs: [],
+            docsFound: [],
+            directoriesFound: [],
+            missingExpected: [],
+            filesConsidered: 0,
+            reason: 'Backend workspace inventory skipped because the request uses browser snapshot context only.',
+          },
+    });
+    this.emitChatStatus(streamHandlers, 'inventory_workspace_docs', 'Workspace documents inventoried', loopCount);
+
+    this.traceBus.emitEvent({
+      type: 'agent_skill_selection',
+      data: {
+        runId,
+        sessionSkills: this.currentSession?.skillsActive ?? [],
+        operationalSkills: operationalSkillNames,
+        activeSkills: activeAgentSkills,
+        promptMode,
+        intent: intentDecision.intent,
+      },
+    });
+    this.emitChatStatus(streamHandlers, 'selecting_skills', 'Agent skills selected', loopCount);
+
     taskContext = workspaceBound
       ? await this.repoIndexer.buildTaskContext({
           userRequest: taskPlan.userRequest,
@@ -4831,6 +5009,47 @@ export class CoreEngine extends EventEmitter {
           sizeEstimate: taskPlan.sizeEstimate,
         }).catch(() => null)
       : null;
+    this.traceBus.emitEvent({
+      type: 'workspace_context_collected',
+      data: {
+        runId,
+        workspaceBound,
+        taskContext,
+        selectedFiles: taskContext?.relevantFiles ?? [],
+        likelyTests: taskContext?.likelyTests ?? [],
+        reason: taskContext?.reason ?? (workspaceBound ? 'No backend task context available.' : 'Browser snapshot only.'),
+      },
+    });
+    this.emitChatStatus(streamHandlers, 'workspace_context_collected', 'Workspace context collected', loopCount);
+
+    const adaptivePlanRequest = {
+      runId,
+      requested: !resumeCheckpoint?.taskPlan?.adaptivePlan && workspaceBound && selectedToolNames.length > 0 && this.shouldUseAdaptivePlan(taskPlan.intent, taskPlan),
+      intent: taskPlan.intent,
+      sizeEstimate: taskPlan.sizeEstimate,
+      selectedToolNames,
+      taskArea: taskContext?.taskArea,
+      reason: resumeCheckpoint?.taskPlan?.adaptivePlan
+        ? 'Adaptive plan resumed from checkpoint.'
+        : workspaceBound && selectedToolNames.length > 0 && this.shouldUseAdaptivePlan(taskPlan.intent, taskPlan)
+          ? 'Non-trivial workspace-bound agent task requires adaptive planning.'
+          : 'Adaptive planning not required for this task shape.',
+    };
+    this.traceBus.emitEvent({
+      type: 'adaptive_plan_requested',
+      data: adaptivePlanRequest,
+    });
+    if (!adaptivePlanRequest.requested) {
+      this.traceBus.emitEvent({
+        type: 'adaptive_plan_validated',
+        data: {
+          runId,
+          skipped: true,
+          valid: true,
+          reason: adaptivePlanRequest.reason,
+        },
+      });
+    }
 
     if (resumeCheckpoint?.taskPlan?.adaptivePlan) {
       this.traceBus.emitEvent({
@@ -4870,6 +5089,10 @@ export class CoreEngine extends EventEmitter {
         if (templateResult.valid && templateResult.plan) {
           adaptivePlan = templateResult.plan;
           this.traceBus.emitEvent({
+            type: 'adaptive_plan_validated',
+            data: { runId, attempt: 'fallback_template', planId: adaptivePlan.id, goals: adaptivePlan.goals.length },
+          });
+          this.traceBus.emitEvent({
             type: 'adaptive_plan_fallback_used',
             data: { runId, reason, fallback: 'validated_template' },
           });
@@ -4891,6 +5114,10 @@ export class CoreEngine extends EventEmitter {
             throw new Error(`Adaptive plan invalid and fallback failed: ${safeResult.errors.join('; ')}`);
           }
           adaptivePlan = safeResult.plan;
+          this.traceBus.emitEvent({
+            type: 'adaptive_plan_validated',
+            data: { runId, attempt: 'safe_fallback', planId: adaptivePlan.id, goals: adaptivePlan.goals.length },
+          });
           this.traceBus.emitEvent({
             type: 'adaptive_plan_fallback_used',
             data: { runId, reason, fallback: 'safe_inspect_plan' },
@@ -4934,17 +5161,44 @@ export class CoreEngine extends EventEmitter {
         addedLines: completedRun.git?.addedLines,
         removedLines: completedRun.git?.removedLines,
       });
-      this.emitRunMetric(streamHandlers, runId, completedRun);
-      this.emitRunSummary(streamHandlers, runId, completedRun);
-      await this.persistCurrentSession();
-      this.autoCheckpointRuns.delete(runId);
-      return buildFinalAnswer(baseAnswer, completedRun);
+	      this.emitRunMetric(streamHandlers, runId, completedRun);
+	      this.emitRunSummary(streamHandlers, runId, completedRun);
+	      await this.persistCurrentSession();
+	      await runLogger.write({
+	        eventType: 'run_completed',
+	        source: 'core',
+	        data: { summary: completedRun },
+	        level: error ? 'error' : 'info',
+	      });
+	      await runLogger.writeSummary({
+	        status: error ? 'error' : 'done',
+	        summary: completedRun.summary,
+	        error,
+	      });
+	      this.autoCheckpointRuns.delete(runId);
+	      return buildFinalAnswer(baseAnswer, completedRun);
+	    };
+
+    const emitDirectAnswerAllowed = (source: string, reason: string) => {
+      this.traceBus.emitEvent({
+        type: 'agent_direct_answer_allowed',
+        data: {
+          runId,
+          source,
+          reason,
+          intent: intentDecision.intent,
+          taskIntent: taskPlan.intent,
+          sizeEstimate: taskPlan.sizeEstimate,
+          workspaceBound,
+        },
+      });
     };
 
     try {
       if (!browserFolderContextActive && this.isStatusOnlyWorkspaceQuestion(latestUserMessage)) {
         const localAnswer = await this.tryAnswerFromLocalState(latestUserMessage);
         if (localAnswer !== null) {
+          emitDirectAnswerAllowed(localAnswer.source, 'Status-only workspace question answered from local runtime/session state.');
           this.completeImmediateResponse(streamHandlers, localAnswer);
           return await finalizeRun(localAnswer.content);
         }
@@ -4961,6 +5215,7 @@ export class CoreEngine extends EventEmitter {
           action: 'Explaining workspace binding requirement',
           source: 'workspace_binding',
         });
+        emitDirectAnswerAllowed('workspace_binding', 'Browser snapshot cannot safely write or run commands without backend workspace binding.');
         return await finalizeRun(bindingAnswer);
       }
 
@@ -4968,6 +5223,7 @@ export class CoreEngine extends EventEmitter {
         ? await this.tryAnswerFromDirectWorkspaceTools(latestUserMessage)
         : null;
       if (directWorkspaceAnswer !== null) {
+        emitDirectAnswerAllowed(directWorkspaceAnswer.source, 'Simple workspace lookup answered through deterministic local tools.');
         this.completeImmediateResponse(streamHandlers, directWorkspaceAnswer);
         return await finalizeRun(directWorkspaceAnswer.content);
       }
@@ -4976,6 +5232,7 @@ export class CoreEngine extends EventEmitter {
         ? await this.tryAnswerFromLocalRepoOverview(latestUserMessage)
         : null;
       if (localRepoOverviewAnswer !== null) {
+        emitDirectAnswerAllowed(localRepoOverviewAnswer.source, 'Repository overview answered from bounded local inventory.');
         this.completeImmediateResponse(streamHandlers, localRepoOverviewAnswer);
         return await finalizeRun(localRepoOverviewAnswer.content);
       }
@@ -4987,6 +5244,7 @@ export class CoreEngine extends EventEmitter {
         ? await this.tryAnswerFromRootManifest(latestUserMessage)
         : null;
       if (rootManifestAnswer !== null) {
+        emitDirectAnswerAllowed(rootManifestAnswer.source, 'Root manifest question answered from bounded local manifest read.');
         this.completeImmediateResponse(streamHandlers, rootManifestAnswer);
         return await finalizeRun(rootManifestAnswer.content);
       }
@@ -5177,6 +5435,7 @@ export class CoreEngine extends EventEmitter {
         ? await this.tryAnswerFromLocalProjectInspection(latestUserMessage)
         : null;
       if (localProjectInspection !== null) {
+        emitDirectAnswerAllowed(localProjectInspection.source, 'Project inspection answered from deterministic local inspection.');
         this.completeImmediateResponse(streamHandlers, localProjectInspection);
         return await finalizeRun(localProjectInspection.content);
       }
@@ -5660,9 +5919,56 @@ export class CoreEngine extends EventEmitter {
           }
         }
 
-        const finalizableResponse = accumulatedResponse || finishReason === 'length' || responseContinuationCount > 0
-          ? joinContinuationText(accumulatedResponse, response)
-          : response;
+      const finalizableResponse = accumulatedResponse || finishReason === 'length' || responseContinuationCount > 0
+        ? joinContinuationText(accumulatedResponse, response)
+        : response;
+
+	        const activeGoalForDirectFinal = taskPlan.steps.find((step) => step.status === 'running') ?? null;
+	        const completedToolStep = runBuilder.snapshot().steps.some((step) => step.type === 'tool' && step.status === 'done');
+	        const activeGoalToolCalls = activeGoalForDirectFinal
+	          ? adaptiveGoalBudgetState.get(activeGoalForDirectFinal.id)?.toolCalls ?? 0
+	          : 0;
+	        const completedRequiredTool = taskPlan.adaptivePlan && activeGoalForDirectFinal
+	          ? activeGoalToolCalls > 0
+	          : completedToolStep;
+	        const currentStepRequiresTool = (activeGoalForDirectFinal?.toolsAllowed?.length ?? 0) > 0 || scopedToolNames.length > 0;
+	        const nonTrivialDirectFinal = Boolean(
+	          workspaceBound &&
+	          nativeToolDefinitions &&
+	          taskPlan.sizeEstimate !== 'none' &&
+	          currentStepRequiresTool &&
+	          !completedRequiredTool &&
+	          visibleResponse.length > 0,
+	        );
+	        if (nonTrivialDirectFinal && planningOnlyNativeRetryCount < toolRetryMax) {
+	          planningOnlyNativeRetryCount += 1;
+	          const retryReason = 'Model attempted a final answer before executing required agent workspace tools.';
+	          runBuilder.finishStep(modelStep.id, { detail: retryReason }, 'skipped');
+	          runBuilder.markNativeRetry(retryReason);
+	          syncFallbackState('native_retry', retryReason);
+	          this.traceBus.emitEvent({
+	            type: 'agent_direct_answer_repaired',
+	            data: {
+	              runId,
+	              model: this.config.model,
+	              reason: retryReason,
+	              attempt: planningOnlyNativeRetryCount,
+	              selectedTools: scopedToolNames,
+	              currentGoalId: activeGoalForDirectFinal?.id,
+	            },
+	          });
+	          currentMessages.push({
+	            role: 'system',
+	            content: [
+	              'Agent Mode guard: this is a non-trivial workspace task.',
+	              'Do not return a final answer before executing an allowed tool for the current goal.',
+	              scopedToolNames.length > 0
+	                ? `Use one of these tools now: ${scopedToolNames.join(', ')}.`
+	                : 'If no tool is possible, report the exact blocker.',
+	            ].join('\n'),
+	          });
+	          continue;
+	        }
 
         runBuilder.finishStep(modelStep.id, {
           detail: response.slice(0, 240) || 'No natural-language response.',

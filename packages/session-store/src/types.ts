@@ -235,10 +235,39 @@ export interface SessionMetadata {
   turnHistory?: SessionTurnMetadata[];
 }
 
+export interface SessionCleanupOptions {
+  activeSessionId?: string;
+  maxAgeMs?: number;
+  now?: number;
+  dryRun?: boolean;
+}
+
+export type SessionCleanupPreserveReason = 'active_session' | 'no_expiry_requested' | 'not_expired';
+export type SessionCleanupSkipReason = 'invalid_session_metadata' | 'delete_failed';
+
+export interface SessionCleanupSessionRecord {
+  id: string;
+  reason?: SessionCleanupPreserveReason | SessionCleanupSkipReason;
+  updatedAt?: number;
+  ageMs?: number;
+}
+
+export interface SessionCleanupResult {
+  sessionDir: string;
+  now: number;
+  maxAgeMs?: number;
+  dryRun: boolean;
+  deletedSessions: SessionCleanupSessionRecord[];
+  preservedSessions: SessionCleanupSessionRecord[];
+  skippedSessions: SessionCleanupSessionRecord[];
+  deletedOrphanTurnSidecars: string[];
+}
+
 export interface SessionStorageEngine {
   saveSession(session: SessionMetadata): Promise<void>;
   loadSession(id: string): Promise<SessionMetadata | null>;
   deleteSession(id: string): Promise<boolean>;
   listSessions(): Promise<SessionMetadata[]>;
   appendTurn(id: string, turn: SessionTurnMetadata): Promise<void>;
+  cleanupSessions(options?: SessionCleanupOptions): Promise<SessionCleanupResult>;
 }

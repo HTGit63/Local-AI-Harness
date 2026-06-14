@@ -683,6 +683,30 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (requestUrl.pathname === '/api/sessions/cleanup' && method === 'POST') {
+      const body = await readBody(req);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        sendBadRequest(req, res, 'Session cleanup body must be an object.');
+        return;
+      }
+      if (
+        body.maxAgeMs !== undefined &&
+        (typeof body.maxAgeMs !== 'number' || !Number.isFinite(body.maxAgeMs) || body.maxAgeMs <= 0)
+      ) {
+        sendBadRequest(req, res, 'maxAgeMs must be a positive number when provided.');
+        return;
+      }
+      if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') {
+        sendBadRequest(req, res, 'dryRun must be a boolean.');
+        return;
+      }
+      sendJson(req, res, 200, await engine.cleanupSessions({
+        maxAgeMs: body.maxAgeMs,
+        dryRun: body.dryRun,
+      }));
+      return;
+    }
+
     if (requestUrl.pathname.startsWith('/api/session/') && requestUrl.pathname.endsWith('/resume') && method === 'POST') {
       const sessionId = requestUrl.pathname.split('/')[3];
       const skillCatalog = await getSkillsCatalog();
@@ -880,6 +904,39 @@ const server = http.createServer(async (req, res) => {
     if (requestUrl.pathname === '/api/runs' && method === 'GET') {
       sendJson(req, res, 200, await engine.listRuns());
       return;
+    }
+
+    if (requestUrl.pathname === '/api/logs/runs' && method === 'GET') {
+      const limit = Number(requestUrl.searchParams.get('limit') || 50);
+      sendJson(req, res, 200, await engine.listLogRuns(Number.isFinite(limit) ? Math.max(1, Math.min(200, Math.floor(limit))) : 50));
+      return;
+    }
+
+    if (requestUrl.pathname.startsWith('/api/logs/runs/') && method === 'GET') {
+      const parts = requestUrl.pathname.split('/').filter(Boolean);
+      const runId = parts[3];
+      if (!runId) {
+        sendBadRequest(req, res, 'Missing run id.');
+        return;
+      }
+
+      try {
+        if (parts.length === 5 && parts[4] === 'summary') {
+          const summary = await engine.getLogRunSummary(runId);
+          sendJson(req, res, summary ? 200 : 404, summary || { error: 'Log summary not found.' });
+          return;
+        }
+        if (parts.length === 4) {
+          const log = await engine.getLogRun(runId);
+          sendJson(req, res, log ? 200 : 404, log || { error: 'Log run not found.' });
+          return;
+        }
+        sendBadRequest(req, res, 'Invalid log route.');
+        return;
+      } catch (error: any) {
+        sendBadRequest(req, res, error?.message || 'Invalid log run id.');
+        return;
+      }
     }
 
     if (requestUrl.pathname.startsWith('/api/runs/') && requestUrl.pathname.endsWith('/checkpoint') && method === 'GET') {

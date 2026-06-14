@@ -161,6 +161,22 @@ interface TraceEntry {
   timestamp: number;
 }
 
+interface HarnessLogRunListItem {
+  runId: string;
+  date: string;
+  executionMode?: ExecutionMode;
+  status?: string;
+  model?: string;
+  promptMode?: string;
+  startedAt?: number;
+  endedAt?: number;
+  eventCount?: number;
+  summary?: string;
+  logPath: string;
+  summaryPath?: string;
+  sizeBytes: number;
+}
+
 type ApprovalItem = RunApprovalItem;
 
 interface PlanState {
@@ -528,6 +544,7 @@ type ChatStreamEvent =
   | { type: 'tool_simulation_detected'; data: { model: string; attempt?: number; preview?: string; manualToolProtocol?: boolean; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
   | { type: 'stream_idle_timeout_retry'; data: { timeoutMs?: number; receivedContent?: boolean; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
   | { type: 'stream_idle_timeout_partial'; data: { timeoutMs?: number; receivedContent?: boolean; fallbackPath?: FallbackPath }; id?: string; timestamp?: number }
+  | { type: 'intent_classified' | 'workspace_doc_inventory' | 'agent_skill_selection' | 'workspace_context_collected' | 'adaptive_plan_requested' | 'adaptive_plan_validated' | 'current_goal_selected' | 'agent_direct_answer_allowed' | 'agent_direct_answer_repaired'; data: Record<string, unknown>; id?: string; timestamp?: number }
   | { type: 'delta'; delta: string }
   | { type: 'done'; response: string }
   | { type: 'error'; message: string };
@@ -828,6 +845,15 @@ function formatSkillAuditEntries(entries: SkillAuditRecord[] | undefined): strin
 }
 
 const TASK_TRACE_EVENT_TYPES = new Set<ChatStreamEvent['type']>([
+  'intent_classified',
+  'workspace_doc_inventory',
+  'agent_skill_selection',
+  'workspace_context_collected',
+  'adaptive_plan_requested',
+  'adaptive_plan_validated',
+  'current_goal_selected',
+  'agent_direct_answer_allowed',
+  'agent_direct_answer_repaired',
   'task_plan_created',
   'task_step_started',
   'task_step_completed',
@@ -1388,6 +1414,8 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
   const [skills, setSkills] = useState<SkillMetadata[]>([]);
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [traces, setTraces] = useState<TraceEntry[]>([]);
+  const [logRuns, setLogRuns] = useState<HarnessLogRunListItem[]>([]);
+  const [logStatus, setLogStatus] = useState('');
   const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [repoContext, setRepoContext] = useState<RepoContext | null>(null);
@@ -1613,6 +1641,20 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
   const userModeLabel = getUserModeLabel(userMode);
   const userModeNote = getUserModeNote(userMode);
   const showAgentWorkbench = isAgentic;
+  const latestLogRuns = useMemo(() => logRuns.slice(0, 4), [logRuns]);
+  const refreshLogRuns = useCallback(async () => {
+    if (!isAgentic) {
+      setLogRuns([]);
+      return;
+    }
+    try {
+      const runs = await fetchJson<HarnessLogRunListItem[]>(`${API}/logs/runs?limit=6`);
+      setLogRuns(runs);
+      setLogStatus('');
+    } catch {
+      setLogStatus('Logs unavailable');
+    }
+  }, [isAgentic]);
 
   /* ─── Refresh dashboard data ─── */
   const refreshDashboard = useCallback(async (
@@ -1821,6 +1863,13 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
       }
     };
   }, [isSending, refreshDashboard]);
+
+  useEffect(() => {
+    if (!showAgentWorkbench) return;
+    void refreshLogRuns();
+    const logId = setInterval(() => void refreshLogRuns(), isSending ? ACTIVE_RUN_REFRESH_MS : LIVE_REFRESH_MS);
+    return () => clearInterval(logId);
+  }, [isSending, refreshLogRuns, showAgentWorkbench]);
 
   useEffect(() => {
     if (folderInputRef.current) {
@@ -2375,6 +2424,7 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
       setAttachedImages([]);
       setAttachmentNotice('');
       await refreshDashboard('full', { includeHeavy: true });
+      await refreshLogRuns();
     }
   }
 
@@ -3014,6 +3064,36 @@ export function AgentMode({ onBack, onOpenChat }: AgentModeProps) {
                         </div>
                         <strong>{formatTraceHeadline(trace)}</strong>
                       </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="activity-card activity-log-card">
+                <div className="command-center-section-head">
+                  <span>Run Logs</span>
+                  <span>{latestLogRuns.length}</span>
+                </div>
+                {logStatus ? (
+                  <div className="empty-note">{logStatus}</div>
+                ) : latestLogRuns.length === 0 ? (
+                  <div className="empty-note">No durable logs yet</div>
+                ) : (
+                  <div className="activity-log-list">
+                    {latestLogRuns.map((run) => (
+                      <a
+                        key={run.runId}
+                        className="activity-log-row"
+                        href={`${API}/logs/runs/${encodeURIComponent(run.runId)}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={run.logPath}
+                      >
+                        <div className="activity-log-row-main">
+                          <strong>{shortenText(run.runId, 18)}</strong>
+                          <span>{run.status || 'open'} · {run.eventCount ?? 0} events</span>
+                        </div>
+                        <span>{formatRelativeTime(run.endedAt || run.startedAt || Date.now())}</span>
+                      </a>
                     ))}
                   </div>
                 )}

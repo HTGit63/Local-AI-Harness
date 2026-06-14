@@ -3,6 +3,8 @@ import * as path from 'path';
 import {
   CompactRunOutcome,
   CompactRunSummary,
+  SessionCleanupOptions,
+  SessionCleanupResult,
   SessionMetadata,
   SessionStorageEngine,
   SessionTurnMetadata,
@@ -466,6 +468,22 @@ export class FileSessionStore implements SessionStorageEngine {
     await fs.writeFile(turnsPath, jsonlContent ? `${jsonlContent}\n` : '');
   }
 
+  private async removeSessionFiles(id: string): Promise<boolean> {
+    try {
+      await fs.unlink(this.getSessionFilePath(id));
+    } catch {
+      return false;
+    }
+
+    try {
+      await fs.unlink(this.getSessionTurnsPath(id));
+    } catch {
+      // Sidecar may not exist.
+    }
+
+    return true;
+  }
+
   private async trimTurnsFile(id: string): Promise<void> {
     const turnsPath = this.getSessionTurnsPath(id);
     try {
@@ -547,17 +565,9 @@ export class FileSessionStore implements SessionStorageEngine {
   }
 
   async deleteSession(id: string): Promise<boolean> {
-    try {
-      await fs.unlink(this.getSessionFilePath(id));
-    } catch {
+    const deleted = await this.removeSessionFiles(id);
+    if (!deleted) {
       return false;
-    }
-
-    // Also remove the JSONL sidecar if it exists
-    try {
-      await fs.unlink(this.getSessionTurnsPath(id));
-    } catch {
-      // Sidecar may not exist — that's fine
     }
 
     const index = await this.ensureIndex();
@@ -579,5 +589,117 @@ export class FileSessionStore implements SessionStorageEngine {
         turnHistory: undefined, // Not loaded in listing — load individually via loadSession
       } as SessionMetadata))
       .sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  async cleanupSessions(options: SessionCleanupOptions = {}): Promise<SessionCleanupResult> {
+    await this.ensureDir();
+    const index = await this.ensureIndex();
+    await this.reconcileIndex(index);
+
+    const now = Number.isFinite(options.now) ? Number(options.now) : Date.now();
+    const maxAgeMs = Number.isFinite(options.maxAgeMs) && Number(options.maxAgeMs) > 0
+      ? Number(options.maxAgeMs)
+      : undefined;
+    const result: SessionCleanupResult = {
+      sessionDir: this.dataDir,
+      now,
+      maxAgeMs,
+      dryRun: options.dryRun === true,
+      deletedSessions: [],
+      preservedSessions: [],
+      skippedSessions: [],
+      deletedOrphanTurnSidecars: [],
+    };
+
+    const sessions = await this.listSessions();
+    for (const session of sessions) {
+      if (session.id === options.activeSessionId) {
+        result.preservedSessions.push({
+          id: session.id,
+          reason: 'active_session',
+          updatedAt: session.updatedAt,
+          ageMs: Math.max(0, now - session.updatedAt),
+        });
+        continue;
+      }
+
+      const updatedAt = Number(session.updatedAt || session.createdAt);
+      if (!Number.isFinite(updatedAt) || updatedAt <= 0) {
+        result.skippedSessions.push({ id: session.id, reason: 'invalid_session_metadata' });
+        continue;
+      }
+
+      const ageMs = Math.max(0, now - updatedAt);
+      if (maxAgeMs === undefined) {
+        result.preservedSessions.push({
+          id: session.id,
+          reason: 'no_expiry_requested',
+          updatedAt,
+          ageMs,
+        });
+        continue;
+      }
+
+      if (ageMs < maxAgeMs) {
+        result.preservedSessions.push({
+          id: session.id,
+          reason: 'not_expired',
+          updatedAt,
+          ageMs,
+        });
+        continue;
+      }
+
+      if (!result.dryRun) {
+        const deleted = await this.removeSessionFiles(session.id);
+        if (!deleted) {
+          result.skippedSessions.push({
+            id: session.id,
+            reason: 'delete_failed',
+            updatedAt,
+            ageMs,
+          });
+          continue;
+        }
+        index.delete(session.id);
+      }
+
+      result.deletedSessions.push({
+        id: session.id,
+        updatedAt,
+        ageMs,
+      });
+    }
+
+    const files = await fs.readdir(this.dataDir);
+    const sessionIds = new Set(
+      files
+        .filter((fileName) => this.isSessionFile(fileName))
+        .map((fileName) => fileName.slice(0, -SESSION_FILE_SUFFIX.length)),
+    );
+
+    for (const fileName of files) {
+      if (!fileName.endsWith(SESSION_TURNS_SUFFIX)) {
+        continue;
+      }
+      const id = fileName.slice(0, -SESSION_TURNS_SUFFIX.length);
+      if (sessionIds.has(id)) {
+        continue;
+      }
+      if (!result.dryRun) {
+        try {
+          await fs.unlink(this.getSessionTurnsPath(id));
+        } catch {
+          continue;
+        }
+      }
+      result.deletedOrphanTurnSidecars.push(id);
+    }
+
+    if (!result.dryRun) {
+      await this.writeIndexFile(index);
+    }
+
+    return result;
   }
 }

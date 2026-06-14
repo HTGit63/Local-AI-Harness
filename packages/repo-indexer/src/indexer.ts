@@ -65,6 +65,16 @@ export interface WorkspaceInventory {
   topLevelAreas: string[];
 }
 
+export interface WorkspaceDocumentInventory {
+  workspaceRoot: string;
+  controlDocs: string[];
+  docsFound: WorkspaceReferenceInfo[];
+  directoriesFound: string[];
+  missingExpected: string[];
+  filesConsidered: number;
+  reason: string;
+}
+
 export interface ProjectInspection {
   cwd: string;
   projectName: string;
@@ -313,6 +323,68 @@ export class RepoIndexer {
     };
     this.inventoryCache = this.buildCacheEntry(signature, inventory);
     return inventory;
+  }
+
+  async buildWorkspaceDocumentInventory(): Promise<WorkspaceDocumentInventory> {
+    const expectedFiles = [
+      'AGENTS.md',
+      'CONTEXT.md',
+      'PRODUCT.md',
+      'DESIGN.md',
+      'README.md',
+      'package.json',
+      '.env.example',
+      '.gamma-harness/project-memory.json',
+    ];
+    const expectedDirectories = ['docs', 'apps', 'packages', 'tests', 'conductor'];
+    const controlDocs: string[] = [];
+    const missingExpected: string[] = [];
+
+    for (const relativePath of expectedFiles) {
+      if (shouldIgnoreFileName(path.basename(relativePath))) {
+        continue;
+      }
+      try {
+        const stat = await fs.stat(path.join(this.cwd, relativePath));
+        if (stat.isFile()) {
+          controlDocs.push(relativePath);
+        } else {
+          missingExpected.push(relativePath);
+        }
+      } catch {
+        missingExpected.push(relativePath);
+      }
+    }
+
+    const docsFound: WorkspaceReferenceInfo[] = [];
+    const directoriesFound: string[] = [];
+    for (const relativePath of expectedDirectories) {
+      try {
+        const entries = await fs.readdir(path.join(this.cwd, relativePath), { withFileTypes: true });
+        directoriesFound.push(relativePath);
+        docsFound.push({
+          area: relativePath,
+          entries: entries
+            .filter((entry) => !IGNORED_DIR_NAMES.has(entry.name) && !shouldIgnoreFileName(entry.name))
+            .map((entry) => entry.isDirectory() ? `${entry.name}/` : entry.name)
+            .sort((left, right) => left.localeCompare(right))
+            .slice(0, 24),
+        });
+      } catch {
+        missingExpected.push(relativePath);
+      }
+    }
+
+    const filesConsidered = expectedFiles.length + expectedDirectories.length;
+    return {
+      workspaceRoot: this.cwd,
+      controlDocs,
+      docsFound,
+      directoriesFound,
+      missingExpected,
+      filesConsidered,
+      reason: 'Bounded inventory of control docs and top-level project areas before agent planning.',
+    };
   }
 
   async inspectProject(): Promise<ProjectInspection> {

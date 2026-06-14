@@ -3100,7 +3100,7 @@ body::after {
 
 .activity-deck {
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(260px, 0.95fr) minmax(240px, 0.8fr);
+  grid-template-columns: minmax(0, 1.15fr) minmax(250px, 0.85fr) minmax(230px, 0.75fr) minmax(220px, 0.72fr);
   gap: 12px;
   padding: 0 20px 12px;
   border-bottom: 1px solid rgba(168, 197, 222, 0.1);
@@ -3113,6 +3113,10 @@ body::after {
   background: rgba(9, 18, 27, 0.74);
   border: 1px solid rgba(171, 198, 221, 0.13);
   border-radius: 20px;
+}
+
+.activity-log-card {
+  border-radius: 8px;
 }
 
 .activity-card-primary {
@@ -3151,18 +3155,51 @@ body::after {
 }
 
 .activity-step-list,
-.activity-trace-list {
+.activity-trace-list,
+.activity-log-list {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
 .activity-step-card,
-.activity-trace-row {
+.activity-trace-row,
+.activity-log-row {
   padding: 12px 13px;
-  border-radius: 14px;
+  border-radius: 8px;
   background: rgba(13, 24, 36, 0.8);
   border: 1px solid rgba(168, 198, 222, 0.1);
+}
+
+.activity-log-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.activity-log-row:hover {
+  border-color: rgba(118, 210, 255, 0.28);
+}
+
+.activity-log-row-main {
+  min-width: 0;
+}
+
+.activity-log-row-main strong,
+.activity-log-row-main span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-log-row-main span,
+.activity-log-row > span {
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .activity-step-card-running {

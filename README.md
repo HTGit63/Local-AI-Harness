@@ -66,6 +66,10 @@ Use the Web UI as the control center:
 5. Review tool activity, approvals, diffs, terminal output, and verification status in the run panels.
 6. Save small project memory facts in Settings only when they help routing.
 
+Durable run logs are written under `.gamma-harness/logs/<yyyy-mm-dd>/`. Use
+`HARNESS_LOG_PROMPTS=off|summary|full` to control prompt capture; the default is
+`summary`. See `docs/observability.md`.
+
 ## Runtime Defaults
 
 | Setting | Default |
