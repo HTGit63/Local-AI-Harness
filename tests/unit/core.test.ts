@@ -14,6 +14,7 @@ import {
   validateAdaptivePlan,
 } from '@local-harness/task-orchestrator';
 import { WorkspacePolicy } from '@local-harness/workspace-policy';
+import { buildVerificationChecks, collectDiffFiles } from '../../apps/web/src/components/run-console/runSummary';
 import { createMockFetch, MOCK_CHAT_RESPONSE, MOCK_MODEL_CAPABILITIES, MOCK_MODEL_LIST } from '../mocks/model-responses';
 
 function assertAgentWorkResponse(response: string, expectedPrefix: string) {
@@ -96,6 +97,30 @@ function testPromptRecipes() {
   assert.ok(optimizer.optimizeForTask('diff content', 100).length > 0);
   assert.ok(optimizer.optimizeForTask('rewrite entire codebase', 5000).includes('FALLBACK'));
   assert.strictEqual(optimizer.detectReframing(Array(120).fill('word').join(' ')), true);
+}
+
+function testMinimalDiffSummaryHelpers() {
+  const diff = [
+    'diff --git a/src/math.ts b/src/math.ts',
+    'index 111..222 100644',
+    '--- a/src/math.ts',
+    '+++ b/src/math.ts',
+    '@@ -1,3 +1,3 @@',
+    '-export const value = 1;',
+    '+export const value = 2;',
+  ].join('\n');
+  const files = collectDiffFiles(null, diff);
+  assert.deepStrictEqual(files, [{ file: 'src/math.ts', added: 1, removed: 1 }]);
+
+  const checks = buildVerificationChecks([
+    { type: 'verification_started', timestamp: 1, data: { command: 'npm test', status: 'running' } },
+    { type: 'verification_completed', timestamp: 2, data: { command: 'npm test', status: 'passed', outputPreview: 'ok' } },
+    { type: 'verification_completed', timestamp: 3, data: { command: 'npm run lint', status: 'not-run' } },
+  ]);
+  assert.deepStrictEqual(checks.map((check) => [check.command, check.status]), [
+    ['npm test', 'passed'],
+    ['npm run lint', 'not_run'],
+  ]);
 }
 
 async function testPromptAnalyzerIsPassThrough() {
@@ -1771,6 +1796,63 @@ async function testEnginePrefersNativeToolsForGemmaTargetedEdits() {
   }
 }
 
+async function testEngineRunsExactEditAndVerificationDeterministically() {
+  const originalFetch = globalThis.fetch;
+  const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'gamma-exact-edit-'));
+  const chatRequests: any[] = [];
+  await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+  await fs.mkdir(path.join(workspaceRoot, 'test'), { recursive: true });
+  await fs.writeFile(path.join(workspaceRoot, 'package.json'), JSON.stringify({
+    type: 'module',
+    scripts: { test: 'node test/math.test.js' },
+  }, null, 2), 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'src', 'math.js'), [
+    'export function add(a, b) {',
+    '  return a + b;',
+    '}',
+    '',
+  ].join('\n'), 'utf8');
+  await fs.writeFile(path.join(workspaceRoot, 'test', 'math.test.js'), [
+    "import assert from 'assert';",
+    "import { add } from '../src/math.js';",
+    'assert.strictEqual(add(2, 3), 5);',
+    "console.log('math-ok');",
+    '',
+  ].join('\n'), 'utf8');
+
+  globalThis.fetch = createMockFetch({
+    onChatRequest(body) {
+      chatRequests.push(body);
+    },
+    chatResponder: () => ({
+      ...MOCK_CHAT_RESPONSE,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'not adaptive plan json' }, finish_reason: 'stop' }],
+    }),
+  }) as typeof fetch;
+
+  try {
+    const engine = new CoreEngine({ workspaceRoot, mode: 'trusted-edit', model: 'gemma4:e4b-it-qat', localModelBudgetProfile: 'lean' });
+    const response = await engine.agentWorkStream([
+      { role: 'user', content: 'Make this exact minimal edit: in src/math.js change `return a + b;` to `return Number(a) + Number(b);`, then run `npm test`, then summarize.' },
+    ], {}, { think: false });
+
+    const updated = await fs.readFile(path.join(workspaceRoot, 'src', 'math.js'), 'utf8');
+    assert.ok(updated.includes('return Number(a) + Number(b);'));
+    assert.ok(response.includes('Files changed: 1'));
+    assert.ok(chatRequests.length >= 1);
+    const traceTypes = engine.getTraceLog().map((entry) => entry.type);
+    assert.ok(traceTypes.includes('adaptive_plan_fallback_used'));
+    assert.ok(traceTypes.includes('verification_completed'));
+    assert.ok(traceTypes.includes('agent_direct_answer_allowed'));
+    const runs = await engine.listLogRuns(1);
+    assert.strictEqual(runs[0]?.status, 'done');
+    assert.ok(runs[0]?.summary?.includes('ran 1 command'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testEngineKeepsNativeToolsWhenCapabilitiesOmitTools() {
   const originalFetch = globalThis.fetch;
   const chatRequests: any[] = [];
@@ -2912,6 +2994,7 @@ async function run() {
   await testEngineTracksSkillAudit();
   await testSessionCleanupPreservesActiveAndDeletesExpiredOnly();
   await testHarnessRunLoggerWritesRedactedLogsAndRejectsTraversal();
+  testMinimalDiffSummaryHelpers();
   await testEngineChatStream();
   await testEngineChatStreamEmitsToolEvents();
   await testEngineRecordsExecutionModes();
@@ -2931,6 +3014,7 @@ async function run() {
   await testRepoIndexerBuildsTaskContext();
   await testEngineKeepsSimplePromptsLean();
   await testEnginePrefersNativeToolsForGemmaTargetedEdits();
+  await testEngineRunsExactEditAndVerificationDeterministically();
   await testEngineKeepsNativeToolsWhenCapabilitiesOmitTools();
   await testEngineRecoversFromPlanningOnlyNativeReply();
   await testEngineUsesManualToolProtocolWhenModelLacksNativeTools();

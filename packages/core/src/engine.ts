@@ -692,6 +692,7 @@ const AGENT_HISTORY_COMPACTION_TAIL = 8;
 const LOOP_CONTEXT_COMPACTION_TAIL = 12;
 const MESSAGE_COMPACTION_LINE_CHARS = 220;
 const MAX_RESPONSE_CONTINUATIONS = 2;
+const DEFAULT_ADAPTIVE_PLAN_TIMEOUT_MS = Number(process.env.HARNESS_ADAPTIVE_PLAN_TIMEOUT_MS || 15_000);
 const STREAM_TASK_TRACE_TYPES = new Set([
   'intent_classified',
   'workspace_doc_inventory',
@@ -745,6 +746,33 @@ function truncateStreamPreview(value: string): string {
 
 function normalizeInlineWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
+}
+
+function parseExactReplacementRequest(message: string): { filePath: string; oldContent: string; newContent: string } | null {
+  const match = message.match(/\bin\s+([^\s`'"]+)\s+change\s+`([^`]+)`\s+to\s+`([^`]+)`/i);
+  if (!match) {
+    return null;
+  }
+
+  const filePath = match[1].trim();
+  if (!filePath || path.isAbsolute(filePath) || filePath.split(/[\\/]+/).includes('..')) {
+    return null;
+  }
+
+  return {
+    filePath,
+    oldContent: match[2],
+    newContent: match[3],
+  };
+}
+
+function parseRequestedVerificationCommand(message: string): string | null {
+  const match = message.match(/\brun\s+`([^`]+)`/i);
+  const command = match?.[1]?.trim();
+  if (!command || !/^(npm|pnpm|yarn|bun|node|npx|tsx|tsc)\b/.test(command)) {
+    return null;
+  }
+  return command;
 }
 
 function compactContextLine(value: string, maxChars = MESSAGE_COMPACTION_LINE_CHARS): string {
@@ -1072,6 +1100,7 @@ export class CoreEngine extends EventEmitter {
     workspaceRoot: string;
     selectedToolNames: SupportedTool[];
     taskContext: TaskContext | null;
+    signal?: AbortSignal;
   }): Promise<AdaptivePlanValidationResult> {
     const allowedTools = params.selectedToolNames;
     const repoContext = params.taskContext
@@ -1104,13 +1133,59 @@ export class CoreEngine extends EventEmitter {
             validationErrors: lastErrors,
             validationOptions,
           });
-      const response = await this.modelAdapter.createChatCompletion({
-        model: this.config.model,
-        messages: [{ role: 'system', content: prompt }],
-        stream: false,
-        max_tokens: LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile].outputBudgetComplexPlan,
-        reasoning_effort: 'low',
-      });
+      const controller = new AbortController();
+      let timedOut = false;
+      const timeoutMs = Number.isFinite(DEFAULT_ADAPTIVE_PLAN_TIMEOUT_MS) && DEFAULT_ADAPTIVE_PLAN_TIMEOUT_MS > 0
+        ? DEFAULT_ADAPTIVE_PLAN_TIMEOUT_MS
+        : 15_000;
+      const timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort(new Error(`Adaptive planner timed out after ${timeoutMs}ms.`));
+      }, timeoutMs);
+      const abortFromCaller = () => {
+        controller.abort(params.signal?.reason ?? new Error('Agent run aborted.'));
+      };
+
+      if (params.signal) {
+        if (params.signal.aborted) {
+          abortFromCaller();
+        } else {
+          params.signal.addEventListener('abort', abortFromCaller, { once: true });
+        }
+      }
+
+      let response: Awaited<ReturnType<ModelAdapter['createChatCompletion']>>;
+      try {
+        response = await this.modelAdapter.createChatCompletion({
+          model: this.config.model,
+          messages: [{ role: 'system', content: prompt }],
+          stream: false,
+          max_tokens: LOCAL_MODEL_BUDGET_PROFILES[this.config.localModelBudgetProfile].outputBudgetComplexPlan,
+          reasoning_effort: 'low',
+          signal: controller.signal,
+        });
+      } catch (error: unknown) {
+        if (params.signal?.aborted) {
+          throw error;
+        }
+        lastErrors = [
+          timedOut
+            ? `Adaptive planner timed out after ${timeoutMs}ms.`
+            : error instanceof Error
+              ? error.message
+              : String(error),
+        ];
+        this.traceBus.emitEvent({
+          type: 'adaptive_plan_validation_failed',
+          data: { attempt, errors: lastErrors },
+        });
+        break;
+      } finally {
+        clearTimeout(timeoutId);
+        if (params.signal) {
+          params.signal.removeEventListener('abort', abortFromCaller);
+        }
+      }
       const message = response?.choices?.[0]?.message;
       const content = composeAssistantContent(message as Record<string, unknown>);
       lastJsonText = content || '';
@@ -2517,6 +2592,24 @@ export class CoreEngine extends EventEmitter {
 
     if (this.shouldIncludeInternetTools(latestUserMessage) && toolNames.includes('webSearch')) {
       return { kind: 'tool', name: 'webSearch', args: { query: latestUserMessage.trim() } };
+    }
+
+    const exactReplacement = parseExactReplacementRequest(latestUserMessage);
+    if (promptMode === 'targeted_edit' && exactReplacement && toolNames.includes('patchFile')) {
+      return {
+        kind: 'tool',
+        name: 'patchFile',
+        args: exactReplacement,
+      };
+    }
+
+    const verificationCommand = parseRequestedVerificationCommand(latestUserMessage);
+    if (verificationCommand && toolNames.includes('runCommand') && !toolNames.includes('patchFile')) {
+      return {
+        kind: 'tool',
+        name: 'runCommand',
+        args: { command: verificationCommand },
+      };
     }
 
     if (!toolNames.includes('readFile')) {
@@ -5067,6 +5160,7 @@ export class CoreEngine extends EventEmitter {
           workspaceRoot: this.config.workspaceRoot,
           selectedToolNames,
           taskContext,
+          signal: options?.signal,
         });
       } catch (error: any) {
         adaptiveResult = { valid: false, errors: [error?.message || 'Adaptive planner model call failed.'] };
@@ -5568,8 +5662,96 @@ export class CoreEngine extends EventEmitter {
 
 	        loopCount += 1;
 	        runBuilder.setLoopCount(loopCount);
-	        await startTaskStep();
+	        const activeLoopStep = await startTaskStep();
 	        refreshScopedToolDefinitions();
+        const deterministicStepTool = await this.inferManualBootstrapTool(latestUserMessage, promptMode, scopedToolNames);
+        if (
+          deterministicStepTool &&
+          (deterministicStepTool.name === 'patchFile' || deterministicStepTool.name === 'runCommand')
+        ) {
+          const toolStep = runBuilder.startNamedStep('tool', `Execute ${deterministicStepTool.name}`);
+          this.planner.setPhase('execution');
+          this.planner.setCurrentTool(deterministicStepTool.name);
+          this.planner.setIntendedAction(`Executing ${deterministicStepTool.name}`);
+          this.planner.upsertRunStep({
+            id: toolStep.id,
+            type: toolStep.type,
+            title: toolStep.title,
+            status: toolStep.status,
+            toolName: deterministicStepTool.name,
+          });
+          this.emitRunStep(streamHandlers, runId, toolStep);
+          this.emitChatStatus(streamHandlers, 'execution', `Executing ${deterministicStepTool.name}`, loopCount);
+
+          const toolEventId = nextStreamToolEventId();
+          this.emitChatToolEvent(streamHandlers, {
+            id: toolEventId,
+            name: deterministicStepTool.name,
+            state: 'start',
+            inputSummary: summarizeToolArgs(deterministicStepTool.name, deterministicStepTool.args),
+          });
+
+          const toolResult = await executeCurrentStepTool(deterministicStepTool.name, deterministicStepTool.args, runId);
+          const streamedOutput = toolResult.preview
+            ? `${toolResult.output}\n\n${toolResult.preview}`
+            : toolResult.output;
+          this.emitChatToolEvent(streamHandlers, {
+            id: toolEventId,
+            name: deterministicStepTool.name,
+            state: 'done',
+            inputSummary: summarizeToolArgs(deterministicStepTool.name, deterministicStepTool.args),
+            output: truncateStreamPreview(streamedOutput),
+            success: toolResult.success,
+          });
+          this.recordRunToolMetadata(runBuilder, toolResult.metadata);
+          currentMessages.push({
+            role: 'user',
+            content: this.formatManualToolResult(
+              deterministicStepTool.name,
+              this.buildToolResultForModel(deterministicStepTool.name, toolResult),
+            ),
+          });
+          runBuilder.finishStep(toolStep.id, {
+            toolName: deterministicStepTool.name,
+            toolInputSummary: summarizeToolArgs(deterministicStepTool.name, deterministicStepTool.args),
+            toolOutputPreview: truncateStreamPreview(streamedOutput),
+            command: toolResult.metadata?.command?.command,
+          }, toolResult.success ? 'done' : 'error');
+          const finishedDeterministicTool = runBuilder.snapshot().steps.find((entry) => entry.id === toolStep.id);
+          if (finishedDeterministicTool) {
+            this.planner.upsertRunStep({
+              id: finishedDeterministicTool.id,
+              type: finishedDeterministicTool.type,
+              title: finishedDeterministicTool.title,
+              status: finishedDeterministicTool.status,
+              detail: finishedDeterministicTool.detail,
+              toolName: finishedDeterministicTool.toolName,
+            });
+            this.emitRunStep(streamHandlers, runId, finishedDeterministicTool);
+          }
+          if (toolResult.success) {
+            await completeCurrentTaskStep(`${deterministicStepTool.name} completed`);
+          }
+          this.emitRunMetric(streamHandlers, runId, runBuilder.snapshot());
+          continue;
+        }
+        if (this.config.mode === 'trusted-edit' && activeLoopStep?.type === 'summarize' && scopedToolNames.length === 0) {
+          const snapshot = runBuilder.snapshot();
+          const hasActionEvidence =
+            snapshot.filesWritten.length > 0 ||
+            snapshot.filesDeleted.length > 0 ||
+            snapshot.directoriesCreated.length > 0 ||
+            snapshot.commands.length > 0;
+          if (hasActionEvidence) {
+            emitDirectAnswerAllowed('run_summary', 'Summarized completed tool work from deterministic run metadata.');
+            this.completeImmediateResponse(streamHandlers, {
+              content: 'Completed requested workspace task.',
+              action: 'Summarizing completed tool work',
+              source: 'run_summary',
+            });
+            return await finalizeRun('Completed requested workspace task.');
+          }
+        }
 	        currentMessages.push({
           role: 'system',
           content: buildStepScopedPrompt(taskPlan, currentTaskStep, taskContext),

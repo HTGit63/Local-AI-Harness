@@ -56,7 +56,12 @@ export function MinimalDiffTestSummary({ gitDiff, structuredDiff, traces }: Mini
         <div className="minimal-run-summary-block">
           <div className="minimal-run-summary-label">Verification</div>
           {checks.length === 0 ? (
-            <div className="empty-note">No verification checks were run.</div>
+            <div className="minimal-run-check-row">
+              <code>No verification command logged</code>
+              <span className="minimal-run-status minimal-run-status-not_run">
+                not-run
+              </span>
+            </div>
           ) : (
             <div className="minimal-run-check-list">
               {checks.map((check) => (

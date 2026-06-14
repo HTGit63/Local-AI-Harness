@@ -2,7 +2,7 @@
 
 Date: 2026-06-14
 
-Scope: AGENTS.md Phase 0 plus the requested Phase 1, Phase 2, and Phase 3 work.
+Scope: AGENTS.md Phase 0 plus requested Phase 1 through Phase 7 work.
 
 ## Commit Anchor
 
@@ -141,6 +141,91 @@ Phase 3 required fixes:
 
 ## Risk Notes
 
-- `apps/web/src/app/agent/AgentMode.tsx` is still a large file. Phase 3 UI work should stay scoped and avoid broad extraction unless needed.
+- `apps/web/src/app/agent/hooks/useAgentModeController.tsx` remains large after Phase 5. `AgentMode.tsx` is now a 7-line shell, and new extracted modules create stable extraction points, but the controller still needs future decomposition.
 - `packages/core/src/engine.ts` is large and stateful. Phase 2/3 changes should use small helper functions and a dedicated log module instead of spreading durable logging logic through unrelated code.
 - Build artifacts must not be treated as source success. Final status must separate code changes, tests, and live runtime proof.
+
+## Phase 4 Result
+
+Real-model smoke is implemented as opt-in script `npm run test:real-model`.
+
+Coverage:
+
+- Direct Chat with real local `nemotron-3-nano:4b`, asserting `harness-ok` and no tool events.
+- Agent Inspect with real local runtime, asserting workspace inventory/context events and read/list/search tool execution without file changes.
+- Agent Edit + Verify in `trusted-edit`, using a temp workspace, exact `patchFile`, `npm test`, verification events, durable JSONL, and summary JSON.
+
+Latest real-model evidence:
+
+```text
+HARNESS_REAL_MODEL_TESTS=1 HARNESS_RUNTIME_PROVIDER=ollama-legacy HARNESS_MODEL=nemotron-3-nano:4b OLLAMA_MODEL=nemotron-3-nano:4b OLLAMA_BASE_URL=http://127.0.0.1:11434/v1 npm run test:real-model
+Real model smoke result:
+- passed
+- model: nemotron-3-nano:4b
+- provider: ollama-legacy
+- base URL: http://127.0.0.1:11434/v1
+- run id: run_mqdq9ojirtqexe
+```
+
+Normal `npm test` still skips real-model work unless `HARNESS_REAL_MODEL_TESTS=1`.
+
+## Phase 5 Result
+
+Agent Mode shell and API/UI pieces are split:
+
+- `apps/web/src/app/agent/AgentMode.tsx`: 7-line shell.
+- `apps/web/src/app/agent/hooks/useAgentModeController.tsx`: existing controller moved behind hook.
+- `apps/web/src/app/agent/agentApi.ts`: shared Agent Mode API helpers.
+- `apps/web/src/app/agent/AgentTopBar.tsx`: runtime/workspace/write-mode top band.
+- `apps/web/src/app/agent/AgentRunLogPanel.tsx`: durable run log list panel.
+
+Residual debt: controller hook is still large. The Phase 5 requirement to make
+`AgentMode.tsx` an orchestration shell is complete; deeper controller splitting
+is intentionally left for a later focused pass.
+
+## Phase 6 Result
+
+UI hardening:
+
+- Compact diff/test summary keeps changed files and verification visible first.
+- Verification entries now show explicit `not-run` state.
+- Full diff, raw trace, checkpoints, and log details remain collapsed.
+- Unit helper coverage was added for diff-file stats and verification status mapping.
+
+Stage 5 behavior hardening:
+
+- Adaptive planning now has a bounded timeout via `HARNESS_ADAPTIVE_PLAN_TIMEOUT_MS`.
+- Invalid or slow adaptive plans fall back to a validated template plan.
+- Exact replacement prompts of the form ``in file change `old` to `new` `` route through deterministic `patchFile`.
+- Backticked verification commands route through `runCommand` only when the current step allows verification tools.
+- Deterministic final summaries are allowed only after write or command evidence, so read-only inspect flows still use model summaries.
+
+## Phase 7 Result
+
+Docs added or updated:
+
+- `docs/runtime.md`
+- `docs/real-model-testing.md`
+- `docs/observability.md`
+- `docs/final-harness-phases-4-7-plan.md`
+- `conductor/index.md`
+- `conductor/product.md`
+- `conductor/tech-stack.md`
+- `conductor/workflow.md`
+- `conductor/tracks.md`
+- `README.md`
+- `.env.example`
+
+## Phase 4-7 Validation Snapshot
+
+Passed after final Phase 4-7 edits:
+
+- `npm run build:packages`
+- `npm run build:apps`
+- `npm run build`
+- `node --import tsx tests/unit/core.test.ts`
+- `node --import tsx tests/e2e/api.test.ts`
+- `npm test`
+- `npm run build --workspace web`
+- `npm run lint --workspace web`
+- `HARNESS_REAL_MODEL_TESTS=1 HARNESS_RUNTIME_PROVIDER=ollama-legacy HARNESS_MODEL=nemotron-3-nano:4b OLLAMA_MODEL=nemotron-3-nano:4b OLLAMA_BASE_URL=http://127.0.0.1:11434/v1 npm run test:real-model`

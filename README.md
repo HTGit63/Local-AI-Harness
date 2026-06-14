@@ -207,6 +207,7 @@ node --import tsx tests/unit/core.test.ts
 node --import tsx tests/integration/workflow.test.ts
 node --import tsx tests/e2e/cli.test.ts
 node --import tsx tests/e2e/api.test.ts
+npm run test:real-model # opt-in; skips unless HARNESS_REAL_MODEL_TESTS=1
 ```
 
 ## Documentation
@@ -216,6 +217,10 @@ node --import tsx tests/e2e/api.test.ts
 | [Architecture](docs/architecture.md) | System design |
 | [Install Guide](docs/install.md) | Setup and launch |
 | [Local Models](docs/local-models.md) | Runtime provider config |
+| [Runtime](docs/runtime.md) | Current provider defaults, fallback, and ports |
+| [Observability](docs/observability.md) | Durable JSONL logs and summary files |
+| [Session Cleanup](docs/session-cleanup.md) | Explicit safe cleanup behavior |
+| [Real Model Testing](docs/real-model-testing.md) | Opt-in Ollama smoke test |
 | [Safety](docs/safety.md) | Modes, protected paths, approvals |
 | [Skills](docs/skills.md) | Native skill pack |
 | [Benchmarks](docs/benchmarks.md) | Measurement guidance |
